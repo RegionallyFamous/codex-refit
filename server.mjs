@@ -3581,6 +3581,327 @@ async function readJsonOrNull(targetPath) {
   }
 }
 
+function emptyLocalEnvironmentSummary({ hasCodexDir = false, hasUsefulPackageScripts = false } = {}) {
+  return {
+    status: hasCodexDir ? "empty" : "missing",
+    tone: hasUsefulPackageScripts ? "medium" : "low",
+    label: hasCodexDir ? "Not set up" : "No .codex",
+    action: hasUsefulPackageScripts ? "Add setup/actions" : "Document setup",
+    detail: hasCodexDir
+      ? "No Codex local environment setup scripts or app actions were found in this project's .codex folder."
+      : "No project .codex folder was found. Codex local environments live there when you share setup scripts and app actions.",
+    configFileCount: 0,
+    candidateFileCount: 0,
+    setupScriptCount: 0,
+    actionCount: 0,
+    platformSpecificCount: 0,
+    scriptLikeCount: 0,
+    parseWarningCount: 0,
+    hasSetupScript: false,
+    hasActions: false,
+    hasPackageCommands: hasUsefulPackageScripts,
+    files: [],
+  };
+}
+
+function localEnvironmentNameLooksRelevant(name) {
+  return /(^|[-_.])(local|env|environment|environments|action|actions|setup|setups|worktree|worktrees|workspace)([-_.]|$)/i.test(
+    String(name || ""),
+  );
+}
+
+function localEnvironmentExtensionLooksRelevant(name) {
+  return /\.(jsonc?|ya?ml|toml|txt|md)$/i.test(String(name || ""));
+}
+
+function localEnvironmentKeyLooksInteresting(key) {
+  return /\b(setup|action|script|command|macos|darwin|linux|windows|win32|worktree|environment)\b/i.test(
+    String(key || "").replaceAll("_", " "),
+  );
+}
+
+function localEnvironmentStringLooksScript(value) {
+  const text = String(value || "").trim();
+  if (!text || text.length > 12000) return false;
+  return /\b(npm|pnpm|yarn|bun|node|vite|electron|make|cargo|go|python|pytest|poetry|pip|bundle|composer|dotnet|swift|xcodebuild|cmake|gradle|mvn|install|build|test|lint|typecheck|dev|start)\b|&&|\|\||\n/i.test(
+    text,
+  );
+}
+
+function countScriptLikeValues(value, depth = 0) {
+  if (depth > 6 || value === null || value === undefined) return 0;
+  if (typeof value === "string") return localEnvironmentStringLooksScript(value) ? 1 : 0;
+  if (Array.isArray(value)) return value.reduce((total, item) => total + countScriptLikeValues(item, depth + 1), 0);
+  if (typeof value !== "object") return 0;
+  return Object.entries(value).reduce((total, [key, item]) => {
+    const keyLooksRunnable = /\b(script|command|cmd|run|shell)\b/i.test(String(key || "").replaceAll("_", " "));
+    if (keyLooksRunnable && typeof item === "string" && localEnvironmentStringLooksScript(item)) return total + 1;
+    return total + countScriptLikeValues(item, depth + 1);
+  }, 0);
+}
+
+function countActionLikeValues(value, depth = 0) {
+  if (depth > 5 || value === null || value === undefined) return 0;
+  if (typeof value === "string") return localEnvironmentStringLooksScript(value) ? 1 : 0;
+  if (Array.isArray(value)) return value.reduce((total, item) => total + countActionLikeValues(item, depth + 1), 0);
+  if (typeof value !== "object") return 0;
+
+  const entries = Object.entries(value);
+  const hasActionShape = entries.some(([key]) => /\b(name|label|title|description|script|command|cmd|run)\b/i.test(key));
+  const scriptCount = countScriptLikeValues(value, depth + 1);
+  if (hasActionShape && scriptCount) return 1;
+
+  return entries.reduce((total, [key, item]) => {
+    if (/action/i.test(key)) return total + countActionLikeValues(item, depth + 1);
+    return total;
+  }, 0);
+}
+
+function analyzeLocalEnvironmentJson(value) {
+  const foundKeys = new Set();
+  const counts = {
+    setupScriptCount: 0,
+    actionCount: 0,
+    platformSpecificCount: 0,
+    scriptLikeCount: 0,
+  };
+
+  const visit = (node, parentKey = "", depth = 0) => {
+    if (depth > 8 || node === null || node === undefined) return;
+    if (typeof node === "string") {
+      if (localEnvironmentStringLooksScript(node)) counts.scriptLikeCount += 1;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, parentKey, depth + 1);
+      return;
+    }
+    if (typeof node !== "object") return;
+
+    for (const [key, item] of Object.entries(node)) {
+      const normalized = String(key || "").toLowerCase().replaceAll("_", " ");
+      const interesting = localEnvironmentKeyLooksInteresting(normalized);
+      if (interesting && foundKeys.size < 18) foundKeys.add(key);
+
+      if (/\b(macos|darwin|linux|windows|win32)\b/.test(normalized) && countScriptLikeValues(item)) {
+        counts.platformSpecificCount += 1;
+      }
+      if (/\bsetup|worktree\b/.test(normalized)) {
+        counts.setupScriptCount += countScriptLikeValues(item);
+      }
+      if (/\bactions?\b/.test(normalized)) {
+        counts.actionCount += countActionLikeValues(item);
+      }
+      if (/\b(script|command|cmd|run|shell)\b/.test(normalized) && localEnvironmentStringLooksScript(item)) {
+        counts.scriptLikeCount += 1;
+      }
+
+      visit(item, `${parentKey} ${normalized}`.trim(), depth + 1);
+    }
+  };
+
+  visit(value);
+  return {
+    ...counts,
+    keys: [...foundKeys],
+  };
+}
+
+function analyzeLocalEnvironmentText(text) {
+  const { values, sections } = parseTomlSummary(text);
+  const foundKeys = new Set();
+  let setupScriptCount = 0;
+  let actionCount = 0;
+  let platformSpecificCount = 0;
+  let scriptLikeCount = 0;
+
+  for (const section of sections) {
+    if (localEnvironmentKeyLooksInteresting(section) && foundKeys.size < 18) foundKeys.add(section);
+  }
+
+  for (const [key, value] of Object.entries(values)) {
+    const normalized = String(key || "").toLowerCase().replaceAll("_", " ");
+    const scriptLike = countScriptLikeValues(value);
+    if (localEnvironmentKeyLooksInteresting(normalized) && foundKeys.size < 18) foundKeys.add(key);
+    if (scriptLike) scriptLikeCount += scriptLike;
+    if (scriptLike && /\b(setup|worktree)\b/.test(normalized)) setupScriptCount += scriptLike;
+    if (scriptLike && /\bactions?\b/.test(normalized)) actionCount += 1;
+    if (scriptLike && /\b(macos|darwin|linux|windows|win32)\b/.test(normalized)) platformSpecificCount += 1;
+  }
+
+  const raw = String(text || "");
+  if (!setupScriptCount && /\b(setup|worktree)\b[\s\S]{0,240}\b(npm|pnpm|yarn|bun|make|install|build|test)\b/i.test(raw)) {
+    setupScriptCount = 1;
+  }
+  if (!actionCount && /\bactions?\b[\s\S]{0,260}\b(script|command|npm|pnpm|yarn|bun|build|test|dev|start)\b/i.test(raw)) {
+    actionCount = 1;
+  }
+  if (!platformSpecificCount && /\b(macos|darwin|linux|windows|win32)\b[\s\S]{0,220}\b(script|command|npm|pnpm|yarn|bun|make)\b/i.test(raw)) {
+    platformSpecificCount = 1;
+  }
+
+  return {
+    setupScriptCount,
+    actionCount,
+    platformSpecificCount,
+    scriptLikeCount,
+    keys: [...foundKeys],
+  };
+}
+
+async function localEnvironmentCandidateFiles(codexDir) {
+  const files = [];
+  const seen = new Set();
+
+  const addFile = async (filePath, depth) => {
+    if (files.length >= 40) return;
+    const resolved = path.resolve(filePath);
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    const stats = await statOrNull(resolved);
+    if (!stats?.isFile() || stats.size > 256 * 1024) return;
+    const name = path.basename(resolved);
+    if (!localEnvironmentExtensionLooksRelevant(name)) return;
+    files.push({ path: resolved, name, bytes: stats.size, depth });
+  };
+
+  const visit = async (dir, depth = 0) => {
+    if (files.length >= 40 || depth > 2) return;
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (files.length >= 40) break;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isFile()) {
+        const relevant =
+          localEnvironmentNameLooksRelevant(entry.name) ||
+          (depth === 0 && /^config\.toml$/i.test(entry.name)) ||
+          localEnvironmentNameLooksRelevant(path.basename(dir));
+        if (relevant) await addFile(fullPath, depth);
+        continue;
+      }
+      if (!entry.isDirectory()) continue;
+      if (["agents", "rules", "hooks"].includes(entry.name.toLowerCase())) continue;
+      if (depth < 2 && localEnvironmentNameLooksRelevant(entry.name)) await visit(fullPath, depth + 1);
+    }
+  };
+
+  await visit(codexDir);
+  return files;
+}
+
+async function summarizeLocalEnvironmentFile(file) {
+  const summary = {
+    path: file.path,
+    name: file.name,
+    bytes: file.bytes,
+    format: path.extname(file.name).replace(/^\./, "").toLowerCase() || "text",
+    setupScriptCount: 0,
+    actionCount: 0,
+    platformSpecificCount: 0,
+    scriptLikeCount: 0,
+    keys: [],
+    parseWarning: null,
+  };
+
+  let text = "";
+  try {
+    text = await fs.readFile(file.path, "utf8");
+  } catch (error) {
+    summary.parseWarning = error.message;
+    return summary;
+  }
+
+  try {
+    const jsonLike = /\.(json|jsonc)$/i.test(file.name);
+    const parsed = jsonLike ? JSON.parse(text.replace(/^\uFEFF/, "")) : null;
+    const analysis = jsonLike ? analyzeLocalEnvironmentJson(parsed) : analyzeLocalEnvironmentText(text);
+    Object.assign(summary, analysis);
+  } catch (error) {
+    summary.parseWarning = error.message;
+    Object.assign(summary, analyzeLocalEnvironmentText(text));
+  }
+
+  summary.setupScriptCount = Math.max(0, Number(summary.setupScriptCount || 0));
+  summary.actionCount = Math.max(0, Number(summary.actionCount || 0));
+  summary.platformSpecificCount = Math.max(0, Number(summary.platformSpecificCount || 0));
+  summary.scriptLikeCount = Math.max(0, Number(summary.scriptLikeCount || 0));
+  summary.keys = (summary.keys || []).slice(0, 18);
+  return summary;
+}
+
+async function getLocalEnvironmentSummary({ codexDir, hasCodexDir = false, packageScripts = {} } = {}) {
+  const hasUsefulPackageScripts = Object.values(packageScripts || {}).some(scriptLooksUseful);
+  if (!hasCodexDir) return emptyLocalEnvironmentSummary({ hasCodexDir, hasUsefulPackageScripts });
+
+  const candidates = await localEnvironmentCandidateFiles(codexDir);
+  const files = await Promise.all(candidates.map((file) => summarizeLocalEnvironmentFile(file)));
+  const configFiles = files.filter((file) => file.setupScriptCount || file.actionCount || file.keys.length || file.parseWarning);
+  const setupScriptCount = files.reduce((total, file) => total + file.setupScriptCount, 0);
+  const actionCount = files.reduce((total, file) => total + file.actionCount, 0);
+  const platformSpecificCount = files.reduce((total, file) => total + file.platformSpecificCount, 0);
+  const scriptLikeCount = files.reduce((total, file) => total + file.scriptLikeCount, 0);
+  const parseWarningCount = files.filter((file) => file.parseWarning).length;
+  const hasSetupScript = setupScriptCount > 0;
+  const hasActions = actionCount > 0;
+  const configured = hasSetupScript || hasActions;
+  const missingUsefulPieces = hasUsefulPackageScripts && (!hasSetupScript || !hasActions);
+  const tone = parseWarningCount && !configured ? "medium" : missingUsefulPieces ? "medium" : "low";
+  const label = configured
+    ? `${setupScriptCount.toLocaleString()} setup / ${actionCount.toLocaleString()} actions`
+    : candidates.length
+      ? "No setup/actions"
+      : "Not set up";
+  const action = configured
+    ? missingUsefulPieces
+      ? "Finish setup/actions"
+      : "Keep shared"
+    : hasUsefulPackageScripts
+      ? "Add setup/actions"
+      : "Document setup";
+  const detail = configured
+    ? `Refit found ${setupScriptCount.toLocaleString()} setup script${setupScriptCount === 1 ? "" : "s"} and ${actionCount.toLocaleString()} app action${actionCount === 1 ? "" : "s"} in project .codex local-environment files.${platformSpecificCount ? ` ${platformSpecificCount.toLocaleString()} platform-specific override${platformSpecificCount === 1 ? "" : "s"} ${pluralVerb(platformSpecificCount)} detected.` : ""}`
+    : hasUsefulPackageScripts
+      ? "This project has useful package scripts, but Refit did not find Codex local-environment setup/actions under .codex. Add them through Codex app settings so new worktrees and common commands do not need rediscovery."
+      : "Refit did not find Codex local-environment setup/actions under .codex. Add them when this project needs repeat setup, build, test, or dev-server commands.";
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail: parseWarningCount ? `${detail} ${parseWarningCount.toLocaleString()} candidate file${parseWarningCount === 1 ? "" : "s"} could not be parsed cleanly.` : detail,
+    configFileCount: configFiles.length,
+    candidateFileCount: candidates.length,
+    setupScriptCount,
+    actionCount,
+    platformSpecificCount,
+    scriptLikeCount,
+    parseWarningCount,
+    hasSetupScript,
+    hasActions,
+    hasPackageCommands: hasUsefulPackageScripts,
+    files: files
+      .filter((file) => file.setupScriptCount || file.actionCount || file.parseWarning)
+      .slice(0, 8)
+      .map((file) => ({
+        name: file.name,
+        bytes: file.bytes,
+        format: file.format,
+        setupScriptCount: file.setupScriptCount,
+        actionCount: file.actionCount,
+        platformSpecificCount: file.platformSpecificCount,
+        parseWarning: file.parseWarning ? "parse warning" : null,
+        keys: file.keys,
+      })),
+  };
+}
+
 function emptyHookSource({ scope, format, sourcePath, active = true, exists = false, error = null }) {
   return {
     scope,
@@ -3766,6 +4087,8 @@ async function getProjectReadinessSummary(projectStatus) {
     hasCodexDir: false,
     hasProjectConfig: false,
     hasLocalEnvironmentHint: false,
+    hasLocalEnvironment: false,
+    localEnvironment: emptyLocalEnvironmentSummary(),
     codexFiles: [],
     hasPackageJson: false,
     hasDevScript: false,
@@ -3812,20 +4135,41 @@ async function getProjectReadinessSummary(projectStatus) {
     summary.hasTestScript = scriptLooksUseful(scripts.test || scripts.lint || scripts.typecheck);
   }
 
+  summary.localEnvironment = await getLocalEnvironmentSummary({
+    codexDir,
+    hasCodexDir: summary.hasCodexDir,
+    packageScripts: summary.scripts,
+  });
+  summary.hasLocalEnvironment = summary.localEnvironment.hasSetupScript || summary.localEnvironment.hasActions;
+  summary.hasLocalEnvironmentHint = summary.hasLocalEnvironmentHint || summary.localEnvironment.candidateFileCount > 0;
+
   if (!summary.hasAgents) {
     summary.gaps.push(summary.hasAgentsFile ? "Fill in AGENTS.md" : "Add AGENTS.md");
   }
   if (!summary.hasCodexDir) summary.gaps.push("Add .codex local setup/actions");
+  if (summary.hasCodexDir && !summary.localEnvironment.hasSetupScript && summary.hasPackageJson) {
+    summary.gaps.push("Add worktree setup script");
+  }
+  if (summary.hasCodexDir && !summary.localEnvironment.hasActions && Object.keys(summary.scripts).length) {
+    summary.gaps.push("Add local environment actions");
+  }
   if (summary.hasPackageJson && !summary.hasDevScript && !summary.hasBuildScript) summary.gaps.push("Document run/build command");
   if (summary.hasPackageJson && !summary.hasTestScript && !summary.hasBuildScript) {
     summary.gaps.push("Add or document verification command");
   }
 
+  const localEnvironmentScore = summary.hasLocalEnvironment
+    ? summary.localEnvironment.hasSetupScript && summary.localEnvironment.hasActions
+      ? 10
+      : 6
+    : summary.hasCodexDir
+      ? 2
+      : 0;
   summary.score = Math.min(
     100,
     (summary.hasAgents ? 35 : 0) +
       (summary.hasProjectConfig ? 15 : summary.hasCodexDir ? 8 : 0) +
-      (summary.hasLocalEnvironmentHint ? 10 : 0) +
+      localEnvironmentScore +
       (summary.hasDevScript || summary.hasBuildScript ? 15 : 0) +
       (summary.hasTestScript ? 25 : 0) +
       (summary.hasGit ? 5 : 0),
@@ -3859,6 +4203,9 @@ async function getTrustedProjectReadiness(trustedProjectStatuses) {
     readyCount: existingProjects.filter((project) => project.ready).length,
     missingGuidanceCount: existingProjects.filter((project) => !project.hasAgents).length,
     missingCodexDirCount: existingProjects.filter((project) => !project.hasCodexDir).length,
+    missingLocalEnvironmentCount: existingProjects.filter(
+      (project) => project.hasPackageJson && (!project.localEnvironment?.hasSetupScript || !project.localEnvironment?.hasActions),
+    ).length,
     missingVerificationCount: existingProjects.filter((project) => project.hasPackageJson && !project.hasTestScript && !project.hasBuildScript).length,
     averageScore: existingProjects.length
       ? Math.round(existingProjects.reduce((total, project) => total + project.score, 0) / existingProjects.length)
@@ -4567,6 +4914,7 @@ async function getCodexConfigSummary() {
       readyCount: 0,
       missingGuidanceCount: 0,
       missingCodexDirCount: 0,
+      missingLocalEnvironmentCount: 0,
       missingVerificationCount: 0,
       averageScore: 0,
       currentProject: null,
@@ -4726,6 +5074,8 @@ function buildProjectPlaybookSnippet(project) {
   const runCommand = projectCommandLine(project, ["dev", "start"], "Document the local run command.");
   const buildCommand = projectCommandLine(project, ["build", "package:mac"], "Document the build command.");
   const verifyCommand = projectCommandLine(project, ["test", "lint", "typecheck", "build"], "Document the smallest useful verification command.");
+  const localEnvironment = project?.localEnvironment || emptyLocalEnvironmentSummary({ hasCodexDir: project?.hasCodexDir });
+  const needsLocalSetup = !project?.hasCodexDir || !localEnvironment.hasSetupScript || (!localEnvironment.hasActions && Object.keys(project?.scripts || {}).length);
   const lines = [
     `# ${path.join(projectPath, "AGENTS.md")}`,
     "",
@@ -4741,12 +5091,20 @@ function buildProjectPlaybookSnippet(project) {
     "- The working tree only contains intentional changes.",
   ];
 
-  if (!project?.hasCodexDir) {
+  if (needsLocalSetup) {
     lines.push(
       "",
-      "# Also configure Codex app Local Environments for this project:",
-      "# - setup script for worktrees, such as npm install && npm run build",
-      "# - actions for common commands, such as dev, build, and test",
+      "# Also configure Codex app Local Environments for this project.",
+      "# Codex stores the shared generated file under this folder:",
+      `# ${path.join(projectPath, ".codex")}`,
+      "",
+      "# Good setup script:",
+      runCommand.startsWith("npm run") ? "npm install" : "# install dependencies for this repo",
+      buildCommand.startsWith("npm run") ? buildCommand : "# build once if this repo needs generated files",
+      "",
+      "# Good actions:",
+      runCommand,
+      verifyCommand,
     );
   }
 
@@ -4805,6 +5163,13 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
+  const currentLocalEnvironment = currentProject?.localEnvironment || null;
+  const localEnvironmentNeedsWork = Boolean(
+    currentProject &&
+      (currentLocalEnvironment?.tone !== "low" ||
+        !currentLocalEnvironment?.hasSetupScript ||
+        (Object.keys(currentProject.scripts || {}).length && !currentLocalEnvironment?.hasActions)),
+  );
   const authCache = codexConfig?.authCache || {};
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
@@ -5284,16 +5649,19 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
 
   if (
     currentProject &&
-    (!currentProject.hasAgents || !currentProject.hasCodexDir || (!currentProject.hasTestScript && !currentProject.hasBuildScript))
+    (!currentProject.hasAgents ||
+      !currentProject.hasCodexDir ||
+      localEnvironmentNeedsWork ||
+      (!currentProject.hasTestScript && !currentProject.hasBuildScript))
   ) {
     addFix({
       id: "project-playbook",
       label: "Project Playbook",
       value: `${currentProject.score}/100`,
       tone: currentProject.score >= 70 ? "low" : "medium",
-      action: currentProject.hasAgents ? "Add setup/actions" : "Add AGENTS.md",
+      action: currentProject.hasAgents ? (localEnvironmentNeedsWork ? "Add setup/actions" : "Add verification") : "Add AGENTS.md",
       detail:
-        "Project-level guidance and local environment actions help Codex start with run, build, and verification context instead of rediscovering it.",
+        "Project guidance, worktree setup scripts, and local actions help Codex start with run, build, and verification context instead of rediscovering it.",
       snippet: buildProjectPlaybookSnippet(currentProject),
     });
   }
@@ -5459,7 +5827,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const currentProject = projectReadiness.currentProject || null;
   const existingProjectCount = Number(projectReadiness.existingCount || 0);
   const projectReadyCount = Number(projectReadiness.readyCount || 0);
-  const projectGapCount = Number(projectReadiness.missingGuidanceCount || 0) + Number(projectReadiness.missingCodexDirCount || 0);
+  const projectGapCount =
+    Number(projectReadiness.missingGuidanceCount || 0) +
+    Number(projectReadiness.missingCodexDirCount || 0) +
+    Number(projectReadiness.missingLocalEnvironmentCount || 0);
+  const currentLocalEnvironment = currentProject?.localEnvironment || null;
   const authCache = codexConfig?.authCache || {};
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
@@ -5535,10 +5907,14 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const projectDetail = currentProject
     ? currentProject.ready
       ? `${currentProject.label} has a useful project playbook score (${currentProject.score}/100).`
-      : `${currentProject.label} is missing ${currentProject.gaps.slice(0, 3).join(", ")}. Add project guidance or local environment actions so Codex does not rediscover setup every run.`
+      : `${currentProject.label} is missing ${currentProject.gaps.slice(0, 3).join(", ")}. Add project guidance and local setup so Codex does not rediscover basics every run.`
     : existingProjectCount
       ? `${projectReadyCount}/${existingProjectCount} trusted projects look Codex-ready. Add AGENTS.md and local setup/actions to the projects you use most.`
       : "No existing trusted projects were found to inspect.";
+
+  const localEnvironmentDetail = currentProject
+    ? currentLocalEnvironment?.detail || "No local environment details were available for the current project."
+    : "Open a trusted project so Refit can check its Codex local-environment setup scripts and app actions.";
 
   const runtimeDetail = runtime?.versionMismatch
     ? `Terminal Codex is ${runtime.cliVersion}; the bundled app binary is ${runtime.appVersion}. The manual notes app and CLI versions can differ.`
@@ -5893,6 +6269,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: currentProject?.ready === false ? "Add repo guidance" : projectGapCount ? "Improve top projects" : "Keep current",
       priority: currentProject?.ready === false ? 86 : projectGapCount ? 66 : 22,
       detail: projectDetail,
+    },
+    {
+      id: "local-environment",
+      label: "Local Setup",
+      value: currentProject ? currentLocalEnvironment?.label || "Unknown" : "No project",
+      tone: currentProject ? currentLocalEnvironment?.tone || "medium" : "low",
+      action: currentProject ? currentLocalEnvironment?.action || "Review setup" : "Open project",
+      priority: currentProject
+        ? currentLocalEnvironment?.tone === "medium"
+          ? 79
+          : currentLocalEnvironment?.hasSetupScript || currentLocalEnvironment?.hasActions
+            ? 32
+            : 58
+        : 10,
+      detail: localEnvironmentDetail,
     },
     {
       id: "runtime-version",
@@ -6285,10 +6676,22 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       id: "project-playbook",
       label: "Project Playbook",
       value: `${currentProject.score}/100`,
-      action: currentProject.hasAgents ? "Add setup/actions" : "Add AGENTS.md",
+      action: currentProject.hasAgents ? (currentLocalEnvironment?.tone !== "low" ? "Add setup/actions" : "Add verification") : "Add AGENTS.md",
       tone: "medium",
       priority: 72,
       detail: projectDetail,
+    });
+  }
+
+  if (currentProject && currentLocalEnvironment?.tone !== "low") {
+    addRecommendation({
+      id: "local-environment",
+      label: "Local Setup",
+      value: currentLocalEnvironment.label,
+      action: currentLocalEnvironment.action,
+      tone: "medium",
+      priority: 70,
+      detail: localEnvironmentDetail,
     });
   }
 
@@ -6962,6 +7365,9 @@ function benchmarkLiveScore(metrics) {
   if (metrics.networkProxyNoEffect) score -= 3;
   if (metrics.networkGlobalAllow) score -= 2;
   if (metrics.networkDangerousSettingCount) score -= Math.min(4, Number(metrics.networkDangerousSettingCount || 0) * 2);
+  if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasSetupScript) score -= 2;
+  if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasActions) score -= 2;
+  score -= Math.min(3, Number(metrics.localEnvironmentParseWarningCount || 0) * 1.5);
   return Math.round(clampNumber(score, 0, 100));
 }
 
@@ -7135,6 +7541,17 @@ function benchmarkGuidance(metrics) {
   } else if (metrics.compactOverrideBytes >= 12 * 1024) {
     guidance.push(`Review compact prompt overrides; ${formatBytesServer(metrics.compactOverrideBytes)} can affect long-thread summarization.`);
   }
+  if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasSetupScript) {
+    guidance.push("Add a Codex local-environment setup script so new worktrees can install/build without rediscovering the same steps.");
+  }
+  if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasActions) {
+    guidance.push("Add Codex local-environment actions for your dev, build, and verification commands so common runs are one click in the app.");
+  }
+  if (metrics.localEnvironmentParseWarningCount > 0) {
+    guidance.push(
+      `Check ${Number(metrics.localEnvironmentParseWarningCount).toLocaleString()} local-environment candidate file${metrics.localEnvironmentParseWarningCount === 1 ? "" : "s"} that Refit could not parse cleanly.`,
+    );
+  }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
     guidance.push(
@@ -7169,7 +7586,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v2",
+    scoreModel: "local-state-v3",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -7832,6 +8249,12 @@ function benchmarkDeltas(current, previous) {
     "networkDomainRuleCount",
     "networkDangerousSettingCount",
     "networkWritableRootCount",
+    "localEnvironmentConfigCount",
+    "localEnvironmentCandidateFileCount",
+    "localEnvironmentSetupCount",
+    "localEnvironmentActionCount",
+    "localEnvironmentPlatformSpecificCount",
+    "localEnvironmentParseWarningCount",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -7982,6 +8405,16 @@ function summarizeBenchmarkEntry(entry) {
     networkWritableRootCount: entry.metrics.networkWritableRootCount || 0,
     networkTmpdirExcluded: Boolean(entry.metrics.networkTmpdirExcluded),
     networkSlashTmpExcluded: Boolean(entry.metrics.networkSlashTmpExcluded),
+    projectHasPackageJson: Boolean(entry.metrics.projectHasPackageJson),
+    projectHasUsefulScripts: Boolean(entry.metrics.projectHasUsefulScripts),
+    localEnvironmentConfigCount: entry.metrics.localEnvironmentConfigCount || 0,
+    localEnvironmentCandidateFileCount: entry.metrics.localEnvironmentCandidateFileCount || 0,
+    localEnvironmentSetupCount: entry.metrics.localEnvironmentSetupCount || 0,
+    localEnvironmentActionCount: entry.metrics.localEnvironmentActionCount || 0,
+    localEnvironmentPlatformSpecificCount: entry.metrics.localEnvironmentPlatformSpecificCount || 0,
+    localEnvironmentParseWarningCount: entry.metrics.localEnvironmentParseWarningCount || 0,
+    localEnvironmentHasSetupScript: Boolean(entry.metrics.localEnvironmentHasSetupScript),
+    localEnvironmentHasActions: Boolean(entry.metrics.localEnvironmentHasActions),
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -8040,6 +8473,11 @@ export async function benchmarkHistory(limit = 12) {
         networkDomainRuleCount: latest.networkDomainRuleCount - oldest.networkDomainRuleCount,
         networkDangerousSettingCount: latest.networkDangerousSettingCount - oldest.networkDangerousSettingCount,
         networkWritableRootCount: latest.networkWritableRootCount - oldest.networkWritableRootCount,
+        localEnvironmentConfigCount: latest.localEnvironmentConfigCount - oldest.localEnvironmentConfigCount,
+        localEnvironmentSetupCount: latest.localEnvironmentSetupCount - oldest.localEnvironmentSetupCount,
+        localEnvironmentActionCount: latest.localEnvironmentActionCount - oldest.localEnvironmentActionCount,
+        localEnvironmentPlatformSpecificCount: latest.localEnvironmentPlatformSpecificCount - oldest.localEnvironmentPlatformSpecificCount,
+        localEnvironmentParseWarningCount: latest.localEnvironmentParseWarningCount - oldest.localEnvironmentParseWarningCount,
       }
     : null;
   const previousDeltas = latest && previous
@@ -8068,6 +8506,9 @@ export async function benchmarkHistory(limit = 12) {
         commandRuleBroadPromptCount: latest.commandRuleBroadPromptCount - previous.commandRuleBroadPromptCount,
         networkDomainRuleCount: latest.networkDomainRuleCount - previous.networkDomainRuleCount,
         networkDangerousSettingCount: latest.networkDangerousSettingCount - previous.networkDangerousSettingCount,
+        localEnvironmentSetupCount: latest.localEnvironmentSetupCount - previous.localEnvironmentSetupCount,
+        localEnvironmentActionCount: latest.localEnvironmentActionCount - previous.localEnvironmentActionCount,
+        localEnvironmentParseWarningCount: latest.localEnvironmentParseWarningCount - previous.localEnvironmentParseWarningCount,
       }
     : null;
   const trend =
@@ -8125,9 +8566,11 @@ export async function runBenchmark() {
   const managedConfigSummary = scan.codexConfig?.managedConfig || emptyManagedConfigSummary();
   const commandRuleSummary = scan.codexConfig?.commandRules || emptyCommandRuleSummary(scan.codexConfig?.rulesFeature !== false);
   const networkSandbox = scan.codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
+  const currentProject = scan.codexConfig?.projectReadiness?.currentProject || null;
+  const localEnvironment = currentProject?.localEnvironment || emptyLocalEnvironmentSummary({ hasCodexDir: Boolean(currentProject?.hasCodexDir) });
 
   const metrics = {
-    scoreModel: "local-state-v2",
+    scoreModel: "local-state-v3",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -8257,6 +8700,22 @@ export async function runBenchmark() {
     networkWritableRootCount: networkSandbox.writableRootCount || 0,
     networkTmpdirExcluded: Boolean(networkSandbox.tmpdirExcluded),
     networkSlashTmpExcluded: Boolean(networkSandbox.slashTmpExcluded),
+    projectHasPackageJson: Boolean(currentProject?.hasPackageJson),
+    projectHasUsefulScripts: Boolean(
+      currentProject?.hasPackageJson &&
+        (currentProject.hasDevScript ||
+          currentProject.hasBuildScript ||
+          currentProject.hasTestScript ||
+          Object.values(currentProject.scripts || {}).some(scriptLooksUseful)),
+    ),
+    localEnvironmentConfigCount: localEnvironment.configFileCount || 0,
+    localEnvironmentCandidateFileCount: localEnvironment.candidateFileCount || 0,
+    localEnvironmentSetupCount: localEnvironment.setupScriptCount || 0,
+    localEnvironmentActionCount: localEnvironment.actionCount || 0,
+    localEnvironmentPlatformSpecificCount: localEnvironment.platformSpecificCount || 0,
+    localEnvironmentParseWarningCount: localEnvironment.parseWarningCount || 0,
+    localEnvironmentHasSetupScript: Boolean(localEnvironment.hasSetupScript),
+    localEnvironmentHasActions: Boolean(localEnvironment.hasActions),
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
