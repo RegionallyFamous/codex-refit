@@ -126,6 +126,97 @@ function extractTrustedProjectPaths(sections, values) {
     .filter(Boolean);
 }
 
+async function getCodexProfileSummaries() {
+  const empty = {
+    profileCount: 0,
+    profileSummaries: [],
+    hasFastTaskProfile: false,
+    fastTaskProfileNames: [],
+    hasSparkProfile: false,
+    sparkProfileNames: [],
+    hasMiniProfile: false,
+    miniProfileNames: [],
+    hasDeepWorkProfile: false,
+    deepWorkProfileNames: [],
+  };
+
+  try {
+    const dirents = await fs.readdir(paths.codexHome, { withFileTypes: true });
+    const profileFiles = dirents
+      .filter((dirent) => dirent.isFile() && /^[A-Za-z0-9_-]+\.config\.toml$/.test(dirent.name))
+      .map((dirent) => dirent.name)
+      .sort((a, b) => a.localeCompare(b));
+
+    const profileSummaries = (
+      await Promise.all(
+        profileFiles.map(async (fileName) => {
+          const profilePath = path.join(paths.codexHome, fileName);
+          const name = fileName.slice(0, -".config.toml".length);
+
+          try {
+            const text = await fs.readFile(profilePath, "utf8");
+            const { values } = parseTomlSummary(text);
+            const model = values.model ? String(values.model) : null;
+            const reasoningEffort = values.model_reasoning_effort || values.reasoning_effort || null;
+            const serviceTier = values.service_tier || null;
+            const verbosity = values.model_verbosity || null;
+            const normalizedName = name.toLowerCase();
+            const normalizedModel = String(model || "").toLowerCase();
+            const normalizedEffort = String(reasoningEffort || "").toLowerCase().replaceAll("_", "-");
+            const isHighEffort = ["high", "xhigh", "extra-high"].includes(normalizedEffort);
+            const isLowEffort = ["low", "minimal", "none"].includes(normalizedEffort);
+            const nameLooksFast = /fast|speed|quick|small|mini|spark|light|lite/.test(normalizedName);
+            const nameLooksDeep = /deep|review|xhigh|heavy/.test(normalizedName);
+            const mini = normalizedModel.includes("mini");
+            const spark = normalizedModel.includes("spark");
+            const fastMode = serviceTier === "fast" && values["features.fast_mode"] !== false;
+            const fastTask = spark || mini || fastMode || (nameLooksFast && !isHighEffort) || (isLowEffort && !nameLooksDeep);
+            const deepWork = nameLooksDeep || (normalizedModel === "gpt-5.5" && isHighEffort);
+
+            return {
+              name,
+              path: profilePath,
+              model,
+              reasoningEffort,
+              serviceTier,
+              verbosity,
+              fastTask,
+              deepWork,
+              spark,
+              mini,
+            };
+          } catch (error) {
+            return {
+              name,
+              path: profilePath,
+              error: error.message,
+              fastTask: false,
+              deepWork: false,
+              spark: false,
+              mini: false,
+            };
+          }
+        }),
+      )
+    ).filter(Boolean);
+
+    return {
+      profileCount: profileSummaries.length,
+      profileSummaries,
+      hasFastTaskProfile: profileSummaries.some((profile) => profile.fastTask),
+      fastTaskProfileNames: profileSummaries.filter((profile) => profile.fastTask).map((profile) => profile.name),
+      hasSparkProfile: profileSummaries.some((profile) => profile.spark),
+      sparkProfileNames: profileSummaries.filter((profile) => profile.spark).map((profile) => profile.name),
+      hasMiniProfile: profileSummaries.some((profile) => profile.mini),
+      miniProfileNames: profileSummaries.filter((profile) => profile.mini).map((profile) => profile.name),
+      hasDeepWorkProfile: profileSummaries.some((profile) => profile.deepWork),
+      deepWorkProfileNames: profileSummaries.filter((profile) => profile.deepWork).map((profile) => profile.name),
+    };
+  } catch {
+    return empty;
+  }
+}
+
 function isTopLevelMcpSection(section) {
   if (!section.startsWith("mcp_servers.")) return false;
   const name = section.slice("mcp_servers.".length);
@@ -806,10 +897,23 @@ async function getCodexConfigSummary() {
     enabledMcpCount: 0,
     disabledMcpCount: 0,
     requiredMcpCount: 0,
+    profileCount: 0,
+    profileSummaries: [],
+    hasFastTaskProfile: false,
+    fastTaskProfileNames: [],
+    hasSparkProfile: false,
+    sparkProfileNames: [],
+    hasMiniProfile: false,
+    miniProfileNames: [],
+    hasDeepWorkProfile: false,
+    deepWorkProfileNames: [],
+    legacyProfileConfig: false,
     globalAgentsExists: globalAgentsBytes > 0,
     globalAgentsFileExists: await exists(paths.globalAgents),
     globalAgentsBytes,
   };
+
+  Object.assign(summary, await getCodexProfileSummaries());
 
   if (!(await exists(paths.configToml))) return summary;
   summary.exists = true;
@@ -830,6 +934,7 @@ async function getCodexConfigSummary() {
     summary.goalsFeature = values["features.goals"] === true;
     summary.webSearchMode = values.web_search || null;
     summary.maxConcurrentThreadsPerSession = values.max_concurrent_threads_per_session || null;
+    summary.legacyProfileConfig = Boolean(values.profile || sections.some((section) => section.startsWith("profiles.")));
     summary.trustedProjectPaths = extractTrustedProjectPaths(sections, values);
     summary.trustedProjectCount = summary.trustedProjectPaths.length;
     const trustedProjectExists = await Promise.all(summary.trustedProjectPaths.map((projectPath) => exists(projectPath)));
@@ -871,6 +976,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const emptyGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const fastMode = Boolean(codexConfig?.fastMode);
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
+  const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
 
   if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
     addFix({
@@ -900,6 +1006,36 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (!hasFastTaskProfile) {
+    addFix({
+      id: "speed-profile-file",
+      label: "Speed Profile",
+      value: "Missing",
+      tone: "medium",
+      action: "Create speed.config.toml",
+      detail:
+        "Named profiles let you keep a fast small-task setup without changing your deep-work default. Use the profile only when the task is scoped and easy to verify.",
+      snippet: [
+        "# ~/.codex/speed.config.toml",
+        'model = "gpt-5.4-mini"',
+        'model_reasoning_effort = "low"',
+        'model_verbosity = "low"',
+        "",
+        "# Optional after /fast status confirms access:",
+        '# service_tier = "fast"',
+        "#",
+        "# [features]",
+        "# fast_mode = true",
+        "",
+        "# Use it:",
+        'codex --profile speed "small, scoped task"',
+        "",
+        "# If Codex-Spark is available for your account, test it in a separate profile:",
+        '# model = "gpt-5.3-codex-spark"',
+      ].join("\n"),
+    });
+  }
+
   if (!hasGuidance) {
     addFix({
       id: "agents-guidance",
@@ -919,6 +1055,27 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "- Inspect the existing code style before editing.",
         "- Run the relevant build or test command after code changes.",
         "- Preserve user-created files and generated assets unless explicitly asked.",
+      ].join("\n"),
+    });
+  }
+
+  if (codexConfig?.legacyProfileConfig) {
+    addFix({
+      id: "legacy-profile-config",
+      label: "Legacy Profiles",
+      value: "Old syntax",
+      tone: "medium",
+      action: "Move to profile files",
+      detail:
+        "Codex 0.134.0 and later expects named profiles in ~/.codex/name.config.toml files, not profile = or [profiles.*] inside config.toml.",
+      snippet: [
+        `# ${paths.configToml}`,
+        "# Remove legacy top-level profile selectors or [profiles.*] tables.",
+        "",
+        "# Then create named profile files, for example:",
+        "# ~/.codex/speed.config.toml",
+        'model = "gpt-5.4-mini"',
+        'model_reasoning_effort = "low"',
       ].join("\n"),
     });
   }
@@ -1023,6 +1180,10 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   const desktopTier = codexConfig?.desktopServiceTier || null;
   const displayTier = codexConfig?.serviceTier || desktopTier || "standard";
   const isHighEffort = ["high", "xhigh", "extra-high", "extra_high"].includes(String(effort).toLowerCase());
+  const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
+  const fastTaskProfileNames = codexConfig?.fastTaskProfileNames || [];
+  const hasSparkProfile = Boolean(codexConfig?.hasSparkProfile);
+  const hasMiniProfile = Boolean(codexConfig?.hasMiniProfile);
   const globalGuidanceReady = Boolean(codexConfig?.globalAgentsExists);
   const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
@@ -1036,7 +1197,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
 
   const modelDetail =
     effort === "xhigh" || effort === "high"
-      ? `Default is ${model} with ${effort} reasoning. Great for hard work; lower effort or gpt-5.4-mini can feel faster on light coding.`
+      ? `Default is ${model} with ${effort} reasoning. Great for hard work; lower effort, gpt-5.4-mini, or Codex-Spark when available can feel faster on light coding.`
       : `Default is ${model} with ${effort} reasoning. Match effort and model to task size for speed.`;
 
   const speedDetail = fastMode
@@ -1094,25 +1255,25 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
 
   const profiles = [
     {
-      id: "small-task-speed",
-      label: "Small Tasks",
-      value: isHighEffort ? "Tune down" : "Current fit",
-      tone: isHighEffort ? "medium" : "low",
-      action: isHighEffort ? "Mini or lower effort" : "Keep prompts tight",
-      detail:
-        isHighEffort
-          ? "The Codex manual recommends gpt-5.4-mini for lighter coding and low reasoning for faster, well-scoped tasks. Keep high/xhigh for harder debugging and long agentic work."
-          : "Current reasoning is not set to high/xhigh. Small, scoped prompts should already avoid unnecessary reasoning drag.",
+      id: "fast-lane-profile",
+      label: "Fast Lane",
+      value: hasFastTaskProfile ? fastTaskProfileNames.slice(0, 2).join(", ") : "Missing",
+      tone: hasFastTaskProfile ? "low" : "medium",
+      action: hasFastTaskProfile ? "Use --profile" : "Create speed profile",
+      detail: hasFastTaskProfile
+        ? `Named fast profile${fastTaskProfileNames.length === 1 ? "" : "s"} found: ${fastTaskProfileNames.join(", ")}. Use one for small, well-scoped tasks.`
+        : "Create ~/.codex/speed.config.toml with gpt-5.4-mini and low reasoning so quick tasks do not inherit the deep-work default.",
     },
     {
-      id: "fast-mode",
-      label: "Fast Mode",
-      value: fastMode ? "Configured" : "Check access",
-      tone: fastMode ? "low" : "medium",
-      action: fastMode ? "Use when worth it" : "/fast status",
-      detail: fastMode
-        ? `Fast Mode is enabled with service tier ${tier}. The manual notes supported models run faster with higher credit use.`
-        : `Run /fast status in Codex. If available, /fast on speeds supported models at higher credit use; persistent config is service_tier = "fast" plus features.fast_mode = true. Current service tier display is ${displayTier}.`,
+      id: "small-task-speed",
+      label: "Small Tasks",
+      value: hasSparkProfile ? "Spark ready" : hasMiniProfile ? "Mini ready" : isHighEffort ? "Tune down" : "Current fit",
+      tone: hasSparkProfile || hasMiniProfile || !isHighEffort ? "low" : "medium",
+      action: hasSparkProfile ? "Use Spark when apt" : hasMiniProfile ? "Use mini profile" : isHighEffort ? "Mini or lower effort" : "Keep prompts tight",
+      detail:
+        hasSparkProfile
+          ? "A Codex-Spark profile exists. The manual describes Spark as a near-instant iteration model for lighter real-time coding when available."
+          : "The Codex manual recommends gpt-5.4-mini for lighter coding and low reasoning for faster, well-scoped tasks. Codex-Spark is another near-instant option when your account has it.",
     },
     {
       id: "deep-work",
@@ -1318,6 +1479,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     });
   }
 
+  if (!hasFastTaskProfile && isHighEffort) {
+    addRecommendation({
+      id: "speed-profile-missing",
+      label: "Fast Lane",
+      value: "No profile",
+      action: "Create speed profile",
+      tone: "medium",
+      priority: 76,
+      detail: "Your default is tuned for deep work. Add a named speed profile so small tasks can start with mini/low settings on purpose.",
+    });
+  }
+
   if (!fastMode) {
     addRecommendation({
       id: "check-fast-mode",
@@ -1458,6 +1631,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     goalsFeature,
     webSearchMode,
     maxConcurrentThreadsPerSession: codexConfig?.maxConcurrentThreadsPerSession || null,
+    profileCount: codexConfig?.profileCount || 0,
+    hasFastTaskProfile,
+    fastTaskProfileNames,
+    hasSparkProfile,
+    hasMiniProfile,
     trustedProjectCount: codexConfig?.trustedProjectCount || 0,
     staleTrustedProjectCount,
     enabledPluginCount,
