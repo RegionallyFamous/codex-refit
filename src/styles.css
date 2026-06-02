@@ -979,7 +979,7 @@ body[data-hard-mode] .benchmark-guidance span:nth-child(n + 2) {
 .benchmark-proof {
   display: grid;
   grid-column: 1 / -1;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(5rem, 1fr));
   gap: 0.32rem;
 }
 

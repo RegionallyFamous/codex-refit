@@ -701,6 +701,7 @@ function renderBenchmarkHistory(history) {
       elements.benchmarkProof.innerHTML = `
         <span>Trend ${escapeHtml(formatSigned(deltas.score))}</span>
         <span>Best ${escapeHtml(String(best?.score ?? latest.score))}/100</span>
+        <span>Proc ${escapeHtml(formatSigned(deltas.processCount || 0))}</span>
         <span>Active ${escapeHtml(formatByteDelta(deltas.activeSessionBytes || 0))}</span>
       `;
     }

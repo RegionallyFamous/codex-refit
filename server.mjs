@@ -81,6 +81,11 @@ function normalizePolicy(value) {
   return ["auto", "safe", "reclaim", "max"].includes(value) ? value : "auto";
 }
 
+function configNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function parseTomlScalar(value) {
   const trimmed = String(value || "").trim();
   if (/^true$/i.test(trimmed)) return true;
@@ -1558,6 +1563,11 @@ async function getCodexConfigSummary() {
     goalsFeature: false,
     webSearchMode: null,
     maxConcurrentThreadsPerSession: null,
+    agentMaxThreads: null,
+    agentMaxThreadsEffective: 6,
+    agentMaxDepth: null,
+    agentMaxDepthEffective: 1,
+    agentJobMaxRuntimeSeconds: null,
     trustedProjectCount: 0,
     staleTrustedProjectCount: 0,
     trustedProjectPaths: [],
@@ -1619,6 +1629,11 @@ async function getCodexConfigSummary() {
     summary.goalsFeature = values["features.goals"] === true;
     summary.webSearchMode = values.web_search || null;
     summary.maxConcurrentThreadsPerSession = values.max_concurrent_threads_per_session || null;
+    summary.agentMaxThreads = configNumber(values["agents.max_threads"]);
+    summary.agentMaxThreadsEffective = summary.agentMaxThreads ?? 6;
+    summary.agentMaxDepth = configNumber(values["agents.max_depth"]);
+    summary.agentMaxDepthEffective = summary.agentMaxDepth ?? 1;
+    summary.agentJobMaxRuntimeSeconds = configNumber(values["agents.job_max_runtime_seconds"]);
     summary.legacyProfileConfig = Boolean(values.profile || sections.some((section) => section.startsWith("profiles.")));
     summary.trustedProjectPaths = extractTrustedProjectPaths(sections, values);
     summary.trustedProjectCount = summary.trustedProjectPaths.length;
@@ -1729,6 +1744,9 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const currentProject = projectReadiness.currentProject;
   const authCache = codexConfig?.authCache || {};
   const processSummary = context.processSummary || {};
+  const agentMaxThreads = Number(codexConfig?.agentMaxThreadsEffective ?? 6);
+  const agentMaxDepth = Number(codexConfig?.agentMaxDepthEffective ?? 1);
+  const agentFanoutRisk = agentMaxDepth > 1 || agentMaxThreads >= 12;
 
   if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
     addFix({
@@ -1752,6 +1770,27 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
       detail:
         "Many live Codex helpers can make the app feel slow even after local cleanup. Finish or archive idle threads, close extra terminals, then restart Codex after active runs are done.",
       snippet: buildProcessLoadSnippet(),
+    });
+  }
+
+  if (agentFanoutRisk) {
+    addFix({
+      id: "agent-fanout",
+      label: "Agent Fan-out",
+      value: `${agentMaxThreads.toLocaleString()} / depth ${agentMaxDepth.toLocaleString()}`,
+      tone: agentMaxDepth > 2 || agentMaxThreads >= 24 ? "high" : "medium",
+      action: "Cap subagents",
+      detail:
+        "The Codex manual says agents.max_threads defaults to 6 and agents.max_depth defaults to 1. Higher depth can create repeated fan-out that adds token use, latency, and local resource load.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# Conservative defaults for fast, predictable subagent work.",
+        "[agents]",
+        "max_threads = 6",
+        "max_depth = 1",
+        "",
+        "# Raise these only for deliberately parallel tasks.",
+      ].join("\n"),
     });
   }
 
@@ -2190,6 +2229,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   ].sort((a, b) => b.priority - a.priority);
 
   const threadLimit = Number(codexConfig?.maxConcurrentThreadsPerSession || 0);
+  const agentMaxThreads = Number(codexConfig?.agentMaxThreadsEffective ?? 6);
+  const agentMaxDepth = Number(codexConfig?.agentMaxDepthEffective ?? 1);
+  const agentThreadsConfigured = codexConfig?.agentMaxThreads !== null && codexConfig?.agentMaxThreads !== undefined;
+  const agentDepthConfigured = codexConfig?.agentMaxDepth !== null && codexConfig?.agentMaxDepth !== undefined;
+  const agentFanoutRisk = agentMaxDepth > 1 || agentMaxThreads >= 12;
+  const agentFanoutHeavy = agentMaxDepth > 2 || agentMaxThreads >= 24;
+  const agentFanoutDetail =
+    agentFanoutRisk
+      ? `Subagent cap is ${agentMaxThreads.toLocaleString()} open thread${agentMaxThreads === 1 ? "" : "s"} with depth ${agentMaxDepth.toLocaleString()}. The Codex manual says depth defaults to 1 and raising it can increase token use, latency, and local resource consumption.`
+      : agentThreadsConfigured || agentDepthConfigured
+        ? `Subagent settings are configured conservatively: ${agentMaxThreads.toLocaleString()} open thread${agentMaxThreads === 1 ? "" : "s"} with depth ${agentMaxDepth.toLocaleString()}.`
+        : "Subagent fan-out is using Codex defaults: 6 open agent threads and depth 1.";
   const trustedProjectCount = Number(codexConfig?.trustedProjectCount || 0);
   const enabledPluginCount = Number(codexConfig?.enabledPluginCount || 0);
   const enabledMcpCount = Number(codexConfig?.enabledMcpCount || 0);
@@ -2203,6 +2254,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: processReady ? processSummary.action || "Review load" : "Run local ps",
       priority: processLoaded ? (processSummary.tone === "high" ? 94 : 78) : 24,
       detail: processDetail,
+    },
+    {
+      id: "agent-fanout",
+      label: "Agent Fan-out",
+      value: `${agentMaxThreads.toLocaleString()} / depth ${agentMaxDepth.toLocaleString()}`,
+      tone: agentFanoutRisk ? (agentFanoutHeavy ? "high" : "medium") : "low",
+      action: agentFanoutRisk ? "Cap subagents" : "Keep scoped",
+      priority: agentFanoutHeavy ? 92 : agentFanoutRisk ? 76 : 26,
+      detail: agentFanoutDetail,
     },
     {
       id: "project-playbooks",
@@ -2389,6 +2449,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (agentFanoutRisk) {
+    addRecommendation({
+      id: "agent-fanout",
+      label: "Agent Fan-out",
+      value: `${agentMaxThreads.toLocaleString()} / depth ${agentMaxDepth.toLocaleString()}`,
+      action: "Cap subagents",
+      tone: agentFanoutHeavy ? "high" : "medium",
+      priority: agentFanoutHeavy ? 86 : 70,
+      detail: agentFanoutDetail,
+    });
+  }
+
   if (currentProject && !currentProject.ready) {
     addRecommendation({
       id: "project-playbook",
@@ -2520,6 +2592,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     goalsFeature,
     webSearchMode,
     maxConcurrentThreadsPerSession: codexConfig?.maxConcurrentThreadsPerSession || null,
+    agentMaxThreads: codexConfig?.agentMaxThreads ?? null,
+    agentMaxThreadsEffective: agentMaxThreads,
+    agentMaxDepth: codexConfig?.agentMaxDepth ?? null,
+    agentMaxDepthEffective: agentMaxDepth,
+    agentJobMaxRuntimeSeconds: codexConfig?.agentJobMaxRuntimeSeconds ?? null,
     authCache,
     projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
@@ -2934,6 +3011,10 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(14, metrics.scanMs / 900);
   score -= Math.min(12, metrics.stateQueryMs / 40);
   score -= Math.min(12, metrics.logQueryMs / 80);
+  score -= Math.min(14, Math.max(0, Number(metrics.processCount || 0) - 10) * 0.3);
+  score -= Math.min(8, ((Number(metrics.processRssBytes || 0) / 1024 ** 3) || 0) * 1.2);
+  score -= Math.min(8, Math.max(0, Number(metrics.agentMaxDepth || 1) - 1) * 4);
+  score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
   return Math.round(clampNumber(score, 0, 100));
 }
 
@@ -2971,6 +3052,20 @@ function benchmarkGuidance(metrics) {
   if (metrics.logWalBytes > 256 * 1024 ** 2) guidance.push("Prune and checkpoint logs to shrink WAL pressure.");
   if (metrics.logBytes > 1024 ** 3) guidance.push(`Compact ${formatBytesServer(metrics.logBytes)} of local log data.`);
   if (metrics.oversizedActiveFiles > 20) guidance.push("Move or archive old large transcripts out of active sessions.");
+  if (metrics.processCount >= 24) {
+    guidance.push(
+      `Close idle Codex work: ${Number(metrics.processCount).toLocaleString()} live Codex process${metrics.processCount === 1 ? "" : "es"} are using ${formatBytesServer(metrics.processRssBytes)}.`,
+    );
+  } else if (metrics.processCount >= 12) {
+    guidance.push(`Codex has ${Number(metrics.processCount).toLocaleString()} live processes; close idle threads before judging cleanup.`);
+  }
+  if (metrics.agentMaxDepth > 1) {
+    guidance.push(
+      `Cap subagent depth back toward 1 unless you deliberately need recursive delegation; depth ${Number(metrics.agentMaxDepth).toLocaleString()} can add latency and resource load.`,
+    );
+  } else if (metrics.agentMaxThreads >= 12) {
+    guidance.push(`Keep subagent fan-out scoped; agents.max_threads is ${Number(metrics.agentMaxThreads).toLocaleString()}.`);
+  }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
     guidance.push(
@@ -3606,6 +3701,11 @@ function benchmarkDeltas(current, previous) {
     "oversizedActiveFiles",
     "staleThreads",
     "archivedFilesInSessions",
+    "processCount",
+    "processRssBytes",
+    "processHelperCount",
+    "agentMaxThreads",
+    "agentMaxDepth",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -3626,6 +3726,11 @@ function summarizeBenchmarkEntry(entry) {
     logWalBytes: entry.metrics.logWalBytes,
     staleThreads: entry.metrics.staleThreads,
     oversizedActiveFiles: entry.metrics.oversizedActiveFiles,
+    processCount: entry.metrics.processCount || 0,
+    processHelperCount: entry.metrics.processHelperCount || 0,
+    processRssBytes: entry.metrics.processRssBytes || 0,
+    agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
+    agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -3650,6 +3755,8 @@ export async function benchmarkHistory(limit = 12) {
         logBytes: latest.logBytes - oldest.logBytes,
         logWalBytes: latest.logWalBytes - oldest.logWalBytes,
         staleThreads: latest.staleThreads - oldest.staleThreads,
+        processCount: latest.processCount - oldest.processCount,
+        processRssBytes: latest.processRssBytes - oldest.processRssBytes,
       }
     : null;
   const previousDeltas = latest && previous
@@ -3659,6 +3766,7 @@ export async function benchmarkHistory(limit = 12) {
         scanMs: latest.scanMs - previous.scanMs,
         stateQueryMs: latest.stateQueryMs - previous.stateQueryMs,
         logQueryMs: latest.logQueryMs - previous.logQueryMs,
+        processCount: latest.processCount - previous.processCount,
       }
     : null;
   const trend =
@@ -3735,6 +3843,11 @@ export async function runBenchmark() {
     archivedDeleteRows: scan.categories.archivedDeleteCandidates?.dbRowCount || 0,
     archivedDeleteBytes: scan.categories.archivedDeleteCandidates?.bytes || 0,
     archivedDeleteDays: scan.categories.archivedDeleteCandidates?.days || 30,
+    processCount: scan.processes?.processCount || 0,
+    processHelperCount: scan.processes?.helperCount || 0,
+    processRssBytes: scan.processes?.rssBytes || 0,
+    agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
+    agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
   };
   metrics.scoreBreakdown = localScoreBreakdown(metrics);
   metrics.score = metrics.scoreBreakdown.score;
