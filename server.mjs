@@ -2421,6 +2421,86 @@ function benchmarkDeltas(current, previous) {
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
 
+function summarizeBenchmarkEntry(entry) {
+  if (!entry?.metrics) return null;
+  return {
+    generatedAt: entry.generatedAt || entry.metrics.generatedAt,
+    rating: entry.rating || benchmarkRating(entry.metrics.score),
+    liveRating: entry.liveRating || benchmarkRating(entry.metrics.liveScore),
+    score: entry.metrics.score,
+    liveScore: entry.metrics.liveScore,
+    scanMs: entry.metrics.scanMs,
+    stateQueryMs: entry.metrics.stateQueryMs,
+    logQueryMs: entry.metrics.logQueryMs,
+    activeSessionBytes: entry.metrics.activeSessionBytes,
+    logBytes: entry.metrics.logBytes,
+    logWalBytes: entry.metrics.logWalBytes,
+    staleThreads: entry.metrics.staleThreads,
+    oversizedActiveFiles: entry.metrics.oversizedActiveFiles,
+    scoreModel: entry.metrics.scoreModel,
+  };
+}
+
+export async function benchmarkHistory(limit = 12) {
+  const rawEntries = await readJsonlEntries(paths.benchmarkLog, normalizeDays(limit, 12, { min: 1, max: 50 }));
+  const entries = rawEntries.map(summarizeBenchmarkEntry).filter(Boolean);
+  const latest = entries[0] || null;
+  const comparable = latest ? entries.filter((entry) => entry.scoreModel === latest.scoreModel) : entries;
+  const oldest = comparable[comparable.length - 1] || null;
+  const previous = comparable[1] || null;
+  const best = comparable.reduce((winner, entry) => (!winner || entry.score > winner.score ? entry : winner), null);
+  const deltas = latest && oldest && latest !== oldest
+    ? {
+        score: latest.score - oldest.score,
+        liveScore: latest.liveScore - oldest.liveScore,
+        scanMs: latest.scanMs - oldest.scanMs,
+        stateQueryMs: latest.stateQueryMs - oldest.stateQueryMs,
+        logQueryMs: latest.logQueryMs - oldest.logQueryMs,
+        activeSessionBytes: latest.activeSessionBytes - oldest.activeSessionBytes,
+        logBytes: latest.logBytes - oldest.logBytes,
+        logWalBytes: latest.logWalBytes - oldest.logWalBytes,
+        staleThreads: latest.staleThreads - oldest.staleThreads,
+      }
+    : null;
+  const previousDeltas = latest && previous
+    ? {
+        score: latest.score - previous.score,
+        liveScore: latest.liveScore - previous.liveScore,
+        scanMs: latest.scanMs - previous.scanMs,
+        stateQueryMs: latest.stateQueryMs - previous.stateQueryMs,
+        logQueryMs: latest.logQueryMs - previous.logQueryMs,
+      }
+    : null;
+  const trend =
+    !deltas ? "baseline" : deltas.score > 0 ? "improved" : deltas.score < 0 ? "declined" : "flat";
+  const summary =
+    !latest
+      ? "No speed checks have been saved yet."
+      : !deltas
+        ? `Baseline saved at ${latest.score}/100. Run another check after cleanup to prove the change.`
+        : trend === "improved"
+          ? `Score improved by ${deltas.score} point${deltas.score === 1 ? "" : "s"} since the first comparable check.`
+          : trend === "declined"
+            ? `Score is ${Math.abs(deltas.score)} point${Math.abs(deltas.score) === 1 ? "" : "s"} lower than the first comparable check.`
+            : "Score is flat against the first comparable check; compare timings and state weight below.";
+
+  return {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    count: entries.length,
+    comparableCount: comparable.length,
+    trend,
+    summary,
+    latest,
+    previous,
+    oldest,
+    best,
+    deltas,
+    previousDeltas,
+    entries,
+  };
+}
+
 export async function runBenchmark() {
   const previous = await readLastJsonl(paths.benchmarkLog);
   const scanTimed = await timedValue(scanCodex);
@@ -2493,6 +2573,7 @@ export async function runBenchmark() {
 
   await fs.mkdir(path.dirname(paths.benchmarkLog), { recursive: true });
   await fs.appendFile(paths.benchmarkLog, `${JSON.stringify(entry)}\n`, "utf8");
+  entry.history = await benchmarkHistory(12);
   return entry;
 }
 
@@ -3001,6 +3082,11 @@ async function handleRequest(req, res) {
 
     if (req.method === "POST" && url.pathname === "/api/benchmark") {
       sendJson(res, 200, await runBenchmark());
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/benchmark-history") {
+      sendJson(res, 200, await benchmarkHistory(Number(url.searchParams.get("limit") || 12)));
       return;
     }
 

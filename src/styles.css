@@ -963,6 +963,69 @@ body[data-hard-mode] .benchmark-guidance span:nth-child(n + 2) {
   display: block;
 }
 
+.benchmark-proof {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.32rem;
+}
+
+.benchmark-proof span {
+  overflow: hidden;
+  border: 1px solid rgba(190, 224, 100, 0.24);
+  border-radius: 6px;
+  padding: 0.34rem 0.38rem;
+  color: var(--green);
+  background: rgba(190, 224, 100, 0.08);
+  font-size: 0.68rem;
+  font-weight: 950;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.benchmark-history {
+  display: none;
+  grid-column: 1 / -1;
+  gap: 0.32rem;
+}
+
+body[data-hard-mode] .benchmark-history {
+  display: grid;
+}
+
+.benchmark-history article {
+  display: grid;
+  grid-template-columns: 2.4rem minmax(2.2rem, auto) minmax(0, 1fr);
+  gap: 0.38rem;
+  align-items: center;
+  border: 1px solid rgba(255, 242, 210, 0.12);
+  border-radius: 6px;
+  padding: 0.34rem 0.4rem;
+  background: rgba(255, 242, 210, 0.045);
+}
+
+.benchmark-history strong {
+  color: var(--cream);
+  font-size: 0.88rem;
+  font-weight: 950;
+}
+
+.benchmark-history span,
+.benchmark-history small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.benchmark-history span {
+  color: var(--green);
+}
+
 .benchmark-card button {
   grid-column: 1 / -1;
   justify-self: stretch;

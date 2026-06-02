@@ -70,6 +70,8 @@ const elements = {
   benchmarkRating: $("#benchmarkRating"),
   benchmarkMeaning: $("#benchmarkMeaning"),
   benchmarkGuidance: $("#benchmarkGuidance"),
+  benchmarkProof: $("#benchmarkProof"),
+  benchmarkHistory: $("#benchmarkHistory"),
   benchmarkScan: $("#benchmarkScan"),
   benchmarkState: $("#benchmarkState"),
   benchmarkDelta: $("#benchmarkDelta"),
@@ -581,6 +583,50 @@ function renderBenchmark(benchmark) {
       .map((item) => `<span>${escapeHtml(item)}</span>`)
       .join("");
   }
+  if (benchmark.history) renderBenchmarkHistory(benchmark.history);
+}
+
+function renderBenchmarkHistory(history) {
+  if (!elements.benchmarkProof && !elements.benchmarkHistory) return;
+  const latest = history?.latest;
+  const best = history?.best;
+  const deltas = history?.deltas;
+  const previousDeltas = history?.previousDeltas;
+  if (elements.benchmarkProof) {
+    if (!latest) {
+      elements.benchmarkProof.innerHTML = `<span>No saved checks yet.</span>`;
+    } else if (!deltas) {
+      elements.benchmarkProof.innerHTML = `
+        <span>Baseline ${escapeHtml(String(latest.score))}/100</span>
+        <span>Best ${escapeHtml(String(best?.score ?? latest.score))}/100</span>
+        <span>${escapeHtml(formatDate(latest.generatedAt))}</span>
+      `;
+    } else {
+      elements.benchmarkProof.innerHTML = `
+        <span>Trend ${escapeHtml(formatSigned(deltas.score))}</span>
+        <span>Best ${escapeHtml(String(best?.score ?? latest.score))}/100</span>
+        <span>Active ${escapeHtml(formatByteDelta(deltas.activeSessionBytes || 0))}</span>
+      `;
+    }
+    elements.benchmarkProof.title = history?.summary || "Speed proof is based on saved local benchmark checks.";
+  }
+  if (elements.benchmarkHistory) {
+    const entries = history?.entries || [];
+    elements.benchmarkHistory.innerHTML = entries.length
+      ? entries
+          .slice(0, 4)
+          .map(
+            (entry, index) => `
+              <article title="${escapeHtml(formatDate(entry.generatedAt))}">
+                <strong>${escapeHtml(String(entry.score))}</strong>
+                <span>${escapeHtml(index === 0 && previousDeltas ? formatSigned(previousDeltas.score) : entry.rating || "Check")}</span>
+                <small>${escapeHtml(formatMs(entry.scanMs))} scan / ${escapeHtml(formatMs(entry.stateQueryMs))} state</small>
+              </article>
+            `,
+          )
+          .join("")
+      : `<span>No saved speed checks yet.</span>`;
+  }
 }
 
 function renderRefitOutcome(outcome, benchmark = null) {
@@ -650,6 +696,18 @@ async function refreshRecovery({ log = false } = {}) {
   } catch (error) {
     if (elements.recoveryBackupList) elements.recoveryBackupList.innerHTML = `<span>Recovery scan failed.</span>`;
     logOperation("Recovery scan failed", error.message, "danger");
+    return null;
+  }
+}
+
+async function refreshBenchmarkHistory() {
+  try {
+    const history = await api("/api/benchmark-history?limit=12");
+    renderBenchmarkHistory(history);
+    return history;
+  } catch (error) {
+    if (elements.benchmarkProof) elements.benchmarkProof.innerHTML = `<span>Proof history unavailable.</span>`;
+    if (elements.benchmarkHistory) elements.benchmarkHistory.innerHTML = `<span>Benchmark history unavailable.</span>`;
     return null;
   }
 }
@@ -761,6 +819,7 @@ async function runBenchmark({ fromAction = false } = {}) {
   try {
     const benchmark = await api("/api/benchmark", { method: "POST" });
     renderBenchmark(benchmark);
+    if (!benchmark.history) await refreshBenchmarkHistory();
     const delta = benchmark.deltas ? ` ${formatSigned(benchmark.deltas.score)} since prior check.` : " Baseline saved.";
     const guidance = benchmark.guidance?.[0] ? ` ${benchmark.guidance[0]}` : "";
     logOperation(
@@ -929,3 +988,4 @@ renderMode();
 renderDeleteArmState();
 refreshScan();
 refreshRecovery();
+refreshBenchmarkHistory();
