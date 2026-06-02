@@ -1229,6 +1229,37 @@ body[data-hard-mode] .doctor-fix-kit {
   background: rgba(126, 154, 211, 0.08);
 }
 
+.official-doctor article.official-fix {
+  grid-column: span 2;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  border-top-color: var(--teal);
+}
+
+.official-doctor article.official-fix pre {
+  grid-column: 1 / -1;
+  max-height: 104px;
+  margin: 0.18rem 0 0;
+  overflow: auto;
+  border: 1px solid rgba(255, 242, 210, 0.14);
+  border-radius: 6px;
+  padding: 0.42rem;
+  background: rgba(0, 0, 0, 0.42);
+  color: var(--cream);
+  font: 700 0.64rem/1.26 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
+.official-doctor article.official-fix button {
+  min-width: 58px;
+  min-height: 30px;
+  border-color: rgba(81, 214, 199, 0.4);
+  padding: 0.32rem 0.52rem;
+  background: rgba(81, 214, 199, 0.18);
+  color: var(--teal);
+  font-size: 0.64rem;
+}
+
 .doctor-queue article {
   min-height: 76px;
   border-top-color: var(--green);
@@ -2161,6 +2192,10 @@ body[data-busy] .app-shell {
   .target-card,
   .log-item {
     grid-template-columns: 1fr;
+  }
+
+  .official-doctor article.official-fix {
+    grid-column: auto;
   }
 
   .metric strong {

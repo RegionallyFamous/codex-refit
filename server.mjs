@@ -325,6 +325,109 @@ function parseDoctorRolloutDetails(value) {
   return { files: Number(match[1]), bytes: Number(match[2]) };
 }
 
+function buildOfficialDoctorFixes(findings, report) {
+  const byId = new Map((findings || []).map((finding) => [finding.id, finding]));
+  const fixes = [];
+  const addFix = (fix) => {
+    if (!fix?.id || fixes.some((existing) => existing.id === fix.id)) return;
+    fixes.push(fix);
+  };
+
+  if (byId.has("terminal.env")) {
+    addFix({
+      id: "official-terminal-env",
+      label: "Terminal Env",
+      value: "TERM",
+      tone: "medium",
+      action: "Copy shell check",
+      detail: "Codex Doctor reports TERM=dumb. This shell-only check does not edit profile files.",
+      snippet: [
+        "# Check terminal settings without printing secrets.",
+        'printf "TERM=%s\\nNO_COLOR=%s\\n" "${TERM:-unset}" "${NO_COLOR:-unset}"',
+        "",
+        "# For this terminal only:",
+        "export TERM=xterm-256color",
+        "unset NO_COLOR",
+        "codex doctor --summary",
+      ].join("\n"),
+    });
+  }
+
+  if (byId.has("auth.mixed-mode")) {
+    addFix({
+      id: "official-auth-mode",
+      label: "Auth Mode",
+      value: "Mixed",
+      tone: "medium",
+      action: "Copy safe unset",
+      detail: "Use either ChatGPT login or API-key mode intentionally. This snippet never prints the key.",
+      snippet: [
+        "# For ChatGPT login mode in this terminal only. Do not print OPENAI_API_KEY.",
+        "unset OPENAI_API_KEY",
+        "codex doctor --summary",
+        "",
+        "# If that fixes repeated prompts or reachability confusion, remove OPENAI_API_KEY",
+        "# from the shell/profile/launcher that starts Codex, after confirming you do not need API-key mode.",
+      ].join("\n"),
+    });
+  }
+
+  if (byId.has("updates.available")) {
+    const updateAction = report?.checks?.["updates.status"]?.details?.["update action"] || "npm install -g @openai/codex";
+    addFix({
+      id: "official-update-cli",
+      label: "CLI Update",
+      value: report?.checks?.["updates.status"]?.details?.["latest version"] || "Newer",
+      tone: "medium",
+      action: "Copy update",
+      detail: "Aligning the CLI with the newer Codex build removes version drift from the speed investigation.",
+      snippet: [
+        "# Update terminal Codex, then compare both versions.",
+        updateAction,
+        "codex --version",
+        "/Applications/Codex.app/Contents/Resources/codex --version",
+        "codex doctor --summary",
+      ].join("\n"),
+    });
+  }
+
+  if (byId.has("mcp.config")) {
+    addFix({
+      id: "official-mcp-config",
+      label: "MCP Config",
+      value: "Inspect",
+      tone: "medium",
+      action: "Copy MCP check",
+      detail: "Show only the redacted MCP Doctor fields, then disable or repair the affected optional server.",
+      snippet: [
+        "# Print only Codex Doctor's redacted MCP summary.",
+        "codex doctor --json | node -e 'let s=\"\"; process.stdin.on(\"data\", d => s += d); process.stdin.on(\"end\", () => { const c = JSON.parse(s).checks[\"mcp.config\"]; console.log(c.summary); console.log(c.remediation || \"No remediation\"); console.log(Object.entries(c.details || {}).map(([k,v]) => `${k}: ${v}`).join(\"\\n\")); });'",
+        "",
+        "# Then edit ~/.codex/config.toml: set the missing env vars or disable that optional MCP server.",
+      ].join("\n"),
+    });
+  }
+
+  if (byId.has("state.active-rollouts")) {
+    addFix({
+      id: "official-active-rollouts",
+      label: "Active Weight",
+      value: "Refit",
+      tone: "medium",
+      action: "Run Smart Optimize",
+      detail: "Use Codex Refit's non-delete cleanup first, then rerun Doctor and Speed Check.",
+      snippet: [
+        "# In Codex Refit, run Smart Optimize first.",
+        "# Then prove the change:",
+        "codex doctor --summary",
+        "# Back in Codex Refit, run Speed Check.",
+      ].join("\n"),
+    });
+  }
+
+  return fixes.slice(0, 5);
+}
+
 function buildOfficialDoctorSummary(report, meta = {}) {
   const checks = Object.values(report?.checks || {});
   const counts = checks.reduce(
@@ -408,6 +511,7 @@ function buildOfficialDoctorSummary(report, meta = {}) {
       return (rank[b.tone] || 0) - (rank[a.tone] || 0);
     })
     .slice(0, 8);
+  const fixes = buildOfficialDoctorFixes(sortedFindings, report);
 
   return {
     status: report?.overallStatus || meta.status || "unknown",
@@ -419,6 +523,7 @@ function buildOfficialDoctorSummary(report, meta = {}) {
     durationMs: meta.durationMs || 0,
     counts,
     findings: sortedFindings,
+    fixes,
     headline: sortedFindings.length
       ? `${sortedFindings.length.toLocaleString()} Doctor finding${sortedFindings.length === 1 ? "" : "s"} need attention.`
       : "Official Codex Doctor did not find blocking issues.",

@@ -506,6 +506,7 @@ function renderOfficialDoctor(report) {
   elements.officialDoctor.hidden = false;
   const counts = report.counts || {};
   const findings = report.findings || [];
+  const fixes = report.fixes || [];
   const issueCount = findings.length;
   const countLine = `${counts.ok || 0} ok / ${counts.warning || 0} warn / ${counts.fail || 0} fail`;
   elements.officialDoctor.innerHTML = `
@@ -534,6 +535,28 @@ function renderOfficialDoctor(report) {
             )
             .join("")
         : `<article class="low"><span>Findings</span><strong>Clear</strong><small>${escapeHtml(report.headline || "No official Doctor findings need attention.")}</small></article>`
+    }
+    ${
+      fixes.length
+        ? fixes
+            .slice(0, 3)
+            .map((fix) => {
+              const snippet = fix.snippet ? escapeHtml(fix.snippet) : "";
+              const copyValue = fix.snippet ? encodeURIComponent(fix.snippet) : "";
+              return `
+                <article class="official-fix ${escapeHtml(fix.tone || "medium")}" title="${escapeHtml(fix.detail || "")}">
+                  <div>
+                    <span>${escapeHtml(fix.label || "Fix")}</span>
+                    <strong>${escapeHtml(fix.value || "--")}</strong>
+                    <small>${escapeHtml(fix.action || fix.detail || "")}</small>
+                  </div>
+                  ${snippet ? `<pre><code>${snippet}</code></pre>` : ""}
+                  ${copyValue ? `<button class="copy-fix" type="button" data-copy="${copyValue}">Copy</button>` : ""}
+                </article>
+              `;
+            })
+            .join("")
+        : ""
     }
   `;
 }
