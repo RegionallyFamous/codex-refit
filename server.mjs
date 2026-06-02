@@ -308,6 +308,182 @@ function isTopLevelMcpSection(section) {
   return Boolean(name && !name.includes("."));
 }
 
+function mcpServerDescriptors(sections) {
+  const descriptors = [];
+  const seen = new Set();
+  const pushDescriptor = (descriptor) => {
+    if (seen.has(descriptor.section)) return;
+    seen.add(descriptor.section);
+    descriptors.push(descriptor);
+  };
+
+  for (const section of sections) {
+    if (isTopLevelMcpSection(section)) {
+      pushDescriptor({
+        section,
+        scope: "user",
+        name: section.slice("mcp_servers.".length),
+        pluginSection: null,
+      });
+      continue;
+    }
+
+    const pluginMatch = section.match(/^plugins\."([^"]+)"\.mcp_servers\.([A-Za-z0-9_-]+)$/);
+    if (pluginMatch) {
+      pushDescriptor({
+        section,
+        scope: "plugin",
+        name: pluginMatch[2],
+        pluginSection: `plugins."${pluginMatch[1]}"`,
+      });
+    }
+  }
+
+  return descriptors;
+}
+
+function tomlArrayStringNames(value) {
+  if (value === undefined || value === null) return [];
+  const text = String(value);
+  const objectNames = [...text.matchAll(/\bname\s*=\s*["']([^"']+)["']/g)].map((match) => match[1]);
+  const withoutObjects = text.replace(/\{[^}]*\}/g, "");
+  const stringNames = [...withoutObjects.matchAll(/["']([^"']+)["']/g)].map((match) => match[1]);
+  return [...new Set([...stringNames, ...objectNames].filter(Boolean))];
+}
+
+function tomlInlineTableValues(value) {
+  if (value === undefined || value === null) return [];
+  return [...String(value).matchAll(/=\s*["']([^"']+)["']/g)].map((match) => match[1]).filter(Boolean);
+}
+
+function mcpEnvVarNames(values, section) {
+  const names = [];
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) names.push(value);
+  };
+
+  for (const name of tomlArrayStringNames(values[`${section}.env_vars`])) add(name);
+  add(values[`${section}.bearer_token_env_var`]);
+
+  for (const value of tomlInlineTableValues(values[`${section}.env_http_headers`])) add(value);
+  const envHttpPrefix = `${section}.env_http_headers.`;
+  for (const [key, value] of Object.entries(values)) {
+    if (key.startsWith(envHttpPrefix)) add(value);
+  }
+
+  return [...new Set(names)];
+}
+
+function mcpInlineEnvCount(values, section) {
+  let count = 0;
+  if (values[`${section}.env`]) {
+    count += tomlInlineTableValues(values[`${section}.env`]).length;
+  }
+  const envPrefix = `${section}.env.`;
+  for (const key of Object.keys(values)) {
+    if (key.startsWith(envPrefix)) count += 1;
+  }
+  return count;
+}
+
+function pluralVerb(count, singular = "was", plural = "were") {
+  return Number(count) === 1 ? singular : plural;
+}
+
+function buildMcpConfigSummary(values = {}, sections = []) {
+  const descriptors = mcpServerDescriptors(sections);
+  const servers = descriptors.map((descriptor) => {
+    const section = descriptor.section;
+    const pluginEnabled = descriptor.pluginSection ? values[`${descriptor.pluginSection}.enabled`] !== false : true;
+    const enabled = pluginEnabled && values[`${section}.enabled`] !== false;
+    const hasCommand = Boolean(values[`${section}.command`]);
+    const hasUrl = Boolean(values[`${section}.url`]);
+    const transport = hasCommand ? "stdio" : hasUrl ? "http" : "unknown";
+    const startupTimeoutSec = configNumber(values[`${section}.startup_timeout_sec`]) ?? 10;
+    const toolTimeoutSec = configNumber(values[`${section}.tool_timeout_sec`]) ?? 60;
+    const envVarNames = mcpEnvVarNames(values, section);
+    const missingEnvVarCount = envVarNames.filter((name) => process.env[name] === undefined).length;
+    const inlineEnvCount = mcpInlineEnvCount(values, section);
+    const hasToolFilter = Boolean(values[`${section}.enabled_tools`] || values[`${section}.disabled_tools`]);
+
+    return {
+      scope: descriptor.scope,
+      name: descriptor.name,
+      enabled,
+      required: enabled && values[`${section}.required`] === true,
+      transport,
+      remoteStdio: enabled && hasCommand && values[`${section}.experimental_environment`] === "remote",
+      startupTimeoutSec,
+      toolTimeoutSec,
+      envVarCount: envVarNames.length,
+      missingEnvVarCount,
+      inlineEnvCount,
+      hasToolFilter,
+      defaultToolsApprovalMode: values[`${section}.default_tools_approval_mode`] || null,
+      configured: {
+        command: hasCommand,
+        url: hasUrl,
+      },
+    };
+  });
+
+  const enabledServers = servers.filter((server) => server.enabled);
+  const enabledCount = enabledServers.length;
+  const requiredCount = enabledServers.filter((server) => server.required).length;
+  const stdioCount = enabledServers.filter((server) => server.transport === "stdio").length;
+  const httpCount = enabledServers.filter((server) => server.transport === "http").length;
+  const unknownTransportCount = enabledServers.filter((server) => server.transport === "unknown").length;
+  const remoteStdioCount = enabledServers.filter((server) => server.remoteStdio).length;
+  const pluginMcpCount = enabledServers.filter((server) => server.scope === "plugin").length;
+  const missingEnvVarCount = enabledServers.reduce((total, server) => total + server.missingEnvVarCount, 0);
+  const longStartupTimeoutCount = enabledServers.filter((server) => server.startupTimeoutSec > 20).length;
+  const longToolTimeoutCount = enabledServers.filter((server) => server.toolTimeoutSec > 120).length;
+  const unfilteredToolServerCount = enabledServers.filter((server) => !server.hasToolFilter).length;
+  const broadApprovalServerCount = enabledServers.filter((server) => server.defaultToolsApprovalMode === "approve").length;
+  const highLoad = enabledCount >= 12 || requiredCount >= 3 || missingEnvVarCount >= 3 || unknownTransportCount > 0;
+  const mediumLoad =
+    highLoad ||
+    enabledCount >= 6 ||
+    requiredCount > 0 ||
+    pluginMcpCount >= 4 ||
+    missingEnvVarCount > 0 ||
+    longStartupTimeoutCount > 0 ||
+    longToolTimeoutCount > 0;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = enabledCount ? `${enabledCount.toLocaleString()} enabled` : descriptors.length ? "Disabled" : "None";
+  const detail = enabledCount
+    ? `${enabledCount.toLocaleString()} enabled MCP server${enabledCount === 1 ? "" : "s"}: ${stdioCount.toLocaleString()} stdio, ${httpCount.toLocaleString()} HTTP, ${pluginMcpCount.toLocaleString()} plugin-provided. ${requiredCount.toLocaleString()} required server${requiredCount === 1 ? "" : "s"} can fail session startup if initialization breaks.`
+    : descriptors.length
+      ? `${descriptors.length.toLocaleString()} MCP server${descriptors.length === 1 ? "" : "s"} configured but disabled.`
+      : "No configured MCP servers were found in user or current trusted project config.";
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    configuredCount: descriptors.length,
+    enabledCount,
+    disabledCount: servers.filter((server) => !server.enabled).length,
+    requiredCount,
+    stdioCount,
+    httpCount,
+    unknownTransportCount,
+    remoteStdioCount,
+    pluginMcpCount,
+    missingEnvVarCount,
+    longStartupTimeoutCount,
+    longToolTimeoutCount,
+    unfilteredToolServerCount,
+    broadApprovalServerCount,
+    servers,
+    detail:
+      missingEnvVarCount > 0
+        ? `${detail} ${missingEnvVarCount.toLocaleString()} referenced environment variable${missingEnvVarCount === 1 ? "" : "s"} ${pluralVerb(missingEnvVarCount)} not visible to this Refit process.`
+        : detail,
+  };
+}
+
 function readFirstLine(value) {
   return String(value || "").trim().split(/\r?\n/).find(Boolean) || null;
 }
@@ -1968,6 +2144,7 @@ async function getCodexConfigSummary() {
     enabledMcpCount: 0,
     disabledMcpCount: 0,
     requiredMcpCount: 0,
+    mcpSummary: buildMcpConfigSummary({}, []),
     profileCount: 0,
     profileSummaries: [],
     hasFastTaskProfile: false,
@@ -2047,10 +2224,24 @@ async function getCodexConfigSummary() {
       currentProject: summary.projectReadiness.currentProject,
     });
     summary.enabledPluginCount = sections.filter((section) => section.startsWith('plugins."') && values[`${section}.enabled`] === true).length;
-    const mcpSections = sections.filter(isTopLevelMcpSection);
-    summary.enabledMcpCount = mcpSections.filter((section) => values[`${section}.enabled`] !== false).length;
-    summary.disabledMcpCount = mcpSections.filter((section) => values[`${section}.enabled`] === false).length;
-    summary.requiredMcpCount = mcpSections.filter((section) => values[`${section}.required`] === true && values[`${section}.enabled`] !== false).length;
+    let mcpValues = values;
+    let mcpSections = sections;
+    const currentProjectConfigPath = summary.projectReadiness.currentProject?.path
+      ? path.join(summary.projectReadiness.currentProject.path, ".codex", "config.toml")
+      : null;
+    if (currentProjectConfigPath && (await exists(currentProjectConfigPath))) {
+      try {
+        const projectMcpConfig = parseTomlSummary(await fs.readFile(currentProjectConfigPath, "utf8"));
+        mcpValues = { ...mcpValues, ...projectMcpConfig.values };
+        mcpSections = [...mcpSections, ...projectMcpConfig.sections];
+      } catch {
+        // Keep MCP diagnostics available from the user config even if project config is unreadable.
+      }
+    }
+    summary.mcpSummary = buildMcpConfigSummary(mcpValues, mcpSections);
+    summary.enabledMcpCount = summary.mcpSummary.enabledCount;
+    summary.disabledMcpCount = summary.mcpSummary.disabledCount;
+    summary.requiredMcpCount = summary.mcpSummary.requiredCount;
   } catch (error) {
     summary.error = error.message;
   }
@@ -2145,6 +2336,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const currentProject = projectReadiness.currentProject;
   const authCache = codexConfig?.authCache || {};
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
+  const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const processSummary = context.processSummary || {};
   const backgroundSummary = processSummary.background || {};
   const hookSummary = codexConfig?.hookSummary || {};
@@ -2231,6 +2423,29 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# For a trusted, scoped speed run only, you can also choose fewer approval prompts:",
         '# approval_policy = "never"',
+      ].join("\n"),
+    });
+  }
+
+  if (mcpSummary.status === "ready" && mcpSummary.tone !== "low") {
+    addFix({
+      id: "mcp-startup-pressure",
+      label: "MCP Startup",
+      value: mcpSummary.label,
+      tone: mcpSummary.tone === "high" ? "high" : "medium",
+      action: "/mcp verbose",
+      detail:
+        "Codex starts configured MCP servers with a session. Required servers can fail startup if initialization breaks, and missing environment variables can make a useful server look slow or broken.",
+      snippet: [
+        "# In Codex:",
+        "/mcp verbose",
+        "",
+        "# For optional servers you do not need every run, edit ~/.codex/config.toml:",
+        "# [mcp_servers.example]",
+        "# enabled = false",
+        "",
+        "# Keep required = true only for servers every session truly needs.",
+        "# If desktop Codex cannot see MCP env vars, put them in ~/.codex/.env and restart the app.",
       ].join("\n"),
     });
   }
@@ -2506,6 +2721,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const projectGapCount = Number(projectReadiness.missingGuidanceCount || 0) + Number(projectReadiness.missingCodexDirCount || 0);
   const authCache = codexConfig?.authCache || {};
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
+  const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const globalGuidanceReady = Boolean(codexConfig?.globalAgentsExists);
   const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
@@ -2781,8 +2997,12 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         : "Subagent fan-out is using Codex defaults: 6 open agent threads and depth 1.";
   const trustedProjectCount = Number(codexConfig?.trustedProjectCount || 0);
   const enabledPluginCount = Number(codexConfig?.enabledPluginCount || 0);
-  const enabledMcpCount = Number(codexConfig?.enabledMcpCount || 0);
-  const requiredMcpCount = Number(codexConfig?.requiredMcpCount || 0);
+  const enabledMcpCount = Number(mcpSummary.enabledCount ?? codexConfig?.enabledMcpCount ?? 0);
+  const requiredMcpCount = Number(mcpSummary.requiredCount ?? codexConfig?.requiredMcpCount ?? 0);
+  const mcpStartupLoaded = mcpSummary.tone !== "low";
+  const mcpStartupDetail =
+    mcpSummary.detail ||
+    `${enabledMcpCount.toLocaleString()} MCP server${enabledMcpCount === 1 ? "" : "s"} are enabled. Use /mcp to inspect active tools.`;
   const workflowAdvice = [
     {
       id: "live-process-load",
@@ -2859,21 +3079,23 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       id: "tool-surface",
       label: "Tool Surface",
       value: `${enabledPluginCount} / ${enabledMcpCount}`,
-      tone: enabledPluginCount + enabledMcpCount > 10 ? "medium" : "low",
-      action: enabledPluginCount + enabledMcpCount > 10 ? "Disable unused" : "Keep intentional",
-      priority: enabledPluginCount + enabledMcpCount > 10 ? 48 : 14,
-      detail: `${enabledPluginCount.toLocaleString()} plugin${enabledPluginCount === 1 ? "" : "s"} and ${enabledMcpCount.toLocaleString()} MCP server${enabledMcpCount === 1 ? "" : "s"} are enabled. Keep only useful surfaces active for clearer runs.`,
+      tone: mcpStartupLoaded || enabledPluginCount + enabledMcpCount > 10 ? "medium" : "low",
+      action: mcpStartupLoaded ? "/mcp verbose" : enabledPluginCount + enabledMcpCount > 10 ? "Disable unused" : "Keep intentional",
+      priority: mcpStartupLoaded ? (mcpSummary.tone === "high" ? 82 : 58) : enabledPluginCount + enabledMcpCount > 10 ? 48 : 14,
+      detail: `${enabledPluginCount.toLocaleString()} plugin${enabledPluginCount === 1 ? "" : "s"} and ${enabledMcpCount.toLocaleString()} MCP server${enabledMcpCount === 1 ? "" : "s"} are enabled. ${mcpStartupDetail}`,
     },
     {
       id: "required-mcp",
       label: "Required MCP",
       value: requiredMcpCount ? requiredMcpCount.toLocaleString() : "None",
-      tone: requiredMcpCount ? "medium" : "low",
-      action: requiredMcpCount ? "Reserve for critical" : "No startup blockers",
-      priority: requiredMcpCount ? 44 : 12,
+      tone: requiredMcpCount || mcpSummary.missingEnvVarCount ? "medium" : "low",
+      action: requiredMcpCount ? "Reserve for critical" : mcpSummary.missingEnvVarCount ? "Check env" : "No startup blockers",
+      priority: requiredMcpCount ? 60 : mcpSummary.missingEnvVarCount ? 54 : 12,
       detail:
         requiredMcpCount > 0
-          ? "Required MCP servers can block startup if they fail. Use required only for tools every run truly needs."
+          ? `Required MCP servers can block startup if they fail. Use required only for tools every run truly needs. ${mcpSummary.missingEnvVarCount ? `${mcpSummary.missingEnvVarCount.toLocaleString()} referenced environment variable${mcpSummary.missingEnvVarCount === 1 ? "" : "s"} ${pluralVerb(mcpSummary.missingEnvVarCount)} not visible to Refit.` : ""}`
+          : mcpSummary.missingEnvVarCount
+            ? `${mcpSummary.missingEnvVarCount.toLocaleString()} referenced MCP environment variable${mcpSummary.missingEnvVarCount === 1 ? "" : "s"} ${pluralVerb(mcpSummary.missingEnvVarCount)} not visible to Refit. Desktop apps may need ~/.codex/.env plus restart.`
           : "No enabled MCP server is marked required, so MCP startup should be less brittle.",
     },
   ].sort((a, b) => b.priority - a.priority);
@@ -3033,6 +3255,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: agentFanoutHeavy ? "high" : "medium",
       priority: agentFanoutHeavy ? 86 : 70,
       detail: agentFanoutDetail,
+    });
+  }
+
+  if (mcpSummary.status === "ready" && mcpSummary.tone !== "low") {
+    addRecommendation({
+      id: "mcp-startup-pressure",
+      label: "MCP Startup",
+      value: mcpSummary.label,
+      action: "/mcp verbose",
+      tone: mcpSummary.tone === "high" ? "high" : "medium",
+      priority: mcpSummary.tone === "high" ? 84 : 62,
+      detail:
+        mcpSummary.missingEnvVarCount > 0
+          ? `${mcpSummary.missingEnvVarCount.toLocaleString()} referenced MCP environment variable${mcpSummary.missingEnvVarCount === 1 ? "" : "s"} ${pluralVerb(mcpSummary.missingEnvVarCount)} not visible to Refit. Check /mcp verbose and ~/.codex/.env before blaming Codex latency.`
+          : `${mcpSummary.detail} Disable optional servers you do not need in every run.`,
     });
   }
 
@@ -3226,6 +3463,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     enabledPluginCount,
     enabledMcpCount,
     requiredMcpCount,
+    mcpSummary,
     runtime,
     processSummary,
     cards,
@@ -3653,6 +3891,10 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(8, Math.max(0, Number(metrics.hookTurnScopedCommandCount || 0) - 1) * 1.2);
   score -= Math.min(4, Math.max(0, Number(metrics.hookBroadMatcherCount || 0)) * 1.5);
   if (metrics.approvalAutoReview) score -= 4;
+  score -= Math.min(8, Math.max(0, Number(metrics.mcpEnabledCount || 0) - 6) * 0.7);
+  score -= Math.min(5, Number(metrics.mcpRequiredCount || 0) * 1.5);
+  score -= Math.min(5, Number(metrics.mcpMissingEnvVarCount || 0) * 2);
+  score -= Math.min(3, Number(metrics.mcpLongStartupTimeoutCount || 0) * 1.2);
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   return Math.round(clampNumber(score, 0, 100));
 }
@@ -3720,6 +3962,17 @@ function benchmarkGuidance(metrics) {
   }
   if (metrics.approvalAutoReview) {
     guidance.push("Auto-review is enabled for interactive approvals. It can reduce clicks, but uses extra model calls for eligible approval requests.");
+  }
+  if (metrics.mcpMissingEnvVarCount > 0) {
+    guidance.push(
+      `Check MCP environment setup: ${Number(metrics.mcpMissingEnvVarCount).toLocaleString()} referenced env var${metrics.mcpMissingEnvVarCount === 1 ? "" : "s"} ${metrics.mcpMissingEnvVarCount === 1 ? "was" : "were"} not visible to Refit.`,
+    );
+  } else if (metrics.mcpRequiredCount > 0) {
+    guidance.push(
+      `Review ${Number(metrics.mcpRequiredCount).toLocaleString()} required MCP server${metrics.mcpRequiredCount === 1 ? "" : "s"} with /mcp verbose; required servers can fail session startup if initialization breaks.`,
+    );
+  } else if (metrics.mcpEnabledCount >= 8) {
+    guidance.push(`Trim optional MCP servers for quick local tasks; ${Number(metrics.mcpEnabledCount).toLocaleString()} are enabled.`);
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -4364,6 +4617,12 @@ function benchmarkDeltas(current, previous) {
     "backgroundCpuPercent",
     "agentMaxThreads",
     "agentMaxDepth",
+    "mcpEnabledCount",
+    "mcpRequiredCount",
+    "mcpMissingEnvVarCount",
+    "mcpStdioCount",
+    "mcpHttpCount",
+    "mcpLongStartupTimeoutCount",
     "hookCommandCount",
     "hookTurnScopedCommandCount",
     "hookBroadMatcherCount",
@@ -4400,6 +4659,12 @@ function summarizeBenchmarkEntry(entry) {
     approvalAutoReview: Boolean(entry.metrics.approvalAutoReview),
     approvalInteractive: entry.metrics.approvalInteractive !== false,
     approvalGranularPolicy: Boolean(entry.metrics.approvalGranularPolicy),
+    mcpEnabledCount: entry.metrics.mcpEnabledCount || 0,
+    mcpRequiredCount: entry.metrics.mcpRequiredCount || 0,
+    mcpMissingEnvVarCount: entry.metrics.mcpMissingEnvVarCount || 0,
+    mcpStdioCount: entry.metrics.mcpStdioCount || 0,
+    mcpHttpCount: entry.metrics.mcpHttpCount || 0,
+    mcpLongStartupTimeoutCount: entry.metrics.mcpLongStartupTimeoutCount || 0,
     hooksFeature: entry.metrics.hooksFeature !== false,
     hookCommandCount: entry.metrics.hookCommandCount || 0,
     hookTurnScopedCommandCount: entry.metrics.hookTurnScopedCommandCount || 0,
@@ -4436,6 +4701,9 @@ export async function benchmarkHistory(limit = 12) {
         processRssBytes: latest.processRssBytes - oldest.processRssBytes,
         backgroundProcessCount: latest.backgroundProcessCount - oldest.backgroundProcessCount,
         backgroundRssBytes: latest.backgroundRssBytes - oldest.backgroundRssBytes,
+        mcpEnabledCount: latest.mcpEnabledCount - oldest.mcpEnabledCount,
+        mcpRequiredCount: latest.mcpRequiredCount - oldest.mcpRequiredCount,
+        mcpMissingEnvVarCount: latest.mcpMissingEnvVarCount - oldest.mcpMissingEnvVarCount,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
       }
     : null;
@@ -4448,6 +4716,8 @@ export async function benchmarkHistory(limit = 12) {
         logQueryMs: latest.logQueryMs - previous.logQueryMs,
         processCount: latest.processCount - previous.processCount,
         backgroundProcessCount: latest.backgroundProcessCount - previous.backgroundProcessCount,
+        mcpEnabledCount: latest.mcpEnabledCount - previous.mcpEnabledCount,
+        mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
       }
     : null;
   const trend =
@@ -4535,6 +4805,12 @@ export async function runBenchmark() {
     approvalAutoReview: Boolean(scan.codexConfig?.approvalFlow?.autoReviewApplies),
     approvalInteractive: scan.codexConfig?.approvalFlow?.interactiveApprovals !== false,
     approvalGranularPolicy: Boolean(scan.codexConfig?.approvalFlow?.granularPolicy),
+    mcpEnabledCount: scan.codexConfig?.mcpSummary?.enabledCount || 0,
+    mcpRequiredCount: scan.codexConfig?.mcpSummary?.requiredCount || 0,
+    mcpMissingEnvVarCount: scan.codexConfig?.mcpSummary?.missingEnvVarCount || 0,
+    mcpStdioCount: scan.codexConfig?.mcpSummary?.stdioCount || 0,
+    mcpHttpCount: scan.codexConfig?.mcpSummary?.httpCount || 0,
+    mcpLongStartupTimeoutCount: scan.codexConfig?.mcpSummary?.longStartupTimeoutCount || 0,
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
