@@ -211,9 +211,10 @@ function parseTomlSummary(text) {
       sections.push(section);
       continue;
     }
-    const valueMatch = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+    const valueMatch = line.match(/^("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
     if (!valueMatch) continue;
-    const key = section ? `${section}.${valueMatch[1]}` : valueMatch[1];
+    const keyName = unquoteTomlTablePath(valueMatch[1].replace(/^["']|["']$/g, ""));
+    const key = section ? `${section}.${keyName}` : keyName;
     values[key] = parseTomlScalar(valueMatch[2]);
   }
 
@@ -1156,6 +1157,236 @@ async function getCommandRuleSummary({ rulesFeature = true, currentProject = nul
   const roots = await commandRuleRoots(currentProject);
   const sources = await Promise.all(roots.map((entry) => summarizeCommandRuleRoot(entry.root, entry)));
   return mergeCommandRuleSources(sources, rulesFeature);
+}
+
+function emptyNetworkSandboxSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "Network off",
+    action: "Enable per task",
+    detail:
+      "Workspace-write command network access is off by default. Enable it only for tasks that need installs, fetches, or external APIs.",
+    sandboxMode: "workspace-write",
+    commandNetworkAccess: false,
+    commandNetworkConfigured: false,
+    networkProxyEnabled: false,
+    networkProxyConfigured: false,
+    networkProxyNoEffect: false,
+    unrestrictedDirectNetwork: false,
+    permissionsNetworkEnabled: false,
+    permissionsProfile: null,
+    domainRuleCount: 0,
+    domainAllowCount: 0,
+    domainDenyCount: 0,
+    globalAllow: false,
+    localBindingAllowed: false,
+    dangerousNetworkSettingCount: 0,
+    writableRootCount: 0,
+    tmpdirExcluded: false,
+    slashTmpExcluded: false,
+    webSearchMode: null,
+  };
+}
+
+function tomlInlineTableEntries(value) {
+  if (value === undefined || value === null) return [];
+  const entries = [];
+  const pattern = /(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_*.:/-]+))\s*=\s*(?:"([^"]*)"|'([^']*)'|([^,}]+))/g;
+  let match;
+  while ((match = pattern.exec(String(value)))) {
+    const key = match[1] || match[2] || match[3];
+    const rawValue = match[4] || match[5] || match[6] || "";
+    entries.push({
+      key,
+      value: String(rawValue).trim(),
+    });
+  }
+  return entries;
+}
+
+function sectionTableEntries(values = {}, prefix) {
+  return Object.entries(values)
+    .filter(([key]) => key.startsWith(`${prefix}.`))
+    .map(([key, value]) => ({
+      key: key.slice(prefix.length + 1),
+      value,
+    }));
+}
+
+function networkDomainEntries(values = {}, prefix) {
+  return [
+    ...tomlInlineTableEntries(values[prefix]),
+    ...sectionTableEntries(values, prefix),
+  ].map((entry) => ({
+    key: String(entry.key || ""),
+    value: normalizeConfigKey(entry.value),
+  }));
+}
+
+function networkBoolean(values = {}, keys = []) {
+  for (const key of keys) {
+    if (values[key] !== undefined) return values[key] === true;
+  }
+  return false;
+}
+
+function buildNetworkSandboxSummary(values = {}, sections = []) {
+  const rawSandboxMode = values.sandbox_mode || "workspace-write";
+  const sandboxMode = normalizeConfigKey(rawSandboxMode);
+  const workspaceWrite = sandboxMode === "workspace_write" || sandboxMode === "workspace";
+  const readOnly = sandboxMode === "read_only";
+  const fullAccess = sandboxMode === "danger_full_access" || sandboxMode === "dangerously_bypass_approvals_and_sandbox";
+  const commandNetworkConfigured = values["sandbox_workspace_write.network_access"] !== undefined;
+  const workspaceNetworkAccess = values["sandbox_workspace_write.network_access"] === true;
+  const commandNetworkAccess = fullAccess || (workspaceWrite && workspaceNetworkAccess);
+  const networkProxyEnabled = networkBoolean(values, ["features.network_proxy", "features.network_proxy.enabled"]);
+  const networkProxyConfigured =
+    values["features.network_proxy"] !== undefined ||
+    Object.keys(values).some((key) => key.startsWith("features.network_proxy."));
+  const defaultPermissions = values.default_permissions ? String(values.default_permissions) : null;
+  const permissionProfileNames = [
+    ...new Set(
+      Object.keys(values)
+        .map((key) => key.match(/^permissions\.([^.]+)\.network(?:\.|$)/)?.[1])
+        .filter(Boolean),
+    ),
+  ];
+  const enabledPermissionProfiles = permissionProfileNames.filter((name) => values[`permissions.${name}.network.enabled`] === true);
+  const preferredPermissionProfile =
+    (defaultPermissions && enabledPermissionProfiles.includes(defaultPermissions) ? defaultPermissions : null) ||
+    enabledPermissionProfiles[0] ||
+    null;
+  const permissionsPrefix = preferredPermissionProfile ? `permissions.${preferredPermissionProfile}.network` : null;
+  const permissionsNetworkEnabled = Boolean(preferredPermissionProfile);
+  const permissionsNetworkMode = permissionsPrefix ? values[`${permissionsPrefix}.mode`] || "limited" : null;
+  const proxyDomainEntries = networkDomainEntries(values, "features.network_proxy.domains");
+  const permissionDomainEntries = permissionsPrefix ? networkDomainEntries(values, `${permissionsPrefix}.domains`) : [];
+  const domainEntries = [...proxyDomainEntries, ...permissionDomainEntries];
+  const domainRuleCount = domainEntries.length;
+  const domainAllowCount = domainEntries.filter((entry) => entry.value === "allow" || entry.value === "true").length;
+  const domainDenyCount = domainEntries.filter((entry) => entry.value === "deny" || entry.value === "false").length;
+  const globalAllow = domainEntries.some((entry) => entry.key === "*" && (entry.value === "allow" || entry.value === "true"));
+  const localBindingAllowed =
+    values["features.network_proxy.allow_local_binding"] === true ||
+    (permissionsPrefix ? values[`${permissionsPrefix}.allow_local_binding`] === true : false);
+  const dangerousFlags = [
+    "features.network_proxy.dangerously_allow_non_loopback_proxy",
+    "features.network_proxy.dangerously_allow_all_unix_sockets",
+    permissionsPrefix ? `${permissionsPrefix}.dangerously_allow_non_loopback_proxy` : null,
+    permissionsPrefix ? `${permissionsPrefix}.dangerously_allow_non_loopback_admin` : null,
+    permissionsPrefix ? `${permissionsPrefix}.dangerously_allow_all_unix_sockets` : null,
+  ].filter(Boolean);
+  const dangerousNetworkSettingCount = dangerousFlags.filter((key) => values[key] === true).length;
+  const writableRootCount = tomlArrayStringNames(values["sandbox_workspace_write.writable_roots"]).length;
+  const tmpdirExcluded = values["sandbox_workspace_write.exclude_tmpdir_env_var"] === true;
+  const slashTmpExcluded = values["sandbox_workspace_write.exclude_slash_tmp"] === true;
+  const webSearchMode = values.web_search || null;
+  const networkProxyNoEffect = networkProxyEnabled && !commandNetworkAccess && !permissionsNetworkEnabled;
+  const unrestrictedDirectNetwork = commandNetworkAccess && !networkProxyEnabled && !permissionsNetworkEnabled;
+  const scopedNetwork = (commandNetworkAccess && networkProxyEnabled) || permissionsNetworkEnabled;
+  const highLoad =
+    dangerousNetworkSettingCount > 0 ||
+    globalAllow ||
+    (fullAccess && values.approval_policy === "never") ||
+    networkProxyNoEffect;
+  const mediumLoad =
+    highLoad ||
+    unrestrictedDirectNetwork ||
+    readOnly ||
+    (!commandNetworkAccess && !permissionsNetworkEnabled) ||
+    localBindingAllowed ||
+    writableRootCount >= 4 ||
+    tmpdirExcluded ||
+    slashTmpExcluded;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = networkProxyNoEffect
+    ? "Proxy idle"
+    : fullAccess
+      ? "Full access"
+      : readOnly
+        ? "Read only"
+        : scopedNetwork
+          ? domainRuleCount
+            ? "Network scoped"
+            : "Network limited"
+          : commandNetworkAccess
+            ? "Network on"
+            : "Network off";
+  const action =
+    networkProxyNoEffect
+      ? "Turn on network"
+      : globalAllow || dangerousNetworkSettingCount
+        ? "Narrow policy"
+        : unrestrictedDirectNetwork
+          ? "Add proxy rules"
+          : readOnly
+            ? "Use workspace mode"
+            : !commandNetworkAccess && !permissionsNetworkEnabled
+              ? "Enable per task"
+              : localBindingAllowed
+                ? "Check local reach"
+                : "Keep scoped";
+  const detail =
+    tone === "low"
+      ? scopedNetwork
+        ? `Command network access is available through a scoped policy with ${domainRuleCount.toLocaleString()} domain rule${domainRuleCount === 1 ? "" : "s"}.`
+        : "Workspace-write command network access is off by default. Enable it only for tasks that need installs, fetches, or external APIs."
+      : [
+          readOnly
+            ? "Read-only sandbox keeps commands from changing files or using the network; great for planning, but slow for agentic setup work."
+            : null,
+          networkProxyNoEffect
+            ? "network_proxy is enabled, but command network access is off, so the proxy policy does not grant network access by itself."
+            : null,
+          unrestrictedDirectNetwork
+            ? "Command network access is on without network_proxy or a permissions network profile, so outbound command traffic is unrestricted by Codex policy."
+            : null,
+          scopedNetwork
+            ? `Network access is constrained by ${permissionsNetworkEnabled ? `permissions profile ${preferredPermissionProfile}` : "network_proxy"} with ${domainRuleCount.toLocaleString()} domain rule${domainRuleCount === 1 ? "" : "s"}.`
+            : null,
+          globalAllow ? "A global '*' allow rule is broad network access; prefer exact hosts or scoped wildcards." : null,
+          localBindingAllowed ? "Local/private destination access is broadly allowed; use exact localhost/IP rules when possible." : null,
+          dangerousNetworkSettingCount
+            ? `${dangerousNetworkSettingCount.toLocaleString()} dangerous network setting${dangerousNetworkSettingCount === 1 ? "" : "s"} ${pluralVerb(dangerousNetworkSettingCount)} enabled.`
+            : null,
+          writableRootCount >= 4
+            ? `${writableRootCount.toLocaleString()} extra writable root${writableRootCount === 1 ? "" : "s"} can widen where setup commands write.`
+            : null,
+          tmpdirExcluded || slashTmpExcluded ? "Temporary directories are excluded from workspace-write roots, which can break tools that expect writable temp space." : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    sandboxMode: String(rawSandboxMode || "workspace-write"),
+    commandNetworkAccess,
+    commandNetworkConfigured,
+    networkProxyEnabled,
+    networkProxyConfigured,
+    networkProxyNoEffect,
+    unrestrictedDirectNetwork,
+    permissionsNetworkEnabled,
+    permissionsProfile: preferredPermissionProfile,
+    permissionsNetworkMode,
+    permissionNetworkProfileCount: enabledPermissionProfiles.length,
+    domainRuleCount,
+    domainAllowCount,
+    domainDenyCount,
+    globalAllow,
+    localBindingAllowed,
+    dangerousNetworkSettingCount,
+    writableRootCount,
+    tmpdirExcluded,
+    slashTmpExcluded,
+    webSearchMode,
+    sectionsWithNetwork: sections.filter((section) => /(^|\.)(network|network_proxy|sandbox_workspace_write)(\.|$)/.test(section)).slice(0, 12),
+  };
 }
 
 function shellEnvSecretNameCount() {
@@ -4285,6 +4516,7 @@ async function getCodexConfigSummary() {
     shellSnapshot: true,
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
+    networkSandbox: emptyNetworkSandboxSummary(),
     instructionStack: emptyInstructionStackSummary(),
     instructionOverrides: emptyInstructionOverrideSummary(),
     customAgents: emptyCustomAgentSummary(),
@@ -4367,6 +4599,7 @@ async function getCodexConfigSummary() {
 
   if (!(await exists(paths.configToml))) {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
+    summary.networkSandbox = buildNetworkSandboxSummary({}, []);
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
     summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
     summary.customAgents = await getCustomAgentSummary(null);
@@ -4453,6 +4686,7 @@ async function getCodexConfigSummary() {
       values: mcpValues,
       currentProject: summary.projectReadiness.currentProject,
     });
+    summary.networkSandbox = buildNetworkSandboxSummary(mcpValues, mcpSections);
     summary.instructionOverrides = await getInstructionOverrideSummary({
       globalConfigText: text,
       currentProject: summary.projectReadiness.currentProject,
@@ -4561,6 +4795,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
@@ -4763,6 +4998,52 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         '# pattern = ["pnpm", "run", "lint"]',
         '# Avoid broad prompt patterns such as ["bash"], ["python"], or ["curl"] unless you really want every matching escalation to stop.',
       ].join("\n"),
+    });
+  }
+
+  if (networkSandbox.status === "ready" && networkSandbox.tone !== "low") {
+    const snippet =
+      networkSandbox.networkProxyNoEffect
+        ? [
+            "# ~/.codex/config.toml",
+            'sandbox_mode = "workspace-write"',
+            "",
+            "[sandbox_workspace_write]",
+            "network_access = true",
+            "",
+            "[features.network_proxy]",
+            "enabled = true",
+            '# Add only the hosts this workflow needs, for example:',
+            '# domains = { "api.openai.com" = "allow", "objects.githubusercontent.com" = "allow" }',
+          ].join("\n")
+        : networkSandbox.unrestrictedDirectNetwork || networkSandbox.globalAllow
+          ? [
+              "# ~/.codex/config.toml",
+              "[features.network_proxy]",
+              "enabled = true",
+              '# Prefer exact hosts or scoped wildcards over "*":',
+              '# domains = { "api.openai.com" = "allow", "objects.githubusercontent.com" = "allow" }',
+              "# Leave allow_local_binding = false unless a local dev server truly needs broader access.",
+            ].join("\n")
+          : [
+              "# ~/.codex/config.toml",
+              'sandbox_mode = "workspace-write"',
+              "",
+              "[sandbox_workspace_write]",
+              "# Turn this on only for tasks that need installs, fetches, or external APIs.",
+              "network_access = true",
+              "",
+              "# For planning/read-only tasks, keep command network off.",
+            ].join("\n");
+    addFix({
+      id: "network-sandbox",
+      label: "Network Sandbox",
+      value: networkSandbox.label,
+      tone: networkSandbox.tone === "high" ? "high" : "medium",
+      action: networkSandbox.action || "Review network",
+      detail:
+        "Codex command network access is separate from web search. Match sandbox network settings to the task so installs and fetches do not stall or overreach.",
+      snippet,
     });
   }
 
@@ -5158,6 +5439,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
@@ -5426,6 +5708,22 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: contextBudgetSummary.action,
       priority: contextBudgetSummary.tone === "high" ? 85 : contextBudgetSummary.tone === "medium" ? 63 : 21,
       detail: contextBudgetSummary.detail,
+    },
+    {
+      id: "network-sandbox",
+      label: "Network Sandbox",
+      value: networkSandbox.label,
+      tone: networkSandbox.tone,
+      action: networkSandbox.action,
+      priority:
+        networkSandbox.tone === "high"
+          ? 84
+          : networkSandbox.tone === "medium"
+            ? networkSandbox.networkProxyNoEffect || networkSandbox.unrestrictedDirectNetwork
+              ? 67
+              : 48
+            : 18,
+      detail: networkSandbox.detail,
     },
     {
       id: "instruction-stack",
@@ -5831,6 +6129,26 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (networkSandbox.status === "ready" && networkSandbox.tone !== "low") {
+    addRecommendation({
+      id: "network-sandbox",
+      label: "Network Sandbox",
+      value: networkSandbox.label,
+      action: networkSandbox.action || "Review network",
+      tone: networkSandbox.tone === "high" ? "high" : "medium",
+      priority:
+        networkSandbox.networkProxyNoEffect || networkSandbox.globalAllow || networkSandbox.dangerousNetworkSettingCount
+          ? 79
+          : networkSandbox.unrestrictedDirectNetwork
+            ? 61
+            : 45,
+      detail:
+        networkSandbox.networkProxyNoEffect
+          ? `${networkSandbox.detail} Turn on sandbox_workspace_write.network_access only when the task needs command network access.`
+          : networkSandbox.detail,
+    });
+  }
+
   if (threadLimit >= 128) {
     addRecommendation({
       id: "thread-discipline",
@@ -6135,6 +6453,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellSnapshot,
     shellEnvironmentSummary,
     contextBudgetSummary,
+    networkSandbox,
     instructionStack,
     instructionOverrides,
     goalsFeature,
@@ -6640,6 +6959,9 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(5, Number(metrics.commandRuleBroadPromptCount || 0) * 1.5);
   score -= Math.min(4, Math.max(0, Number(metrics.commandRulePromptCount || 0) - 6) * 0.2);
   score -= Math.min(3, Number(metrics.commandRuleParseWarningCount || 0) * 1.5);
+  if (metrics.networkProxyNoEffect) score -= 3;
+  if (metrics.networkGlobalAllow) score -= 2;
+  if (metrics.networkDangerousSettingCount) score -= Math.min(4, Number(metrics.networkDangerousSettingCount || 0) * 2);
   return Math.round(clampNumber(score, 0, 100));
 }
 
@@ -6749,6 +7071,16 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Test ${Number(metrics.commandRuleParseWarningCount).toLocaleString()} command rule warning${metrics.commandRuleParseWarningCount === 1 ? "" : "s"} with codex execpolicy check.`,
     );
+  }
+  if (metrics.networkProxyNoEffect) {
+    guidance.push("Network proxy is enabled, but command network access is off. Turn on sandbox_workspace_write.network_access only for tasks that need command network.");
+  } else if (metrics.networkUnrestrictedDirect) {
+    guidance.push("Command network access is on without Codex network_proxy policy. Add scoped domain rules for repeat workflows that fetch or install.");
+  } else if (metrics.networkCommandAccess === false) {
+    guidance.push("Command network access is off in the workspace sandbox. Installs and fetches may need approval or a task-specific network setting.");
+  }
+  if (metrics.networkGlobalAllow) {
+    guidance.push("Network policy has a global '*' allow rule. Prefer exact hosts or scoped wildcards for faster, safer repeat runs.");
   }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
     guidance.push(
@@ -7497,6 +7829,9 @@ function benchmarkDeltas(current, previous) {
     "commandRuleBroadCount",
     "commandRuleBroadPromptCount",
     "commandRuleParseWarningCount",
+    "networkDomainRuleCount",
+    "networkDangerousSettingCount",
+    "networkWritableRootCount",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -7629,6 +7964,24 @@ function summarizeBenchmarkEntry(entry) {
     commandRuleParseWarningCount: entry.metrics.commandRuleParseWarningCount || 0,
     commandRuleLargeFileCount: entry.metrics.commandRuleLargeFileCount || 0,
     commandRuleBytes: entry.metrics.commandRuleBytes || 0,
+    networkSandboxLabel: entry.metrics.networkSandboxLabel || "Network off",
+    networkSandboxTone: entry.metrics.networkSandboxTone || "low",
+    networkSandboxMode: entry.metrics.networkSandboxMode || "workspace-write",
+    networkCommandAccess: Boolean(entry.metrics.networkCommandAccess),
+    networkCommandConfigured: Boolean(entry.metrics.networkCommandConfigured),
+    networkProxyEnabled: Boolean(entry.metrics.networkProxyEnabled),
+    networkProxyNoEffect: Boolean(entry.metrics.networkProxyNoEffect),
+    networkUnrestrictedDirect: Boolean(entry.metrics.networkUnrestrictedDirect),
+    networkPermissionsEnabled: Boolean(entry.metrics.networkPermissionsEnabled),
+    networkDomainRuleCount: entry.metrics.networkDomainRuleCount || 0,
+    networkDomainAllowCount: entry.metrics.networkDomainAllowCount || 0,
+    networkDomainDenyCount: entry.metrics.networkDomainDenyCount || 0,
+    networkGlobalAllow: Boolean(entry.metrics.networkGlobalAllow),
+    networkLocalBindingAllowed: Boolean(entry.metrics.networkLocalBindingAllowed),
+    networkDangerousSettingCount: entry.metrics.networkDangerousSettingCount || 0,
+    networkWritableRootCount: entry.metrics.networkWritableRootCount || 0,
+    networkTmpdirExcluded: Boolean(entry.metrics.networkTmpdirExcluded),
+    networkSlashTmpExcluded: Boolean(entry.metrics.networkSlashTmpExcluded),
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -7684,6 +8037,9 @@ export async function benchmarkHistory(limit = 12) {
         commandRulePromptCount: latest.commandRulePromptCount - oldest.commandRulePromptCount,
         commandRuleBroadPromptCount: latest.commandRuleBroadPromptCount - oldest.commandRuleBroadPromptCount,
         commandRuleParseWarningCount: latest.commandRuleParseWarningCount - oldest.commandRuleParseWarningCount,
+        networkDomainRuleCount: latest.networkDomainRuleCount - oldest.networkDomainRuleCount,
+        networkDangerousSettingCount: latest.networkDangerousSettingCount - oldest.networkDangerousSettingCount,
+        networkWritableRootCount: latest.networkWritableRootCount - oldest.networkWritableRootCount,
       }
     : null;
   const previousDeltas = latest && previous
@@ -7710,6 +8066,8 @@ export async function benchmarkHistory(limit = 12) {
         managedMcpBlockedCount: latest.managedMcpBlockedCount - previous.managedMcpBlockedCount,
         commandRulePromptCount: latest.commandRulePromptCount - previous.commandRulePromptCount,
         commandRuleBroadPromptCount: latest.commandRuleBroadPromptCount - previous.commandRuleBroadPromptCount,
+        networkDomainRuleCount: latest.networkDomainRuleCount - previous.networkDomainRuleCount,
+        networkDangerousSettingCount: latest.networkDangerousSettingCount - previous.networkDangerousSettingCount,
       }
     : null;
   const trend =
@@ -7766,6 +8124,7 @@ export async function runBenchmark() {
     (scan.categories.archivedSessionsInActiveTree?.bytes || 0);
   const managedConfigSummary = scan.codexConfig?.managedConfig || emptyManagedConfigSummary();
   const commandRuleSummary = scan.codexConfig?.commandRules || emptyCommandRuleSummary(scan.codexConfig?.rulesFeature !== false);
+  const networkSandbox = scan.codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
 
   const metrics = {
     scoreModel: "local-state-v2",
@@ -7880,6 +8239,24 @@ export async function runBenchmark() {
     commandRuleParseWarningCount: commandRuleSummary.parseWarningCount || 0,
     commandRuleLargeFileCount: commandRuleSummary.largeFileCount || 0,
     commandRuleBytes: commandRuleSummary.totalBytes || 0,
+    networkSandboxLabel: networkSandbox.label || "Network off",
+    networkSandboxTone: networkSandbox.tone || "low",
+    networkSandboxMode: networkSandbox.sandboxMode || "workspace-write",
+    networkCommandAccess: Boolean(networkSandbox.commandNetworkAccess),
+    networkCommandConfigured: Boolean(networkSandbox.commandNetworkConfigured),
+    networkProxyEnabled: Boolean(networkSandbox.networkProxyEnabled),
+    networkProxyNoEffect: Boolean(networkSandbox.networkProxyNoEffect),
+    networkUnrestrictedDirect: Boolean(networkSandbox.unrestrictedDirectNetwork),
+    networkPermissionsEnabled: Boolean(networkSandbox.permissionsNetworkEnabled),
+    networkDomainRuleCount: networkSandbox.domainRuleCount || 0,
+    networkDomainAllowCount: networkSandbox.domainAllowCount || 0,
+    networkDomainDenyCount: networkSandbox.domainDenyCount || 0,
+    networkGlobalAllow: Boolean(networkSandbox.globalAllow),
+    networkLocalBindingAllowed: Boolean(networkSandbox.localBindingAllowed),
+    networkDangerousSettingCount: networkSandbox.dangerousNetworkSettingCount || 0,
+    networkWritableRootCount: networkSandbox.writableRootCount || 0,
+    networkTmpdirExcluded: Boolean(networkSandbox.tmpdirExcluded),
+    networkSlashTmpExcluded: Boolean(networkSandbox.slashTmpExcluded),
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
