@@ -1041,7 +1041,7 @@ body[data-hard-mode] .benchmark-guidance span:nth-child(n + 2) {
 }
 
 .doctor-workflow {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 body[data-hard-mode] .doctor-config,

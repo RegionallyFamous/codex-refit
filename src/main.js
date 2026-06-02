@@ -440,7 +440,7 @@ function renderCodexDoctor(doctor) {
     const advice = doctor.workflowAdvice || [];
     elements.doctorWorkflow.innerHTML = advice.length
       ? advice
-          .slice(0, 3)
+          .slice(0, 4)
           .map(
             (item) => `
               <article class="${escapeHtml(item.tone || "low")}" title="${escapeHtml(item.detail || "")}">

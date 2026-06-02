@@ -13,6 +13,7 @@ const dataDir = path.resolve(process.env.CODEX_REFIT_DATA_DIR || rootDir);
 const homeDir = os.homedir();
 const appSupport = path.join(homeDir, "Library", "Application Support");
 const codexHome = path.resolve(process.env.CODEX_HOME || path.join(homeDir, ".codex"));
+const codexAppCli = "/Applications/Codex.app/Contents/Resources/codex";
 
 const paths = {
   codexHome,
@@ -111,6 +112,94 @@ function parseTomlSummary(text) {
   return { values, sections };
 }
 
+function unquoteTomlTablePath(value) {
+  return String(value || "").replaceAll('\\"', '"').replaceAll("\\\\", "\\");
+}
+
+function extractTrustedProjectPaths(sections, values) {
+  return sections
+    .map((section) => {
+      const match = section.match(/^projects\."(.+)"$/);
+      if (!match || values[`${section}.trust_level`] !== "trusted") return null;
+      return unquoteTomlTablePath(match[1]);
+    })
+    .filter(Boolean);
+}
+
+function isTopLevelMcpSection(section) {
+  if (!section.startsWith("mcp_servers.")) return false;
+  const name = section.slice("mcp_servers.".length);
+  return Boolean(name && !name.includes("."));
+}
+
+function readFirstLine(value) {
+  return String(value || "").trim().split(/\r?\n/).find(Boolean) || null;
+}
+
+function normalizeCodexVersion(value) {
+  const line = readFirstLine(value);
+  const match = line?.match(/\b(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)\b/);
+  return match?.[1] || line || null;
+}
+
+async function execVersion(command, args = []) {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, args, {
+      timeout: 2500,
+      maxBuffer: 128 * 1024,
+    });
+    return {
+      ok: true,
+      raw: readFirstLine(stdout) || readFirstLine(stderr),
+      version: normalizeCodexVersion(stdout || stderr),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+      raw: readFirstLine(error.stdout) || readFirstLine(error.stderr),
+      version: normalizeCodexVersion(error.stdout || error.stderr),
+    };
+  }
+}
+
+async function whichCommand(command) {
+  try {
+    const { stdout } = await execFileAsync("which", [command], {
+      timeout: 1500,
+      maxBuffer: 32 * 1024,
+    });
+    return readFirstLine(stdout);
+  } catch {
+    return null;
+  }
+}
+
+async function getCodexRuntimeSummary() {
+  const cliPath = await whichCommand("codex");
+  const appCliExists = await exists(codexAppCli);
+  const [cliResult, appResult] = await Promise.all([
+    cliPath ? execVersion(cliPath, ["--version"]) : Promise.resolve(null),
+    appCliExists ? execVersion(codexAppCli, ["--version"]) : Promise.resolve(null),
+  ]);
+  const cliVersion = cliResult?.version || null;
+  const appVersion = appResult?.version || null;
+  const versionMismatch = Boolean(cliVersion && appVersion && cliVersion !== appVersion);
+
+  return {
+    cliPath,
+    cliVersion,
+    cliRaw: cliResult?.raw || null,
+    cliError: cliResult?.ok === false ? cliResult.error : null,
+    appCliPath: appCliExists ? codexAppCli : null,
+    appVersion,
+    appRaw: appResult?.raw || null,
+    appError: appResult?.ok === false ? appResult.error : null,
+    versionMismatch,
+    status: versionMismatch ? "mismatch" : cliVersion || appVersion ? "ready" : "missing",
+  };
+}
+
 function cutoffMs(days) {
   return Date.now() - days * 24 * 60 * 60 * 1000;
 }
@@ -126,6 +215,11 @@ async function exists(targetPath) {
   } catch {
     return false;
   }
+}
+
+async function fileSize(targetPath) {
+  const stats = await statOrNull(targetPath);
+  return stats?.isFile() ? stats.size : 0;
 }
 
 async function statOrNull(targetPath) {
@@ -687,6 +781,7 @@ async function getLogsSummary() {
 }
 
 async function getCodexConfigSummary() {
+  const globalAgentsBytes = await fileSize(paths.globalAgents);
   const summary = {
     path: paths.configToml,
     exists: false,
@@ -700,11 +795,18 @@ async function getCodexConfigSummary() {
     fastModeFeature: true,
     shellSnapshot: true,
     goalsFeature: false,
+    webSearchMode: null,
     maxConcurrentThreadsPerSession: null,
     trustedProjectCount: 0,
+    staleTrustedProjectCount: 0,
+    trustedProjectPaths: [],
     enabledPluginCount: 0,
     enabledMcpCount: 0,
-    globalAgentsExists: await exists(paths.globalAgents),
+    disabledMcpCount: 0,
+    requiredMcpCount: 0,
+    globalAgentsExists: globalAgentsBytes > 0,
+    globalAgentsFileExists: await exists(paths.globalAgents),
+    globalAgentsBytes,
   };
 
   if (!(await exists(paths.configToml))) return summary;
@@ -718,16 +820,23 @@ async function getCodexConfigSummary() {
     summary.reasoningEffort = values.model_reasoning_effort || values.reasoning_effort || null;
     summary.approvalPolicy = values.approval_policy || null;
     summary.sandboxMode = values.sandbox_mode || null;
-    summary.serviceTier = values.service_tier || values["desktop.default-service-tier"] || null;
+    summary.serviceTier = values.service_tier || null;
     summary.desktopServiceTier = values["desktop.default-service-tier"] || null;
     summary.fastModeFeature = values["features.fast_mode"] !== false;
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.goalsFeature = values["features.goals"] === true;
+    summary.webSearchMode = values.web_search || null;
     summary.maxConcurrentThreadsPerSession = values.max_concurrent_threads_per_session || null;
-    summary.trustedProjectCount = sections.filter((section) => section.startsWith('projects."') && values[`${section}.trust_level`] === "trusted").length;
+    summary.trustedProjectPaths = extractTrustedProjectPaths(sections, values);
+    summary.trustedProjectCount = summary.trustedProjectPaths.length;
+    const trustedProjectExists = await Promise.all(summary.trustedProjectPaths.map((projectPath) => exists(projectPath)));
+    summary.staleTrustedProjectCount = trustedProjectExists.filter((projectExists) => !projectExists).length;
     summary.enabledPluginCount = sections.filter((section) => section.startsWith('plugins."') && values[`${section}.enabled`] === true).length;
-    summary.enabledMcpCount = sections.filter((section) => section.startsWith("mcp_servers.") && values[`${section}.enabled`] !== false).length;
+    const mcpSections = sections.filter(isTopLevelMcpSection);
+    summary.enabledMcpCount = mcpSections.filter((section) => values[`${section}.enabled`] !== false).length;
+    summary.disabledMcpCount = mcpSections.filter((section) => values[`${section}.enabled`] === false).length;
+    summary.requiredMcpCount = mcpSections.filter((section) => values[`${section}.required`] === true && values[`${section}.enabled`] !== false).length;
   } catch (error) {
     summary.error = error.message;
   }
@@ -735,7 +844,7 @@ async function getCodexConfigSummary() {
   return summary;
 }
 
-function buildCodexDoctor(scan, codexConfig) {
+function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   const categories = scan.categories || {};
   const activeReliefBytes = (categories.activeStaleSessions?.bytes || 0) + (categories.archivedSessionsInActiveTree?.bytes || 0);
   const logBytes = scan.logs?.bytes || 0;
@@ -749,8 +858,14 @@ function buildCodexDoctor(scan, codexConfig) {
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
+  const desktopTier = codexConfig?.desktopServiceTier || null;
+  const displayTier = codexConfig?.serviceTier || desktopTier || "standard";
   const isHighEffort = ["high", "xhigh", "extra-high", "extra_high"].includes(String(effort).toLowerCase());
-  const docsSource = "Official Codex manual: Speed, Models, Config, Prompting, AGENTS";
+  const globalGuidanceReady = Boolean(codexConfig?.globalAgentsExists);
+  const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
+  const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
+  const webSearchMode = codexConfig?.webSearchMode || "cached default";
+  const docsSource = "Official Codex manual: Speed, Models, Config, AGENTS, MCP, Troubleshooting";
 
   const localDetail =
     activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2
@@ -759,16 +874,24 @@ function buildCodexDoctor(scan, codexConfig) {
 
   const modelDetail =
     effort === "xhigh" || effort === "high"
-      ? `Default is ${model} with ${effort} reasoning. Great for hard work; lower reasoning can feel faster on small tasks.`
-      : `Default is ${model} with ${effort} reasoning. Match effort to task size for speed.`;
+      ? `Default is ${model} with ${effort} reasoning. Great for hard work; lower effort or gpt-5.4-mini can feel faster on light coding.`
+      : `Default is ${model} with ${effort} reasoning. Match effort and model to task size for speed.`;
 
   const speedDetail = fastMode
     ? `Fast Mode is configured; service tier is ${tier}.`
     : `Fast Mode is not configured here. The Codex manual says /fast can speed supported models when it is available.`;
 
-  const workflowDetail = codexConfig?.globalAgentsExists
-    ? "Global AGENTS guidance exists, so repeated preferences can stay out of prompts."
-    : "No global AGENTS guidance found; adding durable guidance can reduce repeated correction loops.";
+  const workflowDetail = globalGuidanceReady
+    ? `Global AGENTS guidance is active (${formatBytesServer(codexConfig.globalAgentsBytes)}).`
+    : emptyGlobalGuidance
+      ? "Global AGENTS.md exists but is empty, so Codex skips it."
+      : "No global AGENTS guidance found; adding durable guidance can reduce repeated correction loops.";
+
+  const runtimeDetail = runtime?.versionMismatch
+    ? `Terminal Codex is ${runtime.cliVersion}; the bundled app binary is ${runtime.appVersion}. The manual notes app and CLI versions can differ.`
+    : runtime?.cliVersion || runtime?.appVersion
+      ? `Terminal Codex ${runtime.cliVersion || "not found"}; app binary ${runtime.appVersion || "not found"}.`
+      : "Codex CLI was not found on PATH and the app binary was not detected.";
 
   const cards = [
     {
@@ -790,18 +913,20 @@ function buildCodexDoctor(scan, codexConfig) {
     {
       id: "workflow-context",
       label: "Workflow Context",
-      value: codexConfig?.globalAgentsExists ? "Guided" : "Needs Guidance",
-      tone: codexConfig?.globalAgentsExists ? "low" : "medium",
+      value: globalGuidanceReady ? "Guided" : emptyGlobalGuidance ? "Empty" : "Needs Guidance",
+      tone: globalGuidanceReady ? "low" : "medium",
       detail: `${workflowDetail} Keep prompts scoped with goal, context, constraints, and done-when checks.`,
-      next: "Keep prompts scoped",
+      next: globalGuidanceReady ? "Keep prompts scoped" : "Add useful guidance",
     },
     {
-      id: "generated-images",
-      label: "Image Output",
-      value: formatBytesServer(generatedImageBytes),
-      tone: generatedImageBytes > 10 * 1024 ** 3 ? "medium" : "low",
-      detail: "Generated images are move-only in Codex Refit. They can leave the active cache without being deleted.",
-      next: generatedImageBytes > 1024 ** 3 ? "Move old images" : "Leave images alone",
+      id: runtime?.versionMismatch ? "runtime-drift" : "generated-images",
+      label: runtime?.versionMismatch ? "Runtime Drift" : "Image Output",
+      value: runtime?.versionMismatch ? `${runtime.cliVersion} / ${runtime.appVersion}` : formatBytesServer(generatedImageBytes),
+      tone: runtime?.versionMismatch || generatedImageBytes > 10 * 1024 ** 3 ? "medium" : "low",
+      detail: runtime?.versionMismatch
+        ? runtimeDetail
+        : "Generated images are move-only in Codex Refit. They can leave the active cache without being deleted.",
+      next: runtime?.versionMismatch ? "Align versions" : generatedImageBytes > 1024 ** 3 ? "Move old images" : "Leave images alone",
     },
   ];
 
@@ -809,12 +934,12 @@ function buildCodexDoctor(scan, codexConfig) {
     {
       id: "small-task-speed",
       label: "Small Tasks",
-      value: isHighEffort ? "Lower effort" : "Current fit",
+      value: isHighEffort ? "Tune down" : "Current fit",
       tone: isHighEffort ? "medium" : "low",
-      action: isHighEffort ? "Use low or medium" : "Keep prompts tight",
+      action: isHighEffort ? "Mini or lower effort" : "Keep prompts tight",
       detail:
         isHighEffort
-          ? "The Codex manual recommends low reasoning for faster, well-scoped tasks. Keep high/xhigh for harder debugging and long agentic work."
+          ? "The Codex manual recommends gpt-5.4-mini for lighter coding and low reasoning for faster, well-scoped tasks. Keep high/xhigh for harder debugging and long agentic work."
           : "Current reasoning is not set to high/xhigh. Small, scoped prompts should already avoid unnecessary reasoning drag.",
     },
     {
@@ -825,14 +950,14 @@ function buildCodexDoctor(scan, codexConfig) {
       action: fastMode ? "Use when worth it" : "/fast status",
       detail: fastMode
         ? `Fast Mode is enabled with service tier ${tier}. The manual notes supported models run faster with higher credit use.`
-        : "Run /fast status in Codex. If available, /fast on speeds supported models at higher credit use; persistent config is service_tier = \"fast\" plus features.fast_mode = true.",
+        : `Run /fast status in Codex. If available, /fast on speeds supported models at higher credit use; persistent config is service_tier = "fast" plus features.fast_mode = true. Current service tier display is ${displayTier}.`,
     },
     {
       id: "deep-work",
       label: "Deep Work",
       value: model === "gpt-5.5" ? "Best model" : "Use gpt-5.5",
       tone: model === "gpt-5.5" && isHighEffort ? "low" : "medium",
-      action: codexConfig?.globalAgentsExists ? "Plan, test, review" : "Add AGENTS.md",
+      action: globalGuidanceReady ? "Plan, test, review" : "Add AGENTS.md",
       detail:
         "The manual recommends gpt-5.5 for complex coding, computer use, research, and knowledge work. For long work, pair high reasoning with plan mode, tests, review, and durable AGENTS guidance.",
     },
@@ -840,11 +965,24 @@ function buildCodexDoctor(scan, codexConfig) {
 
   const configAdvice = [
     {
+      id: "permission-flow",
+      label: "Permission Flow",
+      value: codexConfig?.approvalPolicy || "Default",
+      tone: codexConfig?.approvalPolicy === "never" ? "low" : "medium",
+      action: codexConfig?.approvalPolicy === "never" ? "Fast, high-trust" : "Review prompts",
+      priority: codexConfig?.approvalPolicy === "never" ? 30 : 72,
+      detail:
+        codexConfig?.approvalPolicy === "never"
+          ? "Approval prompts are not expected from Codex itself. Use this only for trusted work because it reduces safety stops."
+          : "Approval prompts can interrupt fast runs. Use /permissions or config only when the trust/safety tradeoff is right.",
+    },
+    {
       id: "shell-snapshot",
       label: "Shell Snapshot",
       value: shellSnapshot ? "On" : "Off",
       tone: shellSnapshot ? "low" : "medium",
       action: shellSnapshot ? "Keep enabled" : "Enable shell snapshot",
+      priority: shellSnapshot ? 32 : 84,
       detail: shellSnapshot
         ? "Codex can snapshot the shell environment to speed up repeated commands."
         : "Set features.shell_snapshot = true so repeated command setup can be faster.",
@@ -852,14 +990,27 @@ function buildCodexDoctor(scan, codexConfig) {
     {
       id: "fast-default",
       label: "Fast Default",
-      value: fastMode ? "Fast" : fastModeFeature ? tier : "Feature off",
+      value: fastMode ? "Fast" : fastModeFeature ? displayTier : "Feature off",
       tone: fastMode ? "low" : "medium",
       action: fastMode ? "Watch credits" : "/fast status",
+      priority: fastMode ? 34 : 80,
       detail: fastMode
         ? "Fast Mode is the configured default. It is faster on supported models and uses more credits."
         : fastModeFeature
-          ? "Fast Mode selection is available, but this config is not set to the fast service tier."
+          ? `Fast Mode selection is available, but this config is not set to the documented service_tier = "fast" default. Desktop tier is ${desktopTier || "not set"}.`
           : "features.fast_mode is disabled, so the persistent fast service-tier path is not available.",
+    },
+    {
+      id: "web-search",
+      label: "Web Search",
+      value: webSearchMode,
+      tone: codexConfig?.webSearchMode === "live" ? "medium" : "low",
+      action: codexConfig?.webSearchMode === "live" ? "Use cached/local" : "Keep scoped",
+      priority: codexConfig?.webSearchMode === "live" ? 70 : 24,
+      detail:
+        codexConfig?.webSearchMode === "live"
+          ? "Live web search is useful for current facts, but cached or disabled search can make local coding runs more predictable."
+          : "Cached/default web search is a good baseline. Disable it only for fully local tasks that should never look outward.",
     },
     {
       id: "goal-mode",
@@ -867,6 +1018,7 @@ function buildCodexDoctor(scan, codexConfig) {
       value: goalsFeature ? "On" : "Optional",
       tone: goalsFeature ? "low" : "medium",
       action: goalsFeature ? "Use for long work" : "Enable for long work",
+      priority: goalsFeature ? 20 : 52,
       detail: goalsFeature
         ? "Goal mode is enabled for persistent, multi-step objectives."
         : "For long speed/refactor work, enable features.goals = true so Codex can keep a clear completion target.",
@@ -874,26 +1026,40 @@ function buildCodexDoctor(scan, codexConfig) {
     {
       id: "guidance",
       label: "Reusable Guidance",
-      value: codexConfig?.globalAgentsExists ? "Global ready" : "Missing",
-      tone: codexConfig?.globalAgentsExists ? "low" : "medium",
-      action: codexConfig?.globalAgentsExists ? "Keep concise" : "Add AGENTS.md",
-      detail: codexConfig?.globalAgentsExists
+      value: globalGuidanceReady ? "Global ready" : emptyGlobalGuidance ? "Empty file" : "Missing",
+      tone: globalGuidanceReady ? "low" : "medium",
+      action: globalGuidanceReady ? "Keep concise" : "Add useful guidance",
+      priority: globalGuidanceReady ? 28 : 76,
+      detail: globalGuidanceReady
         ? "Global AGENTS guidance is present. Keep it short, practical, and based on repeated friction."
-        : "Add ~/.codex/AGENTS.md so recurring preferences do not need to be repeated in every prompt.",
+        : emptyGlobalGuidance
+          ? "The file exists but is empty, so Codex skips it. Add only repeated working preferences that save future prompting."
+          : "Add ~/.codex/AGENTS.md so recurring preferences do not need to be repeated in every prompt.",
     },
-  ];
+  ].sort((a, b) => b.priority - a.priority);
 
   const threadLimit = Number(codexConfig?.maxConcurrentThreadsPerSession || 0);
   const trustedProjectCount = Number(codexConfig?.trustedProjectCount || 0);
   const enabledPluginCount = Number(codexConfig?.enabledPluginCount || 0);
   const enabledMcpCount = Number(codexConfig?.enabledMcpCount || 0);
+  const requiredMcpCount = Number(codexConfig?.requiredMcpCount || 0);
   const workflowAdvice = [
+    {
+      id: "runtime-version",
+      label: "Codex Runtime",
+      value: runtime?.versionMismatch ? "Mismatch" : runtime?.cliVersion || runtime?.appVersion || "Missing",
+      tone: runtime?.versionMismatch || runtime?.status === "missing" ? "medium" : "low",
+      action: runtime?.versionMismatch ? "Align versions" : "Keep current",
+      priority: runtime?.versionMismatch ? 88 : runtime?.status === "missing" ? 62 : 20,
+      detail: runtimeDetail,
+    },
     {
       id: "thread-ceiling",
       label: "Thread Ceiling",
       value: threadLimit ? threadLimit.toLocaleString() : "Default",
       tone: threadLimit >= 128 ? "medium" : "low",
       action: threadLimit >= 128 ? "Avoid same-file overlap" : "Keep work scoped",
+      priority: threadLimit >= 128 ? 70 : 18,
       detail:
         threadLimit >= 128
           ? "Your per-session thread ceiling is very high. The Codex manual allows parallel threads, but warns against two threads modifying the same files."
@@ -902,11 +1068,14 @@ function buildCodexDoctor(scan, codexConfig) {
     {
       id: "trusted-projects",
       label: "Trusted Projects",
-      value: trustedProjectCount ? trustedProjectCount.toLocaleString() : "None",
-      tone: trustedProjectCount >= 20 ? "medium" : "low",
-      action: trustedProjectCount >= 20 ? "Review stale trust" : "Trust intentionally",
+      value: staleTrustedProjectCount ? `${staleTrustedProjectCount}/${trustedProjectCount}` : trustedProjectCount ? trustedProjectCount.toLocaleString() : "None",
+      tone: staleTrustedProjectCount || trustedProjectCount >= 20 ? "medium" : "low",
+      action: staleTrustedProjectCount ? "Remove missing paths" : trustedProjectCount >= 20 ? "Review stale trust" : "Trust intentionally",
+      priority: staleTrustedProjectCount ? 74 : trustedProjectCount >= 20 ? 56 : 16,
       detail:
-        trustedProjectCount >= 20
+        staleTrustedProjectCount
+          ? `${staleTrustedProjectCount.toLocaleString()} trusted project path${staleTrustedProjectCount === 1 ? "" : "s"} no longer exist. Trusted project entries decide whether project .codex layers can load.`
+          : trustedProjectCount >= 20
           ? "Many trusted project entries are configured. Trusted projects can load project .codex layers, so stale trust entries make behavior harder to reason about."
           : "Trusted project scope looks tidy.",
     },
@@ -916,15 +1085,40 @@ function buildCodexDoctor(scan, codexConfig) {
       value: `${enabledPluginCount} / ${enabledMcpCount}`,
       tone: enabledPluginCount + enabledMcpCount > 10 ? "medium" : "low",
       action: enabledPluginCount + enabledMcpCount > 10 ? "Disable unused" : "Keep intentional",
+      priority: enabledPluginCount + enabledMcpCount > 10 ? 48 : 14,
       detail: `${enabledPluginCount.toLocaleString()} plugin${enabledPluginCount === 1 ? "" : "s"} and ${enabledMcpCount.toLocaleString()} MCP server${enabledMcpCount === 1 ? "" : "s"} are enabled. Keep only useful surfaces active for clearer runs.`,
     },
-  ];
+    {
+      id: "required-mcp",
+      label: "Required MCP",
+      value: requiredMcpCount ? requiredMcpCount.toLocaleString() : "None",
+      tone: requiredMcpCount ? "medium" : "low",
+      action: requiredMcpCount ? "Reserve for critical" : "No startup blockers",
+      priority: requiredMcpCount ? 44 : 12,
+      detail:
+        requiredMcpCount > 0
+          ? "Required MCP servers can block startup if they fail. Use required only for tools every run truly needs."
+          : "No enabled MCP server is marked required, so MCP startup should be less brittle.",
+    },
+  ].sort((a, b) => b.priority - a.priority);
 
   const recommendations = [];
   const addRecommendation = (item) => {
     if (!item?.id || recommendations.some((existing) => existing.id === item.id)) return;
     recommendations.push(item);
   };
+
+  if (runtime?.versionMismatch) {
+    addRecommendation({
+      id: "runtime-version-drift",
+      label: "Runtime Drift",
+      value: `${runtime.cliVersion} / ${runtime.appVersion}`,
+      action: "Align CLI and app",
+      tone: "medium",
+      priority: 96,
+      detail: "Your terminal Codex and bundled Codex app binary are different versions. Align them before chasing phantom slowness or missing features.",
+    });
+  }
 
   if (activeReliefBytes > 1024 ** 3) {
     addRecommendation({
@@ -955,10 +1149,10 @@ function buildCodexDoctor(scan, codexConfig) {
       id: "small-task-effort",
       label: "Small Tasks",
       value: effort,
-      action: "Try low or medium",
+      action: "Mini or lower effort",
       tone: "medium",
       priority: 82,
-      detail: "For quick, well-scoped work, lower reasoning can feel faster. Keep high/xhigh for hard debugging and long agentic tasks.",
+      detail: "For quick, well-scoped work, use lower reasoning or gpt-5.4-mini. Keep gpt-5.5 with high/xhigh for hard debugging and long agentic tasks.",
     });
   }
 
@@ -995,6 +1189,44 @@ function buildCodexDoctor(scan, codexConfig) {
       tone: "medium",
       priority: 54,
       detail: "Trusted projects can load project .codex layers. Pruning stale trusted paths makes Codex behavior easier to predict.",
+    });
+  }
+
+  if (staleTrustedProjectCount > 0) {
+    addRecommendation({
+      id: "stale-trusted-projects",
+      label: "Trust Map",
+      value: staleTrustedProjectCount.toLocaleString(),
+      action: "Remove missing paths",
+      tone: "medium",
+      priority: 64,
+      detail: "Trusted project paths that no longer exist make Codex configuration harder to reason about. Clean stale entries from config.toml.",
+    });
+  }
+
+  if (!globalGuidanceReady) {
+    addRecommendation({
+      id: "codex-guidance",
+      label: "Guidance",
+      value: emptyGlobalGuidance ? "Empty" : "Missing",
+      action: "Add useful AGENTS.md",
+      tone: "medium",
+      priority: 60,
+      detail: emptyGlobalGuidance
+        ? "AGENTS.md exists but is empty, so Codex skips it. Add repeated preferences and verification rules that save future turns."
+        : "Add concise global or project AGENTS guidance so recurring preferences do not need to be repeated.",
+    });
+  }
+
+  if (codexConfig?.webSearchMode === "live") {
+    addRecommendation({
+      id: "web-search-live",
+      label: "Web Search",
+      value: "Live",
+      action: "Use cached/local",
+      tone: "medium",
+      priority: 50,
+      detail: "Live web search is useful for current facts, but cached or disabled search can make local-only coding runs steadier.",
     });
   }
 
@@ -1037,7 +1269,9 @@ function buildCodexDoctor(scan, codexConfig) {
   recommendations.sort((a, b) => b.priority - a.priority);
 
   const headline =
-    activeReliefBytes > 1024 ** 3
+    runtime?.versionMismatch
+      ? `Codex versions differ: CLI ${runtime.cliVersion}, app ${runtime.appVersion}.`
+      : activeReliefBytes > 1024 ** 3
       ? `Best next win: move ${formatBytesServer(activeReliefBytes)} out of active sessions.`
       : effort === "xhigh"
         ? "Local state is only one lever; xhigh reasoning can be slower on small tasks."
@@ -1050,13 +1284,19 @@ function buildCodexDoctor(scan, codexConfig) {
     reasoningEffort: effort,
     fastMode,
     serviceTier: tier,
+    desktopServiceTier: desktopTier,
+    displayServiceTier: displayTier,
     fastModeFeature,
     shellSnapshot,
     goalsFeature,
+    webSearchMode,
     maxConcurrentThreadsPerSession: codexConfig?.maxConcurrentThreadsPerSession || null,
     trustedProjectCount: codexConfig?.trustedProjectCount || 0,
+    staleTrustedProjectCount,
     enabledPluginCount,
     enabledMcpCount,
+    requiredMcpCount,
+    runtime,
     cards,
     profiles,
     configAdvice,
@@ -1262,6 +1502,7 @@ export async function scanCodex(options = {}) {
     state,
     preflight,
     codexConfig,
+    runtime,
   ] = await Promise.all([
     summarizeDirectory(paths.archivedSessions, { label: "Archived Sessions", risk: "warn", largestLimit: 12 }),
     summarizeDirectory(paths.maintenanceArchive, {
@@ -1293,6 +1534,7 @@ export async function scanCodex(options = {}) {
     getStateStats(archiveOptions),
     getPreflightStatus(),
     getCodexConfigSummary(),
+    getCodexRuntimeSummary(),
   ]);
 
   const codexHomeBytes = await duBytes(paths.codexHome);
@@ -1369,13 +1611,14 @@ export async function scanCodex(options = {}) {
     state,
     logs,
     codexConfig,
+    runtime,
     categories,
     largestSessionFiles,
   };
 
   addHotspots(scan);
   scan.smartPlan = buildSmartPlan(scan, { ...options, days: archiveChoice.days, archiveChoice });
-  scan.codexDoctor = buildCodexDoctor(scan, codexConfig);
+  scan.codexDoctor = buildCodexDoctor(scan, codexConfig, runtime);
   return scan;
 }
 
