@@ -1580,6 +1580,86 @@ function buildContextBudgetSummary(values = {}) {
   };
 }
 
+function buildResponseShapeSummary(values = {}) {
+  const verbosity = values.model_verbosity ? normalizeConfigKey(values.model_verbosity) : null;
+  const reasoningSummary = values.model_reasoning_summary ? normalizeConfigKey(values.model_reasoning_summary) : null;
+  const summariesForced = values.model_supports_reasoning_summaries === true;
+  const summariesDisabled = values.model_supports_reasoning_summaries === false;
+  const rawReasoning = values.show_raw_agent_reasoning === true;
+  const hiddenReasoningEvents = values.hide_agent_reasoning === true;
+  const highVerbosity = verbosity === "high";
+  const lowVerbosity = verbosity === "low";
+  const detailedSummary = reasoningSummary === "detailed";
+  const conciseSummary = reasoningSummary === "concise";
+  const noSummary = reasoningSummary === "none" || summariesDisabled;
+  const configuredCount = [
+    values.model_verbosity !== undefined,
+    values.model_reasoning_summary !== undefined,
+    values.model_supports_reasoning_summaries !== undefined,
+    values.show_raw_agent_reasoning !== undefined,
+    values.hide_agent_reasoning !== undefined,
+  ].filter(Boolean).length;
+  const highLoad = rawReasoning || (highVerbosity && detailedSummary);
+  const mediumLoad = highLoad || highVerbosity || detailedSummary || summariesForced;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = highVerbosity
+    ? "High verbosity"
+    : lowVerbosity
+      ? "Low verbosity"
+      : detailedSummary
+        ? "Detailed summary"
+        : conciseSummary
+          ? "Concise summary"
+          : noSummary
+            ? "Summary off"
+            : configuredCount
+              ? "Configured"
+              : "Defaults";
+  const action =
+    tone === "low"
+      ? lowVerbosity || noSummary
+        ? "Keep lean"
+        : "Use defaults"
+      : highVerbosity
+        ? "Lower verbosity"
+        : detailedSummary || summariesForced
+          ? "Shorten summaries"
+          : "Hide raw reasoning";
+  const detail =
+    tone === "low"
+      ? configuredCount
+        ? "Response shape is explicit and not adding obvious output weight. model_verbosity only affects Responses API providers."
+        : "Response verbosity and reasoning-summary settings are using Codex defaults."
+      : [
+          highVerbosity ? 'model_verbosity is "high"; the manual notes model_verbosity can shorten responses when set to low.' : null,
+          detailedSummary ? 'model_reasoning_summary is "detailed"; use concise or none for small local tasks.' : null,
+          summariesForced ? "Reasoning summaries are forced on for the current model; leave this unset unless you need it." : null,
+          rawReasoning ? "show_raw_agent_reasoning is enabled, which can add noisy output when raw reasoning is available." : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    verbosity: verbosity || null,
+    reasoningSummary: reasoningSummary || null,
+    summariesForced,
+    summariesDisabled,
+    rawReasoning,
+    hiddenReasoningEvents,
+    highVerbosity,
+    lowVerbosity,
+    detailedSummary,
+    conciseSummary,
+    noSummary,
+    configuredCount,
+  };
+}
+
 function displayPath(filePath) {
   const resolved = path.resolve(filePath || "");
   return resolved === homeDir ? "~" : resolved.startsWith(`${homeDir}${path.sep}`) ? `~${resolved.slice(homeDir.length)}` : resolved;
@@ -4892,6 +4972,12 @@ async function getCodexConfigSummary() {
     exists: false,
     model: null,
     reasoningEffort: null,
+    modelVerbosity: null,
+    modelReasoningSummary: null,
+    modelSupportsReasoningSummaries: null,
+    showRawAgentReasoning: false,
+    hideAgentReasoning: false,
+    responseShapeSummary: buildResponseShapeSummary({}),
     approvalPolicy: null,
     approvalReviewer: "user",
     approvalFlow: buildApprovalFlowSummary({}),
@@ -5013,6 +5099,12 @@ async function getCodexConfigSummary() {
     const { values, sections } = parsed;
     summary.model = values.model || null;
     summary.reasoningEffort = values.model_reasoning_effort || values.reasoning_effort || null;
+    summary.modelVerbosity = values.model_verbosity || null;
+    summary.modelReasoningSummary = values.model_reasoning_summary || null;
+    summary.modelSupportsReasoningSummaries = values.model_supports_reasoning_summaries ?? null;
+    summary.showRawAgentReasoning = values.show_raw_agent_reasoning === true;
+    summary.hideAgentReasoning = values.hide_agent_reasoning === true;
+    summary.responseShapeSummary = buildResponseShapeSummary(values);
     summary.approvalPolicy = values.approval_policy || null;
     summary.approvalReviewer = values.approvals_reviewer || "user";
     summary.approvalFlow = buildApprovalFlowSummary(values);
@@ -5216,6 +5308,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const webSearchLegacyKeyCount = Number(codexConfig?.webSearchLegacyKeyCount || webSearchLegacyKeys.length || 0);
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
@@ -5425,6 +5518,30 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "# Keep prefix_rule patterns narrow, for example:",
         '# pattern = ["pnpm", "run", "lint"]',
         '# Avoid broad prompt patterns such as ["bash"], ["python"], or ["curl"] unless you really want every matching escalation to stop.',
+      ].join("\n"),
+    });
+  }
+
+  if (responseShapeSummary.status === "ready" && responseShapeSummary.tone !== "low") {
+    addFix({
+      id: "response-shape",
+      label: "Response Shape",
+      value: responseShapeSummary.label,
+      tone: responseShapeSummary.tone === "high" ? "high" : "medium",
+      action: responseShapeSummary.action,
+      detail:
+        "High verbosity, detailed reasoning summaries, or raw reasoning display can make small local tasks feel slower and add extra text to sift through.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# Lean default for small/local coding tasks:",
+        'model_verbosity = "low"',
+        'model_reasoning_summary = "concise"',
+        "",
+        "# For the shortest output:",
+        '# model_reasoning_summary = "none"',
+        "",
+        "# Keep raw reasoning display off unless you are debugging model behavior:",
+        "show_raw_agent_reasoning = false",
       ].join("\n"),
     });
   }
@@ -5915,6 +6032,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
@@ -6196,6 +6314,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: contextBudgetSummary.action,
       priority: contextBudgetSummary.tone === "high" ? 85 : contextBudgetSummary.tone === "medium" ? 63 : 21,
       detail: contextBudgetSummary.detail,
+    },
+    {
+      id: "response-shape",
+      label: "Response Shape",
+      value: responseShapeSummary.label,
+      tone: responseShapeSummary.tone,
+      action: responseShapeSummary.action,
+      priority: responseShapeSummary.tone === "high" ? 82 : responseShapeSummary.tone === "medium" ? 62 : 20,
+      detail: responseShapeSummary.detail,
     },
     {
       id: "network-sandbox",
@@ -6753,6 +6880,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (responseShapeSummary.status === "ready" && responseShapeSummary.tone !== "low") {
+    addRecommendation({
+      id: "response-shape",
+      label: "Response Shape",
+      value: responseShapeSummary.label,
+      action: responseShapeSummary.action,
+      tone: responseShapeSummary.tone === "high" ? "high" : "medium",
+      priority: responseShapeSummary.tone === "high" ? 78 : 52,
+      detail: responseShapeSummary.detail,
+    });
+  }
+
   if (instructionStack.status === "ready" && instructionStack.tone !== "low") {
     addRecommendation({
       id: "instruction-stack",
@@ -6982,6 +7121,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellSnapshot,
     shellEnvironmentSummary,
     contextBudgetSummary,
+    responseShapeSummary,
     networkSandbox,
     instructionStack,
     instructionOverrides,
@@ -7470,6 +7610,10 @@ function benchmarkLiveScore(metrics) {
   if (!metrics.shellEnvTightPolicy) score -= Math.min(4, Number(metrics.shellEnvSecretLikeNameCount || 0) * 0.35);
   if (metrics.shellEnvMissingPath) score -= 6;
   score -= Math.min(6, Math.max(0, Number(metrics.toolOutputTokenLimit || 12000) - 12000) / 4000);
+  if (metrics.responseHighVerbosity) score -= 2;
+  if (metrics.responseDetailedSummary) score -= 1;
+  if (metrics.responseRawReasoning) score -= 2;
+  if (metrics.responseSummariesForced) score -= 1;
   if (metrics.compactTooLate) score -= 4;
   if (metrics.compactEarly) score -= 2;
   if (metrics.smallContextWindow) score -= 3;
@@ -7655,6 +7799,12 @@ function benchmarkGuidance(metrics) {
   }
   if (metrics.toolOutputTokenLimit > 24000) {
     guidance.push(`Lower tool_output_token_limit from ${Number(metrics.toolOutputTokenLimit).toLocaleString()} or keep huge logs in files so context stays usable.`);
+  } else if (metrics.responseHighVerbosity) {
+    guidance.push('Set model_verbosity = "low" for fast small-task runs so Codex writes shorter responses.');
+  } else if (metrics.responseDetailedSummary || metrics.responseSummariesForced) {
+    guidance.push('Use concise or none for model_reasoning_summary unless you need detailed reasoning summaries.');
+  } else if (metrics.responseRawReasoning) {
+    guidance.push("Turn off show_raw_agent_reasoning unless you are debugging model behavior.");
   } else if (metrics.compactTooLate) {
     guidance.push("Auto-compact is set very late relative to the context window. Review model_auto_compact_token_limit if long threads get noisy.");
   } else if (metrics.smallContextWindow) {
@@ -7725,7 +7875,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v5",
+    scoreModel: "local-state-v6",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -8351,6 +8501,11 @@ function benchmarkDeltas(current, previous) {
     "contextWindow",
     "autoCompactTokenLimit",
     "toolOutputTokenLimit",
+    "responseHighVerbosity",
+    "responseDetailedSummary",
+    "responseRawReasoning",
+    "responseSummariesForced",
+    "responseConfiguredCount",
     "instructionTotalBytes",
     "instructionGlobalBytes",
     "instructionProjectBytes",
@@ -8451,6 +8606,16 @@ function summarizeBenchmarkEntry(entry) {
     contextWindow: entry.metrics.contextWindow || 0,
     autoCompactTokenLimit: entry.metrics.autoCompactTokenLimit || 0,
     toolOutputTokenLimit: entry.metrics.toolOutputTokenLimit || 0,
+    responseShapeTone: entry.metrics.responseShapeTone || "low",
+    responseVerbosity: entry.metrics.responseVerbosity || "default",
+    responseReasoningSummary: entry.metrics.responseReasoningSummary || "default",
+    responseHighVerbosity: Boolean(entry.metrics.responseHighVerbosity),
+    responseLowVerbosity: Boolean(entry.metrics.responseLowVerbosity),
+    responseDetailedSummary: Boolean(entry.metrics.responseDetailedSummary),
+    responseNoSummary: Boolean(entry.metrics.responseNoSummary),
+    responseRawReasoning: Boolean(entry.metrics.responseRawReasoning),
+    responseSummariesForced: Boolean(entry.metrics.responseSummariesForced),
+    responseConfiguredCount: entry.metrics.responseConfiguredCount || 0,
     compactTooLate: Boolean(entry.metrics.compactTooLate),
     compactEarly: Boolean(entry.metrics.compactEarly),
     smallContextWindow: Boolean(entry.metrics.smallContextWindow),
@@ -8598,6 +8763,11 @@ export async function benchmarkHistory(limit = 12) {
         shellEnvVarCount: latest.shellEnvVarCount - oldest.shellEnvVarCount,
         shellEnvSecretLikeNameCount: latest.shellEnvSecretLikeNameCount - oldest.shellEnvSecretLikeNameCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - oldest.toolOutputTokenLimit,
+        responseHighVerbosity: Number(latest.responseHighVerbosity) - Number(oldest.responseHighVerbosity),
+        responseDetailedSummary: Number(latest.responseDetailedSummary) - Number(oldest.responseDetailedSummary),
+        responseRawReasoning: Number(latest.responseRawReasoning) - Number(oldest.responseRawReasoning),
+        responseSummariesForced: Number(latest.responseSummariesForced) - Number(oldest.responseSummariesForced),
+        responseConfiguredCount: latest.responseConfiguredCount - oldest.responseConfiguredCount,
         instructionTotalBytes: latest.instructionTotalBytes - oldest.instructionTotalBytes,
         instructionProjectCandidateBytes: latest.instructionProjectCandidateBytes - oldest.instructionProjectCandidateBytes,
         instructionSelectedFileCount: latest.instructionSelectedFileCount - oldest.instructionSelectedFileCount,
@@ -8644,6 +8814,10 @@ export async function benchmarkHistory(limit = 12) {
         customAgentCount: latest.customAgentCount - previous.customAgentCount,
         shellEnvVarCount: latest.shellEnvVarCount - previous.shellEnvVarCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - previous.toolOutputTokenLimit,
+        responseHighVerbosity: Number(latest.responseHighVerbosity) - Number(previous.responseHighVerbosity),
+        responseDetailedSummary: Number(latest.responseDetailedSummary) - Number(previous.responseDetailedSummary),
+        responseRawReasoning: Number(latest.responseRawReasoning) - Number(previous.responseRawReasoning),
+        responseConfiguredCount: latest.responseConfiguredCount - previous.responseConfiguredCount,
         instructionTotalBytes: latest.instructionTotalBytes - previous.instructionTotalBytes,
         instructionProjectCandidateBytes: latest.instructionProjectCandidateBytes - previous.instructionProjectCandidateBytes,
         instructionOverrideBytes: latest.instructionOverrideBytes - previous.instructionOverrideBytes,
@@ -8722,9 +8896,10 @@ export async function runBenchmark() {
   const currentProject = scan.codexConfig?.projectReadiness?.currentProject || null;
   const localEnvironment = currentProject?.localEnvironment || emptyLocalEnvironmentSummary({ hasCodexDir: Boolean(currentProject?.hasCodexDir) });
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
+  const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
 
   const metrics = {
-    scoreModel: "local-state-v5",
+    scoreModel: "local-state-v6",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -8778,6 +8953,16 @@ export async function runBenchmark() {
     contextWindow: scan.codexConfig?.contextBudgetSummary?.contextWindow || 0,
     autoCompactTokenLimit: scan.codexConfig?.contextBudgetSummary?.autoCompactTokenLimit || 0,
     toolOutputTokenLimit: scan.codexConfig?.contextBudgetSummary?.toolOutputTokenLimit || 0,
+    responseShapeTone: responseShapeSummary.tone || "low",
+    responseVerbosity: responseShapeSummary.verbosity || "default",
+    responseReasoningSummary: responseShapeSummary.reasoningSummary || "default",
+    responseHighVerbosity: Boolean(responseShapeSummary.highVerbosity),
+    responseLowVerbosity: Boolean(responseShapeSummary.lowVerbosity),
+    responseDetailedSummary: Boolean(responseShapeSummary.detailedSummary),
+    responseNoSummary: Boolean(responseShapeSummary.noSummary),
+    responseRawReasoning: Boolean(responseShapeSummary.rawReasoning),
+    responseSummariesForced: Boolean(responseShapeSummary.summariesForced),
+    responseConfiguredCount: responseShapeSummary.configuredCount || 0,
     compactTooLate: Boolean(scan.codexConfig?.contextBudgetSummary?.compactTooLate),
     compactEarly: Boolean(scan.codexConfig?.contextBudgetSummary?.compactEarly),
     smallContextWindow: Boolean(scan.codexConfig?.contextBudgetSummary?.smallWindow),
