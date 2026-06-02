@@ -605,6 +605,7 @@ function renderScan(scan) {
 
   elements.targetList.innerHTML = [
     scan.categories.activeSessions,
+    scan.categories.sessionMedia,
     scan.categories.activeStaleSessions,
     scan.categories.archivedSessionsInActiveTree,
     scan.categories.archivedSessions,

@@ -4618,6 +4618,165 @@ function emptyWorktreeSummary() {
   };
 }
 
+function emptySessionMediaSummary(activeSessions = {}) {
+  return {
+    label: "Session Media",
+    path: paths.sessions,
+    exists: Boolean(activeSessions.exists),
+    bytes: 0,
+    fileCount: 0,
+    dirCount: 0,
+    scannedFileCount: 0,
+    sampledBytes: 0,
+    markerCount: 0,
+    appshotMarkerCount: 0,
+    imageMarkerCount: 0,
+    dataUrlMarkerCount: 0,
+    cappedFileCount: 0,
+    largest: [],
+    risk: "scan",
+    tone: "low",
+    action: "No media drag",
+    detail: "No appshot or image-attachment markers were found in the largest active session files.",
+    hotspots: ["Largest active transcripts do not show media attachment pressure."],
+  };
+}
+
+function countMatches(text, pattern) {
+  const matches = String(text || "").match(pattern);
+  return matches ? matches.length : 0;
+}
+
+async function scanSessionMediaMarkers(file) {
+  const stats = await statOrNull(file.path);
+  if (!stats?.isFile()) return null;
+  const maxHeadBytes = 6 * 1024 * 1024;
+  const maxTailBytes = 2 * 1024 * 1024;
+  const headBytes = Math.min(stats.size, maxHeadBytes);
+  const tailBytes = stats.size > headBytes ? Math.min(stats.size - headBytes, maxTailBytes) : 0;
+  let sampledBytes = 0;
+  let sample = "";
+  let handle = null;
+
+  try {
+    handle = await fs.open(file.path, "r");
+    if (headBytes > 0) {
+      const buffer = Buffer.alloc(headBytes);
+      const { bytesRead } = await handle.read(buffer, 0, headBytes, 0);
+      sampledBytes += bytesRead;
+      sample += buffer.subarray(0, bytesRead).toString("utf8");
+    }
+    if (tailBytes > 0) {
+      const buffer = Buffer.alloc(tailBytes);
+      const { bytesRead } = await handle.read(buffer, 0, tailBytes, Math.max(0, stats.size - tailBytes));
+      sampledBytes += bytesRead;
+      sample += "\n" + buffer.subarray(0, bytesRead).toString("utf8");
+    }
+  } catch {
+    return null;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+
+  const appshotMarkers = countMatches(sample, /\bappshots?\b|\bapp_shot\b|frontmost app/gi);
+  const imageMarkers = countMatches(
+    sample,
+    /\binput_image\b|\bimage_url\b|\battached_image\b|\bscreenshot\b|\bscreen capture\b|\bimage\/(?:png|jpe?g|webp|gif)\b/gi,
+  );
+  const dataUrlMarkers = countMatches(sample, /data:image\//gi);
+  const markerCount = appshotMarkers + imageMarkers + dataUrlMarkers;
+  if (!markerCount) return null;
+
+  const markerKinds = [
+    appshotMarkers ? "appshot" : null,
+    imageMarkers ? "image" : null,
+    dataUrlMarkers ? "data-url" : null,
+  ].filter(Boolean);
+
+  return {
+    name: path.basename(file.path),
+    path: file.path,
+    bytes: stats.size,
+    mtime: stats.mtime.toISOString(),
+    bucket: "Session Media",
+    markerCount,
+    appshotMarkers,
+    imageMarkers,
+    dataUrlMarkers,
+    markerKinds,
+    sampledBytes,
+    capped: sampledBytes < stats.size,
+  };
+}
+
+async function summarizeSessionMediaPressure(activeSessions = {}) {
+  const summary = emptySessionMediaSummary(activeSessions);
+  if (!activeSessions.exists) return summary;
+  const candidates = (activeSessions.largest || [])
+    .filter((file) => file?.path && /\.(jsonl?|txt|md)$/i.test(file.path))
+    .slice(0, 12);
+  if (!candidates.length) {
+    summary.exists = true;
+    summary.detail = "No readable transcript candidates were found among the largest active session files.";
+    summary.hotspots = [summary.detail];
+    return summary;
+  }
+
+  const scanned = [];
+  for (const file of candidates) {
+    const result = await scanSessionMediaMarkers(file);
+    if (result) scanned.push(result);
+  }
+
+  summary.exists = true;
+  summary.scannedFileCount = candidates.length;
+  summary.largest = scanned.sort((a, b) => b.bytes - a.bytes).slice(0, 8);
+  summary.fileCount = summary.largest.length;
+  summary.bytes = summary.largest.reduce((total, file) => total + file.bytes, 0);
+  summary.sampledBytes = summary.largest.reduce((total, file) => total + file.sampledBytes, 0);
+  summary.markerCount = summary.largest.reduce((total, file) => total + file.markerCount, 0);
+  summary.appshotMarkerCount = summary.largest.reduce((total, file) => total + file.appshotMarkers, 0);
+  summary.imageMarkerCount = summary.largest.reduce((total, file) => total + file.imageMarkers, 0);
+  summary.dataUrlMarkerCount = summary.largest.reduce((total, file) => total + file.dataUrlMarkers, 0);
+  summary.cappedFileCount = summary.largest.filter((file) => file.capped).length;
+  summary.tone =
+    summary.bytes >= 1024 ** 3 || summary.fileCount >= 8 || summary.dataUrlMarkerCount >= 6
+      ? "high"
+      : summary.bytes >= 256 * 1024 ** 2 || summary.fileCount >= 3 || summary.markerCount >= 6
+        ? "medium"
+        : "low";
+  summary.action =
+    summary.tone === "high"
+      ? "Archive media threads"
+      : summary.tone === "medium"
+        ? "Start fresh when done"
+        : summary.fileCount
+          ? "Keep scoped"
+          : "No media drag";
+  summary.detail =
+    summary.fileCount === 0
+      ? "No appshot or image-attachment markers were found in the largest active session files."
+      : [
+          `Refit found media/appshot markers in ${summary.fileCount.toLocaleString()} of the largest active session file${summary.fileCount === 1 ? "" : "s"}, representing ${formatBytesServer(summary.bytes)} of active transcript weight.`,
+          "The Codex manual says appshots and image inputs are stored locally in session history, so old visual-debugging threads can become heavy even when the database is healthy.",
+          summary.cappedFileCount
+            ? `${summary.cappedFileCount.toLocaleString()} very large file${summary.cappedFileCount === 1 ? " was" : "s were"} sampled at the head and tail only; Refit reports counts and sizes, not attachment content.`
+            : "Refit reports counts and sizes only, not attachment content.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+  summary.hotspots = summary.fileCount
+    ? [
+        `${summary.fileCount.toLocaleString()} media-marked active transcript${summary.fileCount === 1 ? "" : "s"} among the largest files.`,
+        `${formatBytesServer(summary.bytes)} of active session weight tied to appshot/image markers.`,
+        summary.appshotMarkerCount ? `${summary.appshotMarkerCount.toLocaleString()} appshot marker${summary.appshotMarkerCount === 1 ? "" : "s"} sampled.` : null,
+        summary.dataUrlMarkerCount ? `${summary.dataUrlMarkerCount.toLocaleString()} inline image marker${summary.dataUrlMarkerCount === 1 ? "" : "s"} sampled.` : null,
+        "Archive finished visual-debugging threads or start a fresh thread once the image context is no longer needed.",
+      ].filter(Boolean)
+    : ["Largest active transcripts do not show media attachment pressure."];
+  return summary;
+}
+
 async function summarizeCodexWorktrees() {
   const summary = emptyWorktreeSummary();
   const rootStats = await statOrNull(paths.worktrees);
@@ -5502,6 +5661,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const activeReliefBytes = context.activeReliefBytes || 0;
   const logBytes = context.logBytes || 0;
   const logWalBytes = context.logWalBytes || 0;
+  const sessionMedia = scan?.categories?.sessionMedia || emptySessionMediaSummary(scan?.categories?.activeSessions || {});
   const worktrees = scan?.categories?.codexWorktrees || emptyWorktreeSummary();
   const staleProjectPaths = codexConfig?.staleTrustedProjectPaths || [];
   const defaultReasoningEffort = normalizedEffort(codexConfig?.reasoningEffort);
@@ -5561,6 +5721,27 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
       action: "Smart Optimize, then Run Check",
       detail:
         "Best local win: move stale active history, prune logs, checkpoint WAL, and compact databases with backups. This does not delete generated images.",
+    });
+  }
+
+  if (sessionMedia.exists && sessionMedia.tone !== "low") {
+    addFix({
+      id: "session-media-pressure",
+      label: "Session Media",
+      value: formatBytesServer(sessionMedia.bytes),
+      tone: sessionMedia.tone === "high" ? "high" : "medium",
+      action: "Archive visual threads",
+      detail:
+        "Appshots and image inputs are useful, but the Codex manual says they live in session history. Finished visual-debugging threads should be archived or continued in a fresh thread once the image context is no longer needed.",
+      snippet: [
+        "# Metadata-only local check; does not print transcript contents:",
+        `find ${shellQuote(paths.sessions)} -type f -size +50M -print 2>/dev/null | head`,
+        "",
+        "# Safe next moves:",
+        "# - Archive finished threads that used Appshots or image attachments.",
+        "# - Start a fresh thread after the image context has served its purpose.",
+        "# - Use /compact on long active threads before they become transcript-heavy.",
+      ].join("\n"),
     });
   }
 
@@ -6289,6 +6470,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const logBytes = scan.logs?.bytes || 0;
   const logWalBytes = scan.logs?.walBytes || 0;
   const generatedImageBytes = categories.generatedImages?.bytes || 0;
+  const sessionMedia = categories.sessionMedia || emptySessionMediaSummary(categories.activeSessions || {});
   const worktrees = categories.codexWorktrees || emptyWorktreeSummary();
   const staleThreads = Number(scan.state?.threads?.activeStale ?? scan.state?.threads?.activeOlder7d ?? 0);
   const model = codexConfig?.model || "Not set";
@@ -6587,6 +6769,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: contextBudgetSummary.action,
       priority: contextBudgetSummary.tone === "high" ? 85 : contextBudgetSummary.tone === "medium" ? 63 : 21,
       detail: contextBudgetSummary.detail,
+    },
+    {
+      id: "session-media-pressure",
+      label: "Session Media",
+      value: sessionMedia.exists ? formatBytesServer(sessionMedia.bytes) : "None",
+      tone: sessionMedia.tone || "low",
+      action: sessionMedia.action || "No media drag",
+      priority: sessionMedia.tone === "high" ? 84 : sessionMedia.tone === "medium" ? 62 : 19,
+      detail: sessionMedia.detail,
     },
     {
       id: "response-shape",
@@ -7035,6 +7226,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: worktrees.tone === "high" ? "high" : "medium",
       priority: worktrees.tone === "high" ? 83 : 61,
       detail: worktrees.detail,
+    });
+  }
+
+  if (sessionMedia.exists && sessionMedia.tone !== "low") {
+    addRecommendation({
+      id: "session-media-pressure",
+      label: "Session Media",
+      value: `${sessionMedia.fileCount.toLocaleString()} / ${formatBytesServer(sessionMedia.bytes)}`,
+      action: "Archive visual threads",
+      tone: sessionMedia.tone === "high" ? "high" : "medium",
+      priority: sessionMedia.tone === "high" ? 85 : 63,
+      detail: sessionMedia.detail,
     });
   }
 
@@ -7518,6 +7721,14 @@ function addHotspots(scan) {
     `${categories.activeSessions.oversized500mb.toLocaleString()} files over 500 MB`,
     `${formatBytesServer(categories.activeStaleSessions.bytes)} older than ${categories.activeStaleSessions.days} days`,
   ];
+  categories.sessionMedia.hotspots = categories.sessionMedia.hotspots?.length
+    ? categories.sessionMedia.hotspots
+    : [
+        `${categories.sessionMedia.fileCount.toLocaleString()} media-marked active transcript${categories.sessionMedia.fileCount === 1 ? "" : "s"}`,
+        categories.sessionMedia.bytes
+          ? `${formatBytesServer(categories.sessionMedia.bytes)} tied to appshot/image markers.`
+          : "No appshot or image-attachment markers found in the largest active transcripts.",
+      ];
   categories.activeStaleSessions.hotspots = [
     `${categories.activeStaleSessions.fileCount.toLocaleString()} active transcript${categories.activeStaleSessions.fileCount === 1 ? "" : "s"} older than ${categories.activeStaleSessions.days} days`,
     `${categories.activeStaleSessions.oversized50mb.toLocaleString()} stale file${categories.activeStaleSessions.oversized50mb === 1 ? "" : "s"} over 50 MB`,
@@ -7701,6 +7912,7 @@ export async function scanCodex(options = {}) {
   const archiveChoice = resolveArchiveChoice(options, activeSessions);
   const archiveOptions = { ...options, days: archiveChoice.days };
   const [
+    sessionMedia,
     archivedSessions,
     maintenanceArchive,
     generatedImages,
@@ -7720,6 +7932,7 @@ export async function scanCodex(options = {}) {
     runtime,
     processSummary,
   ] = await Promise.all([
+    summarizeSessionMediaPressure(activeSessions),
     summarizeDirectory(paths.archivedSessions, { label: "Archived Sessions", risk: "warn", largestLimit: 12 }),
     summarizeDirectory(paths.maintenanceArchive, {
       label: "Old Refit Backups",
@@ -7799,6 +8012,7 @@ export async function scanCodex(options = {}) {
       hotspots: ["Desktop wrapper state and crash reports."],
     },
     activeSessions,
+    sessionMedia,
     activeStaleSessions: activeStale,
     archivedSessions,
     archivedSessionsInActiveTree: archivedStillInSessions,
@@ -7816,6 +8030,7 @@ export async function scanCodex(options = {}) {
   const largestSessionCandidates = [
     ...activeStale.largest.map((file) => ({ ...file, bucket: "Stale active sessions" })),
     ...archivedDeleteCandidates.largest.map((file) => ({ ...file, bucket: "Old archived conversations" })),
+    ...sessionMedia.largest.map((file) => ({ ...file, bucket: "Session media" })),
     ...activeSessions.largest.map((file) => ({ ...file, bucket: "Active sessions" })),
     ...archivedSessions.largest.map((file) => ({ ...file, bucket: "Archived sessions" })),
     ...maintenanceArchive.largest.map((file) => ({ ...file, bucket: "Old Refit backups" })),
@@ -7872,6 +8087,18 @@ function localScoreBreakdown(metrics) {
       points: Math.min(22, gb(metrics.logBytes) * 2.5),
       value: formatBytesServer(metrics.logBytes),
       detail: "Local log database size.",
+    },
+    {
+      id: "session-media",
+      label: "Session Media",
+      points: Math.min(
+        8,
+        gb(metrics.sessionMediaBytes) * 1.1 +
+          Number(metrics.sessionMediaFileCount || 0) * 0.45 +
+          Number(metrics.sessionMediaDataUrlMarkerCount || 0) * 0.08,
+      ),
+      value: `${Number(metrics.sessionMediaFileCount || 0).toLocaleString()} file${metrics.sessionMediaFileCount === 1 ? "" : "s"}`,
+      detail: "Largest active transcripts carrying appshot or image-attachment markers.",
     },
     {
       id: "log-wal",
@@ -8034,6 +8261,13 @@ function benchmarkGuidance(metrics) {
   if (metrics.logWalBytes > 256 * 1024 ** 2) guidance.push("Prune and checkpoint logs to shrink WAL pressure.");
   if (metrics.logBytes > 1024 ** 3) guidance.push(`Compact ${formatBytesServer(metrics.logBytes)} of local log data.`);
   if (metrics.oversizedActiveFiles > 20) guidance.push("Move or archive old large transcripts out of active sessions.");
+  if (metrics.sessionMediaBytes > 1024 ** 3 || metrics.sessionMediaFileCount >= 8) {
+    guidance.push(
+      `Archive finished visual threads: ${Number(metrics.sessionMediaFileCount).toLocaleString()} media-marked active transcript${metrics.sessionMediaFileCount === 1 ? " accounts" : "s account"} for ${formatBytesServer(metrics.sessionMediaBytes)}.`,
+    );
+  } else if (metrics.sessionMediaBytes > 256 * 1024 ** 2 || metrics.sessionMediaFileCount >= 3) {
+    guidance.push(`Start fresh after image-heavy work; Refit found ${formatBytesServer(metrics.sessionMediaBytes)} of media-marked active transcripts.`);
+  }
   if (metrics.processCount >= 24) {
     guidance.push(
       `Close idle Codex work: ${Number(metrics.processCount).toLocaleString()} live Codex process${metrics.processCount === 1 ? "" : "es"} are using ${formatBytesServer(metrics.processRssBytes)}.`,
@@ -8252,13 +8486,19 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v9",
+    scoreModel: "local-state-v10",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
     oversizedActiveFiles: categories.activeSessions?.oversized50mb || 0,
     archivedFilesInSessions: categories.archivedSessionsInActiveTree?.fileCount || 0,
     staleThreads: Number(scan?.state?.threads?.activeStale ?? scan?.state?.threads?.activeOlder7d ?? 0),
+    sessionMediaBytes: categories.sessionMedia?.bytes || 0,
+    sessionMediaFileCount: categories.sessionMedia?.fileCount || 0,
+    sessionMediaMarkerCount: categories.sessionMedia?.markerCount || 0,
+    sessionMediaAppshotMarkerCount: categories.sessionMedia?.appshotMarkerCount || 0,
+    sessionMediaImageMarkerCount: categories.sessionMedia?.imageMarkerCount || 0,
+    sessionMediaDataUrlMarkerCount: categories.sessionMedia?.dataUrlMarkerCount || 0,
     codexWorktreeBytes: categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
@@ -8361,6 +8601,8 @@ function buildSlowdownDiagnosis(scan, context = {}) {
   const logWalBytes = scan.logs?.walBytes || 0;
   const archivedDeleteBytes = context.deletePreviewBytes || 0;
   const generatedImageBytes = categories.generatedImages?.bytes || 0;
+  const sessionMediaBytes = categories.sessionMedia?.bytes || 0;
+  const sessionMediaFiles = categories.sessionMedia?.fileCount || 0;
   const worktreeBytes = categories.codexWorktrees?.bytes || 0;
   const worktreeCount = categories.codexWorktrees?.worktreeCount || 0;
   const worktreeOverDefaultKeep = categories.codexWorktrees?.overDefaultKeepCount || 0;
@@ -8396,6 +8638,16 @@ function buildSlowdownDiagnosis(scan, context = {}) {
         logWalBytes > 0
           ? `${formatBytesServer(logWalBytes)} is waiting in WAL; pruning checkpoints it.`
           : "Log pressure is low.",
+    },
+    {
+      id: "session-media",
+      label: "Session Media",
+      value: formatBytesServer(sessionMediaBytes),
+      score: gb(sessionMediaBytes) * 1.2 + sessionMediaFiles * 0.5,
+      tone: categories.sessionMedia?.tone || "low",
+      detail: sessionMediaFiles
+        ? `${sessionMediaFiles.toLocaleString()} large active transcript${sessionMediaFiles === 1 ? " includes" : "s include"} appshot or image markers. Archive finished visual threads or start fresh once the image context is no longer needed.`
+        : "No media-heavy active transcript pressure is showing.",
     },
     {
       id: "archived-data",
@@ -8473,6 +8725,8 @@ function buildSmartPlan(scan, options = {}) {
   const archivedDeleteBytes = scan.categories.archivedDeleteCandidates?.bytes || 0;
   const maintenanceBytes = scan.categories.maintenanceArchive?.bytes || 0;
   const generatedImageBytes = scan.categories.generatedImages?.bytes || 0;
+  const sessionMediaBytes = scan.categories.sessionMedia?.bytes || 0;
+  const sessionMediaFiles = scan.categories.sessionMedia?.fileCount || 0;
   const worktreeBytes = scan.categories.codexWorktrees?.bytes || 0;
   const worktreeCount = scan.categories.codexWorktrees?.worktreeCount || 0;
   const worktreeOverDefaultKeep = scan.categories.codexWorktrees?.overDefaultKeepCount || 0;
@@ -8697,6 +8951,14 @@ function buildSmartPlan(scan, options = {}) {
         tone: logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3 ? "high" : "low",
       },
       {
+        label: "Session Media",
+        value: formatBytesServer(sessionMediaBytes),
+        detail: sessionMediaFiles
+          ? `${sessionMediaFiles.toLocaleString()} large active transcript${sessionMediaFiles === 1 ? " carries" : "s carry"} appshot/image markers. Archive finished visual threads or start fresh.`
+          : "No media-heavy active transcript pressure found.",
+        tone: scan.categories.sessionMedia?.tone || "low",
+      },
+      {
         label: "Worktrees",
         value: formatBytesServer(worktreeBytes),
         detail: worktreeCount
@@ -8884,6 +9146,14 @@ function benchmarkDeltas(current, previous) {
     "oversizedActiveFiles",
     "staleThreads",
     "archivedFilesInSessions",
+    "sessionMediaBytes",
+    "sessionMediaFileCount",
+    "sessionMediaScannedFileCount",
+    "sessionMediaMarkerCount",
+    "sessionMediaAppshotMarkerCount",
+    "sessionMediaImageMarkerCount",
+    "sessionMediaDataUrlMarkerCount",
+    "sessionMediaCappedFileCount",
     "codexWorktreeBytes",
     "codexWorktreeCount",
     "codexWorktreeLargeCount",
@@ -9002,6 +9272,14 @@ function summarizeBenchmarkEntry(entry) {
     logWalBytes: entry.metrics.logWalBytes,
     staleThreads: entry.metrics.staleThreads,
     oversizedActiveFiles: entry.metrics.oversizedActiveFiles,
+    sessionMediaBytes: entry.metrics.sessionMediaBytes || 0,
+    sessionMediaFileCount: entry.metrics.sessionMediaFileCount || 0,
+    sessionMediaScannedFileCount: entry.metrics.sessionMediaScannedFileCount || 0,
+    sessionMediaMarkerCount: entry.metrics.sessionMediaMarkerCount || 0,
+    sessionMediaAppshotMarkerCount: entry.metrics.sessionMediaAppshotMarkerCount || 0,
+    sessionMediaImageMarkerCount: entry.metrics.sessionMediaImageMarkerCount || 0,
+    sessionMediaDataUrlMarkerCount: entry.metrics.sessionMediaDataUrlMarkerCount || 0,
+    sessionMediaCappedFileCount: entry.metrics.sessionMediaCappedFileCount || 0,
     codexWorktreeBytes: entry.metrics.codexWorktreeBytes || 0,
     codexWorktreeCount: entry.metrics.codexWorktreeCount || 0,
     codexWorktreeLargeCount: entry.metrics.codexWorktreeLargeCount || 0,
@@ -9207,6 +9485,10 @@ export async function benchmarkHistory(limit = 12) {
         logBytes: latest.logBytes - oldest.logBytes,
         logWalBytes: latest.logWalBytes - oldest.logWalBytes,
         staleThreads: latest.staleThreads - oldest.staleThreads,
+        sessionMediaBytes: latest.sessionMediaBytes - oldest.sessionMediaBytes,
+        sessionMediaFileCount: latest.sessionMediaFileCount - oldest.sessionMediaFileCount,
+        sessionMediaMarkerCount: latest.sessionMediaMarkerCount - oldest.sessionMediaMarkerCount,
+        sessionMediaDataUrlMarkerCount: latest.sessionMediaDataUrlMarkerCount - oldest.sessionMediaDataUrlMarkerCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - oldest.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - oldest.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - oldest.codexWorktreeLargeCount,
@@ -9285,6 +9567,10 @@ export async function benchmarkHistory(limit = 12) {
         scanMs: latest.scanMs - previous.scanMs,
         stateQueryMs: latest.stateQueryMs - previous.stateQueryMs,
         logQueryMs: latest.logQueryMs - previous.logQueryMs,
+        sessionMediaBytes: latest.sessionMediaBytes - previous.sessionMediaBytes,
+        sessionMediaFileCount: latest.sessionMediaFileCount - previous.sessionMediaFileCount,
+        sessionMediaMarkerCount: latest.sessionMediaMarkerCount - previous.sessionMediaMarkerCount,
+        sessionMediaDataUrlMarkerCount: latest.sessionMediaDataUrlMarkerCount - previous.sessionMediaDataUrlMarkerCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - previous.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - previous.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - previous.codexWorktreeLargeCount,
@@ -9410,7 +9696,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v9",
+    scoreModel: "local-state-v10",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -9430,6 +9716,14 @@ export async function runBenchmark() {
     archivedDeleteRows: scan.categories.archivedDeleteCandidates?.dbRowCount || 0,
     archivedDeleteBytes: scan.categories.archivedDeleteCandidates?.bytes || 0,
     archivedDeleteDays: scan.categories.archivedDeleteCandidates?.days || 30,
+    sessionMediaBytes: scan.categories.sessionMedia?.bytes || 0,
+    sessionMediaFileCount: scan.categories.sessionMedia?.fileCount || 0,
+    sessionMediaScannedFileCount: scan.categories.sessionMedia?.scannedFileCount || 0,
+    sessionMediaMarkerCount: scan.categories.sessionMedia?.markerCount || 0,
+    sessionMediaAppshotMarkerCount: scan.categories.sessionMedia?.appshotMarkerCount || 0,
+    sessionMediaImageMarkerCount: scan.categories.sessionMedia?.imageMarkerCount || 0,
+    sessionMediaDataUrlMarkerCount: scan.categories.sessionMedia?.dataUrlMarkerCount || 0,
+    sessionMediaCappedFileCount: scan.categories.sessionMedia?.cappedFileCount || 0,
     codexWorktreeBytes: scan.categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: scan.categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: scan.categories.codexWorktrees?.largeWorktreeCount || 0,
