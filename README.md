@@ -4,7 +4,7 @@ Codex Refit is a small macOS helper for people who use Codex a lot and want it t
 
 It checks the local Codex data on your Mac, shows what is getting heavy, and gives you a simple way to clean up the safe stuff without digging through hidden folders.
 
-![Codex Refit interface](public/design-comps/codex-refit-interface-concept.png)
+![Codex Refit screenshot](public/screenshots/codex-refit-app.png)
 
 ## What It Does
 
