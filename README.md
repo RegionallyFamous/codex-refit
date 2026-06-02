@@ -1,60 +1,71 @@
 # Codex Refit
 
-Codex Refit is a small macOS helper for people who use Codex a lot and want it to feel snappy again.
+Codex is great. Your local Codex folder, after weeks of screenshots, long threads, logs, worktrees, caches, experiments, and "just one more quick task," can become... less great.
 
-It checks the local Codex data on your Mac, shows what is getting heavy, and gives you a simple way to clean up the safe stuff without digging through hidden folders.
+**Codex Refit is a little Mac tune-up app for Codex.** It scans the local Codex data on your machine, shows what is getting heavy, and gives you a big friendly button to clean up the safe stuff.
+
+No terminal spelunking. No mystery cleanup script. No "wait, did that delete my generated images?"
 
 ![Codex Refit screenshot](public/screenshots/codex-refit-app.png)
 
-## What It Does
+## The Big Idea
 
-- Shows how much local Codex state is on your machine.
-- Finds oversized conversations, logs, caches, old crash files, and other local drag.
-- Gives you one main **Smart Optimize** button for the usual safe cleanup.
-- Keeps advanced controls tucked behind **Hard Mode**.
-- Runs a **Speed Check** so you can see whether things are actually improving.
-- Includes a **Codex Doctor** panel with plain-language next steps.
+Codex Refit does not make the model itself faster. It helps the local world around Codex stay lighter.
 
-## Why It Exists
+That means less local drag from oversized conversations, old active history, logs, crash files, rebuildable browser caches, worktrees, and background clutter. When your local Codex state is cleaner, Codex has a better shot at feeling crisp again.
 
-Codex can slow down when local history, large active conversations, logs, screenshots, worktrees, or background helper processes pile up. Refit does not make the model itself faster. It helps keep the local environment around Codex cleaner, lighter, and easier to understand.
+It is basically a refit bay for your Codex install.
 
-Think of it as a tune-up panel for Codex on your Mac.
+## What You Get
 
-## Safety
+- **Smart Optimize**: one recommended cleanup plan for the normal safe stuff.
+- **Speed Check**: a before-and-after benchmark so you can see whether things improved.
+- **Codex Doctor**: plain-language advice when Refit spots something slowing you down.
+- **Easy Mode**: the default view, focused on what matters.
+- **Hard Mode**: deeper controls when you want to inspect the machinery.
+- **Generated-image safety**: Refit preserves generated images instead of deleting them.
 
-Codex Refit is intentionally conservative.
+## Why It Is Useful
 
-- Generated images are **never deleted** by Refit.
-- Image folders may be moved out of the active Codex area, but they are preserved.
-- Riskier cleanup actions stay locked until you turn on Hard Mode and explicitly enable deletes.
+Codex stores useful local state: conversations, logs, screenshots, app data, worktrees, and more. That is good until it quietly turns into a pile.
+
+Refit helps answer the questions you actually care about:
+
+- Why does Codex feel slower lately?
+- What is taking up all this space?
+- What can I safely clean?
+- Did cleanup actually help?
+- Is this a local-state problem, a config problem, or just a big active thread?
+
+## Safety First
+
+The default behavior is intentionally conservative.
+
+- Generated images are **never deleted** by Codex Refit.
+- Old generated-image folders may be moved out of the active Codex area, but they are preserved.
+- Riskier cleanup stays locked behind Hard Mode and an explicit delete switch.
 - SQLite changes create backups under the app data directory.
-- Refit does not print your conversation text, auth tokens, SSH keys, or provider secrets.
+- Refit does not print your conversation text.
+- Refit does not inspect auth tokens, provider secrets, SSH keys, or private credentials.
 - Refit does not silently rewrite your Codex config.
 
-The default path is meant to be boring in the best way: scan, explain, optimize, and keep your work safe.
+The happy path is simple: scan, understand, optimize, check the result.
 
 ## How To Use It
 
 1. Open **Codex Refit**.
-2. Click **Scan** if it has not scanned yet.
-3. Check the main cards to see what is using space or causing drag.
-4. Click **Smart Optimize** for the normal safe cleanup.
-5. Run **Speed Check** before and after cleanup to compare.
-6. Open **Hard Mode** only when you want more control.
-
-## Easy Mode vs Hard Mode
-
-**Easy Mode** is the normal mode. It keeps the app focused on one-button cleanup and a few clear signals.
-
-**Hard Mode** is for deeper inspection. It shows advanced cleanup options, Doctor details, benchmark drivers, and config recommendations.
+2. Let it scan your local Codex state.
+3. Read the top cards to see what is heavy.
+4. Click **Smart Optimize** for the recommended cleanup.
+5. Run **Speed Check** before and after if you want proof.
+6. Open **Hard Mode** only when you want the deeper controls.
 
 ## Download
 
-Use the latest macOS build from the [Releases page](https://github.com/RegionallyFamous/codex-refit/releases) when one is attached.
+Grab the latest macOS build from the [Releases page](https://github.com/RegionallyFamous/codex-refit/releases) when a build is attached.
 
-Because this is a local utility app, macOS may warn that it is from an unidentified developer until it is signed and notarized.
+Until the app is signed and notarized, macOS may warn that it is from an unidentified developer. That is expected for an early local utility.
 
-## For Developers
+## Want The Technical Details?
 
-Build notes, local commands, packaging steps, safety rules, and the full Codex speed playbook live in the [wiki](https://github.com/RegionallyFamous/codex-refit/wiki).
+The build notes, packaging steps, safety model, and full Codex speed playbook live in the [wiki](https://github.com/RegionallyFamous/codex-refit/wiki).
