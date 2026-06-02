@@ -54,6 +54,7 @@ const paths = {
   maintenanceArchive: path.join(codexHome, "maintenance-archive"),
   generatedImages: path.join(codexHome, "generated_images"),
   generatedImagesArchive: path.join(codexHome, "archived_generated_images"),
+  worktrees: path.join(codexHome, "worktrees"),
   memories: path.join(codexHome, "memories"),
   memoriesExtensions: path.join(codexHome, "memories_extensions"),
   customPrompts: path.join(codexHome, "prompts"),
@@ -4596,6 +4597,109 @@ async function summarizeMany(targets, options = {}) {
   return summary;
 }
 
+function emptyWorktreeSummary() {
+  return {
+    label: "Codex Worktrees",
+    path: paths.worktrees,
+    exists: false,
+    bytes: 0,
+    fileCount: 0,
+    dirCount: 0,
+    worktreeCount: 0,
+    largeWorktreeCount: 0,
+    hugeWorktreeCount: 0,
+    overDefaultKeepCount: 0,
+    largest: [],
+    risk: "scan",
+    tone: "low",
+    action: "None",
+    detail: "No Codex-managed worktree directory was found.",
+    hotspots: ["No Codex-managed worktrees found."],
+  };
+}
+
+async function summarizeCodexWorktrees() {
+  const summary = emptyWorktreeSummary();
+  const rootStats = await statOrNull(paths.worktrees);
+  if (!rootStats?.isDirectory()) return summary;
+  summary.exists = true;
+  summary.hotspots = [];
+
+  let entries = [];
+  try {
+    entries = await fs.readdir(paths.worktrees, { withFileTypes: true });
+  } catch {
+    summary.detail = "Refit could not read the Codex worktrees directory.";
+    summary.hotspots = [summary.detail];
+    summary.tone = "medium";
+    summary.action = "Inspect worktrees";
+    return summary;
+  }
+
+  const worktreeEntries = [];
+  for (const entry of entries) {
+    const fullPath = path.join(paths.worktrees, entry.name);
+    const stats = await statOrNull(fullPath);
+    if (!stats || stats.isSymbolicLink()) continue;
+    if (!stats.isDirectory() && !stats.isFile()) continue;
+    const bytes = await duBytes(fullPath);
+    summary.bytes += bytes;
+    if (stats.isDirectory()) summary.dirCount += 1;
+    else summary.fileCount += 1;
+    worktreeEntries.push({
+      name: entry.name,
+      path: fullPath,
+      bytes,
+      mtime: stats.mtime.toISOString(),
+      bucket: "Codex Worktrees",
+    });
+  }
+
+  summary.worktreeCount = worktreeEntries.length;
+  summary.largeWorktreeCount = worktreeEntries.filter((entry) => entry.bytes >= 1024 ** 3).length;
+  summary.hugeWorktreeCount = worktreeEntries.filter((entry) => entry.bytes >= 5 * 1024 ** 3).length;
+  summary.overDefaultKeepCount = Math.max(0, summary.worktreeCount - 15);
+  summary.largest = worktreeEntries.sort((a, b) => b.bytes - a.bytes).slice(0, 8);
+  summary.tone =
+    summary.bytes >= 20 * 1024 ** 3 || summary.hugeWorktreeCount > 0 || summary.overDefaultKeepCount > 0
+      ? "high"
+      : summary.bytes >= 5 * 1024 ** 3 || summary.largeWorktreeCount > 0 || summary.worktreeCount >= 8
+        ? "medium"
+        : "low";
+  summary.action =
+    summary.tone === "high"
+      ? "Review worktrees"
+      : summary.tone === "medium"
+        ? "Watch worktrees"
+        : summary.worktreeCount
+          ? "Keep tidy"
+          : "None";
+  summary.detail =
+    summary.worktreeCount === 0
+      ? "No Codex-managed worktrees were found."
+      : [
+          `Codex-managed worktrees occupy ${formatBytesServer(summary.bytes)} across ${summary.worktreeCount.toLocaleString()} item${summary.worktreeCount === 1 ? "" : "s"}.`,
+          summary.overDefaultKeepCount
+            ? `That is ${summary.overDefaultKeepCount.toLocaleString()} over the documented default keep limit of 15 managed worktrees.`
+            : null,
+          summary.largeWorktreeCount
+            ? `${summary.largeWorktreeCount.toLocaleString()} worktree${summary.largeWorktreeCount === 1 ? " is" : "s are"} at least 1 GB.`
+            : null,
+          "Archive finished runs you no longer need in the Codex app, and avoid pinning automation runs unless you intend to keep their worktrees.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+  summary.hotspots = summary.worktreeCount
+    ? [
+        `${summary.worktreeCount.toLocaleString()} Codex-managed worktree${summary.worktreeCount === 1 ? "" : "s"} under ${displayPath(paths.worktrees)}.`,
+        summary.bytes ? `${formatBytesServer(summary.bytes)} of isolated checkout/dependency state.` : "Worktree size is negligible.",
+        summary.overDefaultKeepCount ? `${summary.overDefaultKeepCount.toLocaleString()} over the documented default keep limit of 15.` : null,
+      ].filter(Boolean)
+    : ["No Codex-managed worktrees found."];
+
+  return summary;
+}
+
 async function sqliteJson(dbPath, sql, timeout = 30000) {
   if (!(await exists(dbPath))) return [];
   const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
@@ -5398,6 +5502,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const activeReliefBytes = context.activeReliefBytes || 0;
   const logBytes = context.logBytes || 0;
   const logWalBytes = context.logWalBytes || 0;
+  const worktrees = scan?.categories?.codexWorktrees || emptyWorktreeSummary();
   const staleProjectPaths = codexConfig?.staleTrustedProjectPaths || [];
   const defaultReasoningEffort = normalizedEffort(codexConfig?.reasoningEffort);
   const highEffort = ["high", "xhigh", "extra-high"].includes(defaultReasoningEffort);
@@ -6011,6 +6116,27 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (worktrees.exists && worktrees.tone !== "low") {
+    addFix({
+      id: "worktree-pressure",
+      label: "Worktrees",
+      value: formatBytesServer(worktrees.bytes),
+      tone: worktrees.tone === "high" ? "high" : "medium",
+      action: "Review in Codex app",
+      detail:
+        "Codex-managed worktrees are isolated checkouts under ~/.codex/worktrees. They can include dependencies and build caches, so review them in the Codex app before removing anything.",
+      snippet: [
+        "# Inspect Codex-managed worktree size:",
+        `du -sh ${shellQuote(paths.worktrees)}/* 2>/dev/null | sort -hr | head`,
+        "",
+        "# Safe next moves:",
+        "# - Archive finished worktree-backed threads you no longer need.",
+        "# - Avoid pinning automation runs unless you intend to keep their worktrees.",
+        "# - Use Handoff or create a branch before cleaning up work you still need.",
+      ].join("\n"),
+    });
+  }
+
   if (
     currentProject &&
     (!currentProject.hasAgents ||
@@ -6163,6 +6289,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const logBytes = scan.logs?.bytes || 0;
   const logWalBytes = scan.logs?.walBytes || 0;
   const generatedImageBytes = categories.generatedImages?.bytes || 0;
+  const worktrees = categories.codexWorktrees || emptyWorktreeSummary();
   const staleThreads = Number(scan.state?.threads?.activeStale ?? scan.state?.threads?.activeOlder7d ?? 0);
   const model = codexConfig?.model || "Not set";
   const effort = codexConfig?.reasoningEffort || "Not set";
@@ -6544,6 +6671,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: profileHealth.detail,
     },
     {
+      id: "worktree-pressure",
+      label: "Worktrees",
+      value: worktrees.exists ? formatBytesServer(worktrees.bytes) : "None",
+      tone: worktrees.tone || "low",
+      action: worktrees.action || "None",
+      priority: worktrees.tone === "high" ? 82 : worktrees.tone === "medium" ? 60 : 20,
+      detail: worktrees.detail,
+    },
+    {
       id: "fast-default",
       label: "Fast Default",
       value: fastMode ? "Fast" : fastModeFeature ? displayTier : "Feature off",
@@ -6887,6 +7023,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: profileHealth.tone,
       priority: profileHealth.tone === "high" ? 84 : 62,
       detail: profileHealth.detail,
+    });
+  }
+
+  if (worktrees.exists && worktrees.tone !== "low") {
+    addRecommendation({
+      id: "worktree-pressure",
+      label: "Worktrees",
+      value: `${worktrees.worktreeCount.toLocaleString()} / ${formatBytesServer(worktrees.bytes)}`,
+      action: "Review worktrees",
+      tone: worktrees.tone === "high" ? "high" : "medium",
+      priority: worktrees.tone === "high" ? 83 : 61,
+      detail: worktrees.detail,
     });
   }
 
@@ -7557,6 +7705,7 @@ export async function scanCodex(options = {}) {
     maintenanceArchive,
     generatedImages,
     generatedImagesArchive,
+    codexWorktrees,
     memoryState,
     crashDumps,
     browserCaches,
@@ -7580,6 +7729,7 @@ export async function scanCodex(options = {}) {
     }),
     summarizeDirectory(paths.generatedImages, { label: "Generated Images", risk: "warn", largestLimit: 8 }),
     summarizeDirectory(paths.generatedImagesArchive, { label: "Moved Generated Images", risk: "scan", largestLimit: 8 }),
+    summarizeCodexWorktrees(),
     summarizeMany([paths.memories, paths.memoriesExtensions], {
       label: "Memory State",
       pathLabel: "memories + memories_extensions",
@@ -7656,6 +7806,7 @@ export async function scanCodex(options = {}) {
     maintenanceArchive,
     generatedImages,
     generatedImagesArchive,
+    codexWorktrees,
     memoryState,
     logs,
     crashDumps,
@@ -7749,6 +7900,18 @@ function localScoreBreakdown(metrics) {
       points: Math.min(10, Number(metrics.staleThreads || 0) * 0.08),
       value: `${Number(metrics.staleThreads || 0).toLocaleString()} threads`,
       detail: "Unarchived threads older than the active cutoff.",
+    },
+    {
+      id: "codex-worktrees",
+      label: "Worktrees",
+      points: Math.min(
+        12,
+        gb(metrics.codexWorktreeBytes) * 0.45 +
+          Number(metrics.codexWorktreeLargeCount || 0) * 0.6 +
+          Number(metrics.codexWorktreeOverDefaultKeepCount || 0) * 0.8,
+      ),
+      value: `${Number(metrics.codexWorktreeCount || 0).toLocaleString()} worktree${metrics.codexWorktreeCount === 1 ? "" : "s"}`,
+      detail: "Codex-managed worktrees under ~/.codex/worktrees.",
     },
   ].map((component) => ({
     ...component,
@@ -7896,6 +8059,15 @@ function benchmarkGuidance(metrics) {
     guidance.push(`Retune ${Number(metrics.profileSlowFastCount).toLocaleString()} speed-named profile${metrics.profileSlowFastCount === 1 ? "" : "s"} that still use high reasoning.`);
   } else if (metrics.profileWeakFastCount > 0) {
     guidance.push(`Add explicit mini, Spark, low reasoning, Fast Mode, low verbosity, or lean summary settings to ${Number(metrics.profileWeakFastCount).toLocaleString()} speed-named profile${metrics.profileWeakFastCount === 1 ? "" : "s"}.`);
+  }
+  if (metrics.codexWorktreeOverDefaultKeepCount > 0) {
+    guidance.push(
+      `Review Codex worktrees: ${Number(metrics.codexWorktreeCount).toLocaleString()} are present, ${Number(metrics.codexWorktreeOverDefaultKeepCount).toLocaleString()} over the documented default keep limit of 15.`,
+    );
+  } else if (metrics.codexWorktreeBytes > 5 * 1024 ** 3) {
+    guidance.push(`Review ${formatBytesServer(metrics.codexWorktreeBytes)} of Codex-managed worktrees in the app before judging disk cleanup.`);
+  } else if (metrics.codexWorktreeLargeCount > 0) {
+    guidance.push(`Review ${Number(metrics.codexWorktreeLargeCount).toLocaleString()} Codex worktree${metrics.codexWorktreeLargeCount === 1 ? "" : "s"} over 1 GB.`);
   }
   if (metrics.agentMaxDepth > 1) {
     guidance.push(
@@ -8080,13 +8252,18 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v8",
+    scoreModel: "local-state-v9",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
     oversizedActiveFiles: categories.activeSessions?.oversized50mb || 0,
     archivedFilesInSessions: categories.archivedSessionsInActiveTree?.fileCount || 0,
     staleThreads: Number(scan?.state?.threads?.activeStale ?? scan?.state?.threads?.activeOlder7d ?? 0),
+    codexWorktreeBytes: categories.codexWorktrees?.bytes || 0,
+    codexWorktreeCount: categories.codexWorktrees?.worktreeCount || 0,
+    codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
+    codexWorktreeHugeCount: categories.codexWorktrees?.hugeWorktreeCount || 0,
+    codexWorktreeOverDefaultKeepCount: categories.codexWorktrees?.overDefaultKeepCount || 0,
   };
 }
 
@@ -8184,6 +8361,9 @@ function buildSlowdownDiagnosis(scan, context = {}) {
   const logWalBytes = scan.logs?.walBytes || 0;
   const archivedDeleteBytes = context.deletePreviewBytes || 0;
   const generatedImageBytes = categories.generatedImages?.bytes || 0;
+  const worktreeBytes = categories.codexWorktrees?.bytes || 0;
+  const worktreeCount = categories.codexWorktrees?.worktreeCount || 0;
+  const worktreeOverDefaultKeep = categories.codexWorktrees?.overDefaultKeepCount || 0;
   const cacheBytes = categories.browserCaches?.bytes || 0;
   const crashBytes = categories.crashDumps?.bytes || 0;
   const staleThreads = Number(state.activeStale ?? state.activeOlder7d ?? 0);
@@ -8236,6 +8416,16 @@ function buildSlowdownDiagnosis(scan, context = {}) {
       tone: cacheBytes + crashBytes > 256 * 1024 ** 2 ? "medium" : "low",
       detail: "Crash dumps and rebuildable browser caches are disposable.",
     },
+    {
+      id: "worktrees",
+      label: "Worktrees",
+      value: formatBytesServer(worktreeBytes),
+      score: gb(worktreeBytes) * 0.45 + worktreeOverDefaultKeep * 0.8,
+      tone: categories.codexWorktrees?.tone || "low",
+      detail: worktreeCount
+        ? `${worktreeCount.toLocaleString()} Codex-managed worktree${worktreeCount === 1 ? "" : "s"} found. Review finished worktree-backed threads in the Codex app before removing anything.`
+        : "No Codex-managed worktree pressure is showing.",
+    },
   ].sort((a, b) => b.score - a.score);
 
   const primary = signals[0];
@@ -8283,6 +8473,9 @@ function buildSmartPlan(scan, options = {}) {
   const archivedDeleteBytes = scan.categories.archivedDeleteCandidates?.bytes || 0;
   const maintenanceBytes = scan.categories.maintenanceArchive?.bytes || 0;
   const generatedImageBytes = scan.categories.generatedImages?.bytes || 0;
+  const worktreeBytes = scan.categories.codexWorktrees?.bytes || 0;
+  const worktreeCount = scan.categories.codexWorktrees?.worktreeCount || 0;
+  const worktreeOverDefaultKeep = scan.categories.codexWorktrees?.overDefaultKeepCount || 0;
   let suggestedPolicy = "safe";
   let suggestedReason = "Safe mode has useful cleanup and is the right default.";
   if (maintenanceBytes > 5 * 1024 ** 3 || archivedDeleteBytes > 256 * 1024 ** 2 || archivedDeleteRows > 25) {
@@ -8504,6 +8697,16 @@ function buildSmartPlan(scan, options = {}) {
         tone: logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3 ? "high" : "low",
       },
       {
+        label: "Worktrees",
+        value: formatBytesServer(worktreeBytes),
+        detail: worktreeCount
+          ? worktreeOverDefaultKeep
+            ? `${worktreeCount.toLocaleString()} Codex-managed worktree${worktreeCount === 1 ? "" : "s"} found, ${worktreeOverDefaultKeep.toLocaleString()} over the documented default keep limit.`
+            : `${worktreeCount.toLocaleString()} Codex-managed worktree${worktreeCount === 1 ? "" : "s"} found. Review in the Codex app if disk pressure matters.`
+          : "No Codex-managed worktrees found.",
+        tone: scan.categories.codexWorktrees?.tone || "low",
+      },
+      {
         label: "Locked Deletes",
         value: effectivePolicy === "safe" ? "Locked" : formatBytesServer(deletePreviewBytes),
         detail:
@@ -8681,6 +8884,11 @@ function benchmarkDeltas(current, previous) {
     "oversizedActiveFiles",
     "staleThreads",
     "archivedFilesInSessions",
+    "codexWorktreeBytes",
+    "codexWorktreeCount",
+    "codexWorktreeLargeCount",
+    "codexWorktreeHugeCount",
+    "codexWorktreeOverDefaultKeepCount",
     "processCount",
     "processRssBytes",
     "processHelperCount",
@@ -8794,6 +9002,11 @@ function summarizeBenchmarkEntry(entry) {
     logWalBytes: entry.metrics.logWalBytes,
     staleThreads: entry.metrics.staleThreads,
     oversizedActiveFiles: entry.metrics.oversizedActiveFiles,
+    codexWorktreeBytes: entry.metrics.codexWorktreeBytes || 0,
+    codexWorktreeCount: entry.metrics.codexWorktreeCount || 0,
+    codexWorktreeLargeCount: entry.metrics.codexWorktreeLargeCount || 0,
+    codexWorktreeHugeCount: entry.metrics.codexWorktreeHugeCount || 0,
+    codexWorktreeOverDefaultKeepCount: entry.metrics.codexWorktreeOverDefaultKeepCount || 0,
     processCount: entry.metrics.processCount || 0,
     processHelperCount: entry.metrics.processHelperCount || 0,
     processRssBytes: entry.metrics.processRssBytes || 0,
@@ -8994,6 +9207,11 @@ export async function benchmarkHistory(limit = 12) {
         logBytes: latest.logBytes - oldest.logBytes,
         logWalBytes: latest.logWalBytes - oldest.logWalBytes,
         staleThreads: latest.staleThreads - oldest.staleThreads,
+        codexWorktreeBytes: latest.codexWorktreeBytes - oldest.codexWorktreeBytes,
+        codexWorktreeCount: latest.codexWorktreeCount - oldest.codexWorktreeCount,
+        codexWorktreeLargeCount: latest.codexWorktreeLargeCount - oldest.codexWorktreeLargeCount,
+        codexWorktreeHugeCount: latest.codexWorktreeHugeCount - oldest.codexWorktreeHugeCount,
+        codexWorktreeOverDefaultKeepCount: latest.codexWorktreeOverDefaultKeepCount - oldest.codexWorktreeOverDefaultKeepCount,
         processCount: latest.processCount - oldest.processCount,
         processRssBytes: latest.processRssBytes - oldest.processRssBytes,
         backgroundProcessCount: latest.backgroundProcessCount - oldest.backgroundProcessCount,
@@ -9067,6 +9285,11 @@ export async function benchmarkHistory(limit = 12) {
         scanMs: latest.scanMs - previous.scanMs,
         stateQueryMs: latest.stateQueryMs - previous.stateQueryMs,
         logQueryMs: latest.logQueryMs - previous.logQueryMs,
+        codexWorktreeBytes: latest.codexWorktreeBytes - previous.codexWorktreeBytes,
+        codexWorktreeCount: latest.codexWorktreeCount - previous.codexWorktreeCount,
+        codexWorktreeLargeCount: latest.codexWorktreeLargeCount - previous.codexWorktreeLargeCount,
+        codexWorktreeHugeCount: latest.codexWorktreeHugeCount - previous.codexWorktreeHugeCount,
+        codexWorktreeOverDefaultKeepCount: latest.codexWorktreeOverDefaultKeepCount - previous.codexWorktreeOverDefaultKeepCount,
         processCount: latest.processCount - previous.processCount,
         backgroundProcessCount: latest.backgroundProcessCount - previous.backgroundProcessCount,
         modelHighEffort: Number(latest.modelHighEffort) - Number(previous.modelHighEffort),
@@ -9187,7 +9410,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v8",
+    scoreModel: "local-state-v9",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -9207,6 +9430,11 @@ export async function runBenchmark() {
     archivedDeleteRows: scan.categories.archivedDeleteCandidates?.dbRowCount || 0,
     archivedDeleteBytes: scan.categories.archivedDeleteCandidates?.bytes || 0,
     archivedDeleteDays: scan.categories.archivedDeleteCandidates?.days || 30,
+    codexWorktreeBytes: scan.categories.codexWorktrees?.bytes || 0,
+    codexWorktreeCount: scan.categories.codexWorktrees?.worktreeCount || 0,
+    codexWorktreeLargeCount: scan.categories.codexWorktrees?.largeWorktreeCount || 0,
+    codexWorktreeHugeCount: scan.categories.codexWorktrees?.hugeWorktreeCount || 0,
+    codexWorktreeOverDefaultKeepCount: scan.categories.codexWorktrees?.overDefaultKeepCount || 0,
     processCount: scan.processes?.processCount || 0,
     processHelperCount: scan.processes?.helperCount || 0,
     processRssBytes: scan.processes?.rssBytes || 0,

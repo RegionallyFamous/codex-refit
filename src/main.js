@@ -612,6 +612,7 @@ function renderScan(scan) {
     scan.categories.maintenanceArchive,
     scan.categories.generatedImages,
     scan.categories.generatedImagesArchive,
+    scan.categories.codexWorktrees,
     scan.categories.memoryState,
     scan.categories.logs,
     scan.categories.crashDumps,
