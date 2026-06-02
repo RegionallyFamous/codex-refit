@@ -608,6 +608,7 @@ function renderScan(scan) {
     scan.categories.sessionMedia,
     scan.categories.taskClarity,
     scan.categories.turnTelemetry,
+    scan.categories.approvalFriction,
     scan.categories.activeStaleSessions,
     scan.categories.archivedSessionsInActiveTree,
     scan.categories.archivedSessions,

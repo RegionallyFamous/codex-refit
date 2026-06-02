@@ -7153,6 +7153,299 @@ async function summarizeTurnTelemetry(activeSessions = {}) {
   return summary;
 }
 
+function emptyApprovalFrictionSummary(activeSessions = {}) {
+  return {
+    label: "Approval Friction",
+    path: paths.sessions,
+    exists: Boolean(activeSessions.exists),
+    bytes: 0,
+    fileCount: 0,
+    scannedFileCount: 0,
+    sampledBytes: 0,
+    parsedLineCount: 0,
+    markerCount: 0,
+    approvalMarkerCount: 0,
+    permissionRequestCount: 0,
+    sandboxDenialCount: 0,
+    execPolicyMarkerCount: 0,
+    escalationMarkerCount: 0,
+    deniedMarkerCount: 0,
+    networkSandboxMarkerCount: 0,
+    highFrictionFileCount: 0,
+    cappedFileCount: 0,
+    unparsedFileCount: 0,
+    largest: [],
+    risk: "scan",
+    tone: "low",
+    action: "Keep current",
+    detail: "No approval, permission, sandbox-denial, or execpolicy friction markers were found in the largest active transcript metadata samples.",
+    hotspots: ["No sampled approval or sandbox friction found in active transcript metadata."],
+  };
+}
+
+const approvalMetadataSkipKeys = new Set([
+  "arguments",
+  "body",
+  "cmd",
+  "command",
+  "content",
+  "diff",
+  "input",
+  "input_text",
+  "output",
+  "output_text",
+  "patch",
+  "prompt",
+  "stderr",
+  "stdout",
+  "summary",
+  "text",
+  "transcript",
+]);
+
+function collectApprovalMetadataText(value, chunks = [], keyPath = []) {
+  if (chunks.length >= 800 || value === null || value === undefined) return chunks;
+  const key = String(keyPath.at(-1) || "").toLowerCase();
+  const pathText = keyPath.join(".").toLowerCase();
+  if (approvalMetadataSkipKeys.has(key)) return chunks;
+
+  if (typeof value === "string") {
+    const metadataLike =
+      /(?:^|\.)(type|subtype|kind|event|name|status|decision|policy|approval|permission|sandbox|rule|reason|error|warning|message|code|result|source|tool|action|annotation)$/i.test(
+        pathText,
+      ) || /approval|permission|sandbox|execpolicy|prefix_rule|matched_rule|request_permissions|with_escalated_permissions/i.test(pathText);
+    if (metadataLike) chunks.push(value.slice(0, 600));
+    return chunks;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    if (/approval|permission|sandbox|execpolicy|rule|status|decision|policy|error|warning/.test(pathText)) chunks.push(String(value));
+    return chunks;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 40)) collectApprovalMetadataText(item, chunks, keyPath);
+    return chunks;
+  }
+
+  if (typeof value === "object") {
+    for (const [entryKey, entryValue] of Object.entries(value).slice(0, 120)) {
+      const normalizedKey = String(entryKey || "");
+      if (approvalMetadataSkipKeys.has(normalizedKey.toLowerCase())) continue;
+      chunks.push(normalizedKey);
+      collectApprovalMetadataText(entryValue, chunks, [...keyPath, normalizedKey]);
+    }
+  }
+
+  return chunks;
+}
+
+function approvalFrictionSignals(metadataText) {
+  const text = String(metadataText || "");
+  const approval =
+    /\bapproval(?:s|_policy|_reviewer)?\b|\bapproval[_-]?request\b|\bask[_-]?for[_-]?approval\b|\brequires?\s+approval\b|\bon-request\b/i.test(text);
+  const permissionRequest =
+    /\bPermissionRequest\b|\brequest_permissions\b|\bpermission[_\s-]?request\b|\bpermissions?\b|\btool[_\s-]?approval\b/i.test(text);
+  const sandboxDenial =
+    /(?:sandbox|seatbelt|landlock|seccomp)[\s\S]{0,180}(?:denied|blocked|forbidden|not permitted|operation not permitted|outside|violation|failed)|(?:denied|blocked|forbidden|not permitted|operation not permitted)[\s\S]{0,180}sandbox|\boutside\s+(?:the\s+)?sandbox\b|\bnetwork access (?:is )?off\b/i.test(
+      text,
+    );
+  const execPolicy = /\bexecpolicy\b|\bprefix_rule\b|\bmatched_rule\b|\bexec[_-]?policy\b|\brule[_-]prompt\b/i.test(text);
+  const escalation =
+    /\brequire_escalated\b|\bwith_escalated_permissions\b|\bsandbox_permissions\b|\bescalat(?:e|ed|ion)\b|\boutside\s+(?:the\s+)?sandbox\b/i.test(text);
+  const denied = /\bden(?:y|ied|ial)\b|\breject(?:ed|ion)?\b|\bdeclined\b|\bcancel(?:led|ed)\b|\bforbidden\b|\bblocked\b/i.test(text);
+  const networkSandbox =
+    /\bnetwork access (?:is )?off\b|\bsandbox_workspace_write\.network_access\b|\bnetwork_proxy\b|\bcommand network\b|\bnetwork[\s\S]{0,80}sandbox\b/i.test(
+      text,
+    );
+
+  return {
+    approval,
+    permissionRequest,
+    sandboxDenial,
+    execPolicy,
+    escalation,
+    denied,
+    networkSandbox,
+    any: approval || permissionRequest || sandboxDenial || execPolicy || escalation || denied || networkSandbox,
+  };
+}
+
+async function scanApprovalFrictionMarkers(file) {
+  const sampled = await sampleTextFile(file.path, { maxHeadBytes: 4 * 1024 * 1024, maxTailBytes: 2 * 1024 * 1024 });
+  if (!sampled) return null;
+  const { stats, sample, sampledBytes, capped } = sampled;
+  const result = {
+    name: path.basename(file.path),
+    path: file.path,
+    bytes: stats.size,
+    mtime: stats.mtime.toISOString(),
+    bucket: "Approval Friction",
+    sampledBytes,
+    capped,
+    parsedLineCount: 0,
+    markerCount: 0,
+    approvalMarkerCount: 0,
+    permissionRequestCount: 0,
+    sandboxDenialCount: 0,
+    execPolicyMarkerCount: 0,
+    escalationMarkerCount: 0,
+    deniedMarkerCount: 0,
+    networkSandboxMarkerCount: 0,
+    highFriction: false,
+  };
+
+  for (const line of sample.split("\n")) {
+    if (!line.trim()) continue;
+    let record = null;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    result.parsedLineCount += 1;
+    const metadataText = collectApprovalMetadataText(record).join("\n");
+    if (!metadataText) continue;
+    const signals = approvalFrictionSignals(metadataText);
+    if (!signals.any) continue;
+
+    result.markerCount += 1;
+    if (signals.approval) result.approvalMarkerCount += 1;
+    if (signals.permissionRequest) result.permissionRequestCount += 1;
+    if (signals.sandboxDenial) result.sandboxDenialCount += 1;
+    if (signals.execPolicy) result.execPolicyMarkerCount += 1;
+    if (signals.escalation) result.escalationMarkerCount += 1;
+    if (signals.denied) result.deniedMarkerCount += 1;
+    if (signals.networkSandbox) result.networkSandboxMarkerCount += 1;
+  }
+
+  result.highFriction =
+    result.sandboxDenialCount >= 2 ||
+    result.permissionRequestCount >= 6 ||
+    result.execPolicyMarkerCount >= 6 ||
+    result.escalationMarkerCount >= 5 ||
+    result.deniedMarkerCount >= 4;
+
+  return result;
+}
+
+async function summarizeApprovalFriction(activeSessions = {}) {
+  const summary = emptyApprovalFrictionSummary(activeSessions);
+  if (!activeSessions.exists) return summary;
+  const candidates = (activeSessions.largest || [])
+    .filter((file) => file?.path && /\.(jsonl?|txt|md)$/i.test(file.path))
+    .slice(0, 10);
+  if (!candidates.length) {
+    summary.exists = true;
+    summary.detail = "No readable transcript candidates were found among the largest active session files.";
+    summary.hotspots = [summary.detail];
+    return summary;
+  }
+
+  const scanned = [];
+  for (const file of candidates) {
+    const result = await scanApprovalFrictionMarkers(file);
+    if (result) scanned.push(result);
+  }
+
+  summary.exists = true;
+  summary.scannedFileCount = candidates.length;
+  summary.largest = scanned
+    .filter((file) => file.markerCount || file.parsedLineCount === 0)
+    .sort((a, b) => {
+      const pressureA =
+        a.sandboxDenialCount * 8 +
+        a.permissionRequestCount * 2 +
+        a.execPolicyMarkerCount * 2 +
+        a.escalationMarkerCount * 2 +
+        a.deniedMarkerCount * 3 +
+        a.bytes / 1024 ** 3;
+      const pressureB =
+        b.sandboxDenialCount * 8 +
+        b.permissionRequestCount * 2 +
+        b.execPolicyMarkerCount * 2 +
+        b.escalationMarkerCount * 2 +
+        b.deniedMarkerCount * 3 +
+        b.bytes / 1024 ** 3;
+      return pressureB - pressureA;
+    })
+    .slice(0, 8);
+
+  summary.fileCount = summary.largest.length;
+  summary.bytes = summary.largest.reduce((total, file) => total + file.bytes, 0);
+  summary.sampledBytes = summary.largest.reduce((total, file) => total + file.sampledBytes, 0);
+  summary.parsedLineCount = summary.largest.reduce((total, file) => total + file.parsedLineCount, 0);
+  summary.markerCount = summary.largest.reduce((total, file) => total + file.markerCount, 0);
+  summary.approvalMarkerCount = summary.largest.reduce((total, file) => total + file.approvalMarkerCount, 0);
+  summary.permissionRequestCount = summary.largest.reduce((total, file) => total + file.permissionRequestCount, 0);
+  summary.sandboxDenialCount = summary.largest.reduce((total, file) => total + file.sandboxDenialCount, 0);
+  summary.execPolicyMarkerCount = summary.largest.reduce((total, file) => total + file.execPolicyMarkerCount, 0);
+  summary.escalationMarkerCount = summary.largest.reduce((total, file) => total + file.escalationMarkerCount, 0);
+  summary.deniedMarkerCount = summary.largest.reduce((total, file) => total + file.deniedMarkerCount, 0);
+  summary.networkSandboxMarkerCount = summary.largest.reduce((total, file) => total + file.networkSandboxMarkerCount, 0);
+  summary.highFrictionFileCount = summary.largest.filter((file) => file.highFriction).length;
+  summary.cappedFileCount = summary.largest.filter((file) => file.capped).length;
+  summary.unparsedFileCount = summary.largest.filter((file) => file.parsedLineCount === 0).length;
+  summary.label = summary.markerCount
+    ? `${summary.markerCount.toLocaleString()} stop${summary.markerCount === 1 ? "" : "s"}`
+    : summary.fileCount
+      ? "No stops"
+      : "No sample";
+  summary.tone =
+    summary.sandboxDenialCount >= 3 ||
+    summary.permissionRequestCount >= 10 ||
+    summary.execPolicyMarkerCount >= 10 ||
+    summary.highFrictionFileCount >= 2
+      ? "high"
+      : summary.sandboxDenialCount ||
+          summary.permissionRequestCount >= 3 ||
+          summary.execPolicyMarkerCount >= 3 ||
+          summary.escalationMarkerCount >= 3 ||
+          summary.deniedMarkerCount >= 2
+        ? "medium"
+        : "low";
+  summary.risk = summary.tone === "high" ? "warn" : "scan";
+  summary.action =
+    summary.tone === "high"
+      ? "Tune approvals"
+      : summary.tone === "medium"
+        ? "Review rules"
+        : summary.markerCount
+          ? "Watch prompts"
+          : "Keep current";
+  summary.detail =
+    summary.fileCount === 0
+      ? "Refit could not parse approval or sandbox metadata from the largest active transcript samples."
+      : [
+          `Refit sampled ${summary.fileCount.toLocaleString()} active transcript${summary.fileCount === 1 ? "" : "s"} and found ${summary.markerCount.toLocaleString()} approval, permission, sandbox, or execpolicy marker${summary.markerCount === 1 ? "" : "s"}.`,
+          `${summary.permissionRequestCount.toLocaleString()} permission request marker${summary.permissionRequestCount === 1 ? "" : "s"}, ${summary.sandboxDenialCount.toLocaleString()} sandbox-denial marker${summary.sandboxDenialCount === 1 ? "" : "s"}, and ${summary.execPolicyMarkerCount.toLocaleString()} execpolicy marker${summary.execPolicyMarkerCount === 1 ? "" : "s"} were present.`,
+          summary.highFrictionFileCount
+            ? `${summary.highFrictionFileCount.toLocaleString()} sampled thread${summary.highFrictionFileCount === 1 ? " looks" : "s look"} like approval flow could be slowing the run.`
+            : null,
+          summary.cappedFileCount
+            ? `${summary.cappedFileCount.toLocaleString()} very large file${summary.cappedFileCount === 1 ? " was" : "s were"} sampled at the head and tail only.`
+            : null,
+          "Refit counts metadata markers only; it does not print commands, prompt text, or transcript contents.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+  summary.hotspots = [
+    summary.permissionRequestCount
+      ? `${summary.permissionRequestCount.toLocaleString()} permission request marker${summary.permissionRequestCount === 1 ? "" : "s"} in sampled active metadata.`
+      : "No sampled permission request markers.",
+    summary.sandboxDenialCount
+      ? `${summary.sandboxDenialCount.toLocaleString()} sandbox-denial marker${summary.sandboxDenialCount === 1 ? "" : "s"}; review sandbox/network settings before blaming cleanup.`
+      : "No sampled sandbox-denial markers.",
+    summary.execPolicyMarkerCount
+      ? `${summary.execPolicyMarkerCount.toLocaleString()} execpolicy marker${summary.execPolicyMarkerCount === 1 ? "" : "s"}; narrow broad prompt rules if routine commands keep stopping.`
+      : "No sampled execpolicy prompt markers.",
+    summary.highFrictionFileCount
+      ? `${summary.highFrictionFileCount.toLocaleString()} high-friction active thread${summary.highFrictionFileCount === 1 ? "" : "s"} found.`
+      : "No high-friction active thread sample found.",
+  ];
+  return summary;
+}
+
 async function summarizeSessionMediaPressure(activeSessions = {}) {
   const summary = emptySessionMediaSummary(activeSessions);
   if (!activeSessions.exists) return summary;
@@ -8161,6 +8454,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const sessionMedia = scan?.categories?.sessionMedia || emptySessionMediaSummary(scan?.categories?.activeSessions || {});
   const taskClarity = scan?.categories?.taskClarity || emptyTaskClaritySummary(scan?.categories?.activeSessions || {});
   const turnTelemetry = scan?.categories?.turnTelemetry || emptyTurnTelemetrySummary(scan?.categories?.activeSessions || {});
+  const approvalFriction = scan?.categories?.approvalFriction || emptyApprovalFrictionSummary(scan?.categories?.activeSessions || {});
   const worktrees = scan?.categories?.codexWorktrees || emptyWorktreeSummary();
   const staleProjectPaths = codexConfig?.staleTrustedProjectPaths || [];
   const defaultReasoningEffort = normalizedEffort(codexConfig?.reasoningEffort);
@@ -8305,6 +8599,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# If rate limits are low:",
         "# - Wait for the limit to recover, use a lighter profile, or move independent heavy work to cloud when the repo is ready.",
+      ].join("\n"),
+    });
+  }
+
+  if (approvalFriction.exists && approvalFriction.tone !== "low") {
+    addFix({
+      id: "approval-friction",
+      label: "Approval Stops",
+      value: approvalFriction.label || `${approvalFriction.markerCount.toLocaleString()} stops`,
+      tone: approvalFriction.tone === "high" ? "high" : "medium",
+      action: approvalFriction.action,
+      detail:
+        "Approval, sandbox, and execpolicy stops can make Codex feel slow even when local state is tidy. Refit reports marker counts only, never commands or prompt text.",
+      snippet: [
+        "# In Codex:",
+        "/permissions",
+        "",
+        "# Test how command rules handle a specific command before changing policy:",
+        "codex execpolicy check --pretty -- <command>",
+        "",
+        "# Keep approvals scoped. Use fewer prompts only for trusted, focused runs,",
+        "# and avoid global danger-full-access unless the environment is isolated.",
       ].join("\n"),
     });
   }
@@ -9295,6 +9611,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const sessionMedia = categories.sessionMedia || emptySessionMediaSummary(categories.activeSessions || {});
   const taskClarity = categories.taskClarity || emptyTaskClaritySummary(categories.activeSessions || {});
   const turnTelemetry = categories.turnTelemetry || emptyTurnTelemetrySummary(categories.activeSessions || {});
+  const approvalFriction = categories.approvalFriction || emptyApprovalFrictionSummary(categories.activeSessions || {});
   const worktrees = categories.codexWorktrees || emptyWorktreeSummary();
   const staleThreads = Number(scan.state?.threads?.activeStale ?? scan.state?.threads?.activeOlder7d ?? 0);
   const model = codexConfig?.model || "Not set";
@@ -9564,6 +9881,24 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: approvalFlow.action || "Review prompts",
       priority: approvalFlow.priority || 72,
       detail: approvalFlow.detail || "Approval prompts can interrupt fast runs. Use /permissions or config only when the trust/safety tradeoff is right.",
+    },
+    {
+      id: "approval-friction",
+      label: "Approval Stops",
+      value: approvalFriction.label,
+      tone: approvalFriction.tone,
+      action: approvalFriction.action,
+      priority:
+        approvalFriction.tone === "high"
+          ? 91
+          : approvalFriction.tone === "medium"
+            ? approvalFriction.sandboxDenialCount
+              ? 74
+              : 62
+            : approvalFriction.markerCount
+              ? 30
+              : 14,
+      detail: approvalFriction.detail,
     },
     {
       id: "managed-config",
@@ -10162,6 +10497,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         turnTelemetry.lowRateLimitCount || turnTelemetry.rateLimitReachedCount
           ? `${turnTelemetry.detail} Run /status in Codex to see current context and rate-limit state before tuning local cleanup again.`
           : turnTelemetry.detail,
+    });
+  }
+
+  if (approvalFriction.exists && approvalFriction.tone !== "low") {
+    addRecommendation({
+      id: "approval-friction",
+      label: "Approval Stops",
+      value: approvalFriction.label,
+      action: approvalFriction.action,
+      tone: approvalFriction.tone === "high" ? "high" : "medium",
+      priority: approvalFriction.tone === "high" ? 90 : 69,
+      detail:
+        approvalFriction.sandboxDenialCount || approvalFriction.execPolicyMarkerCount
+          ? `${approvalFriction.detail} Use /permissions and codex execpolicy check to tune the approval path before assuming database cleanup will help.`
+          : approvalFriction.detail,
     });
   }
 
@@ -11099,6 +11449,7 @@ export async function scanCodex(options = {}) {
     sessionMedia,
     taskClarity,
     turnTelemetry,
+    approvalFriction,
     archivedSessions,
     maintenanceArchive,
     generatedImages,
@@ -11121,6 +11472,7 @@ export async function scanCodex(options = {}) {
     summarizeSessionMediaPressure(activeSessions),
     summarizeTaskClarity(activeSessions),
     summarizeTurnTelemetry(activeSessions),
+    summarizeApprovalFriction(activeSessions),
     summarizeDirectory(paths.archivedSessions, { label: "Archived Sessions", risk: "warn", largestLimit: 12 }),
     summarizeDirectory(paths.maintenanceArchive, {
       label: "Old Refit Backups",
@@ -11203,6 +11555,7 @@ export async function scanCodex(options = {}) {
     sessionMedia,
     taskClarity,
     turnTelemetry,
+    approvalFriction,
     activeStaleSessions: activeStale,
     archivedSessions,
     archivedSessionsInActiveTree: archivedStillInSessions,
@@ -11220,6 +11573,7 @@ export async function scanCodex(options = {}) {
   const largestSessionCandidates = [
     ...activeStale.largest.map((file) => ({ ...file, bucket: "Stale active sessions" })),
     ...archivedDeleteCandidates.largest.map((file) => ({ ...file, bucket: "Old archived conversations" })),
+    ...approvalFriction.largest.map((file) => ({ ...file, bucket: "Approval friction" })),
     ...turnTelemetry.largest.map((file) => ({ ...file, bucket: "Turn telemetry" })),
     ...taskClarity.largest.map((file) => ({ ...file, bucket: "Task clarity" })),
     ...sessionMedia.largest.map((file) => ({ ...file, bucket: "Session media" })),
@@ -11412,6 +11766,21 @@ function localScoreBreakdown(metrics) {
       detail: "Observed turn duration, first-token delay, rate-limit metadata, and near-context-window events from active transcript metadata.",
     },
     {
+      id: "approval-friction",
+      label: "Approval Stops",
+      points: Math.min(
+        7,
+        Number(metrics.approvalFrictionSandboxDenialCount || 0) * 1.4 +
+          Number(metrics.approvalFrictionPermissionRequestCount || 0) * 0.45 +
+          Number(metrics.approvalFrictionExecPolicyMarkerCount || 0) * 0.8 +
+          Number(metrics.approvalFrictionEscalationMarkerCount || 0) * 0.55 +
+          Number(metrics.approvalFrictionDeniedMarkerCount || 0) * 0.8 +
+          Number(metrics.approvalFrictionHighFrictionFileCount || 0) * 1.5,
+      ),
+      value: metrics.approvalFrictionLabel || `${Number(metrics.approvalFrictionMarkerCount || 0).toLocaleString()} stops`,
+      detail: "Sampled active-thread approval, permission, sandbox-denial, escalation, and execpolicy metadata markers.",
+    },
+    {
       id: "log-wal",
       label: "Log WAL",
       points: Math.min(18, gb(metrics.logWalBytes) * 12),
@@ -11507,6 +11876,10 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(5, Number(metrics.turnTelemetrySlowFirstTokenCount || 0) * 0.9 + Number(metrics.turnTelemetryVerySlowFirstTokenCount || 0) * 1.5);
   score -= Math.min(5, Number(metrics.turnTelemetryLowRateLimitCount || 0) * 1.4 + Number(metrics.turnTelemetryRateLimitReachedCount || 0) * 2);
   score -= Math.min(4, Number(metrics.turnTelemetryContextNearLimitCount || 0) * 0.6);
+  score -= Math.min(5, Number(metrics.approvalFrictionSandboxDenialCount || 0) * 1.2);
+  score -= Math.min(4, Number(metrics.approvalFrictionPermissionRequestCount || 0) * 0.3);
+  score -= Math.min(4, Number(metrics.approvalFrictionExecPolicyMarkerCount || 0) * 0.45);
+  score -= Math.min(3, Number(metrics.approvalFrictionHighFrictionFileCount || 0) * 1.2);
   if (metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffHasGithubRemote) score -= 3;
   if (metrics.cloudHandoffDetachedHead) score -= 3;
   if ((metrics.processCount >= 12 || metrics.backgroundProcessCount > 0) && metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffReady) score -= 2;
@@ -11663,6 +12036,19 @@ function benchmarkGuidance(metrics) {
   } else if (metrics.turnTelemetryContextNearLimitCount > 0) {
     guidance.push(
       `Use /compact sooner in long threads; ${Number(metrics.turnTelemetryContextNearLimitCount).toLocaleString()} sampled token-count event${metrics.turnTelemetryContextNearLimitCount === 1 ? " was" : "s were"} near the model context window.`,
+    );
+  }
+  if (metrics.approvalFrictionSandboxDenialCount > 0) {
+    guidance.push(
+      `Review approval and sandbox flow: Refit saw ${Number(metrics.approvalFrictionSandboxDenialCount).toLocaleString()} sandbox-denial marker${metrics.approvalFrictionSandboxDenialCount === 1 ? "" : "s"} in sampled active metadata.`,
+    );
+  } else if (metrics.approvalFrictionPermissionRequestCount >= 3) {
+    guidance.push(
+      `Review /permissions for frequent stops; Refit saw ${Number(metrics.approvalFrictionPermissionRequestCount).toLocaleString()} permission request marker${metrics.approvalFrictionPermissionRequestCount === 1 ? "" : "s"} in sampled active metadata.`,
+    );
+  } else if (metrics.approvalFrictionExecPolicyMarkerCount >= 3) {
+    guidance.push(
+      `Test command rules with codex execpolicy check; Refit saw ${Number(metrics.approvalFrictionExecPolicyMarkerCount).toLocaleString()} execpolicy marker${metrics.approvalFrictionExecPolicyMarkerCount === 1 ? "" : "s"} in sampled active metadata.`,
     );
   }
   if (metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffHasGithubRemote) {
@@ -12005,8 +12391,9 @@ function scoreMetricsFromScan(scan) {
   const appServerTransport = scan?.processes?.appServerTransport || emptyAppServerTransportSummary();
   const remoteHosts = scan?.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const shellStartup = scan?.codexConfig?.shellStartup || emptyShellStartupSummary();
+  const approvalFriction = categories.approvalFriction || emptyApprovalFrictionSummary(categories.activeSessions || {});
   return {
-    scoreModel: "local-state-v22",
+    scoreModel: "local-state-v23",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -12031,6 +12418,22 @@ function scoreMetricsFromScan(scan) {
     turnTelemetryLowRateLimitCount: categories.turnTelemetry?.lowRateLimitCount || 0,
     turnTelemetryRateLimitReachedCount: categories.turnTelemetry?.rateLimitReachedCount || 0,
     turnTelemetryContextNearLimitCount: categories.turnTelemetry?.contextNearLimitCount || 0,
+    approvalFrictionTone: approvalFriction.tone || "low",
+    approvalFrictionLabel: approvalFriction.label || "No stops",
+    approvalFrictionScannedFileCount: approvalFriction.scannedFileCount || 0,
+    approvalFrictionFileCount: approvalFriction.fileCount || 0,
+    approvalFrictionSampledBytes: approvalFriction.sampledBytes || 0,
+    approvalFrictionMarkerCount: approvalFriction.markerCount || 0,
+    approvalFrictionApprovalMarkerCount: approvalFriction.approvalMarkerCount || 0,
+    approvalFrictionPermissionRequestCount: approvalFriction.permissionRequestCount || 0,
+    approvalFrictionSandboxDenialCount: approvalFriction.sandboxDenialCount || 0,
+    approvalFrictionExecPolicyMarkerCount: approvalFriction.execPolicyMarkerCount || 0,
+    approvalFrictionEscalationMarkerCount: approvalFriction.escalationMarkerCount || 0,
+    approvalFrictionDeniedMarkerCount: approvalFriction.deniedMarkerCount || 0,
+    approvalFrictionNetworkSandboxMarkerCount: approvalFriction.networkSandboxMarkerCount || 0,
+    approvalFrictionHighFrictionFileCount: approvalFriction.highFrictionFileCount || 0,
+    approvalFrictionCappedFileCount: approvalFriction.cappedFileCount || 0,
+    approvalFrictionUnparsedFileCount: approvalFriction.unparsedFileCount || 0,
     codexWorktreeBytes: categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
@@ -12854,6 +13257,20 @@ function benchmarkDeltas(current, previous) {
     "turnTelemetryMaxContextUsedPct",
     "turnTelemetryContextNearLimitCount",
     "turnTelemetryUnparsedFileCount",
+    "approvalFrictionScannedFileCount",
+    "approvalFrictionFileCount",
+    "approvalFrictionSampledBytes",
+    "approvalFrictionMarkerCount",
+    "approvalFrictionApprovalMarkerCount",
+    "approvalFrictionPermissionRequestCount",
+    "approvalFrictionSandboxDenialCount",
+    "approvalFrictionExecPolicyMarkerCount",
+    "approvalFrictionEscalationMarkerCount",
+    "approvalFrictionDeniedMarkerCount",
+    "approvalFrictionNetworkSandboxMarkerCount",
+    "approvalFrictionHighFrictionFileCount",
+    "approvalFrictionCappedFileCount",
+    "approvalFrictionUnparsedFileCount",
     "cloudHandoffReady",
     "cloudHandoffHasGithubRemote",
     "cloudHandoffDirtyCount",
@@ -13113,6 +13530,23 @@ function summarizeBenchmarkEntry(entry) {
     turnTelemetryContextNearLimitCount: entry.metrics.turnTelemetryContextNearLimitCount || 0,
     turnTelemetryCappedFileCount: entry.metrics.turnTelemetryCappedFileCount || 0,
     turnTelemetryUnparsedFileCount: entry.metrics.turnTelemetryUnparsedFileCount || 0,
+    approvalFrictionTone: entry.metrics.approvalFrictionTone || "low",
+    approvalFrictionLabel: entry.metrics.approvalFrictionLabel || "No stops",
+    approvalFrictionScannedFileCount: entry.metrics.approvalFrictionScannedFileCount || 0,
+    approvalFrictionFileCount: entry.metrics.approvalFrictionFileCount || 0,
+    approvalFrictionSampledBytes: entry.metrics.approvalFrictionSampledBytes || 0,
+    approvalFrictionParsedLineCount: entry.metrics.approvalFrictionParsedLineCount || 0,
+    approvalFrictionMarkerCount: entry.metrics.approvalFrictionMarkerCount || 0,
+    approvalFrictionApprovalMarkerCount: entry.metrics.approvalFrictionApprovalMarkerCount || 0,
+    approvalFrictionPermissionRequestCount: entry.metrics.approvalFrictionPermissionRequestCount || 0,
+    approvalFrictionSandboxDenialCount: entry.metrics.approvalFrictionSandboxDenialCount || 0,
+    approvalFrictionExecPolicyMarkerCount: entry.metrics.approvalFrictionExecPolicyMarkerCount || 0,
+    approvalFrictionEscalationMarkerCount: entry.metrics.approvalFrictionEscalationMarkerCount || 0,
+    approvalFrictionDeniedMarkerCount: entry.metrics.approvalFrictionDeniedMarkerCount || 0,
+    approvalFrictionNetworkSandboxMarkerCount: entry.metrics.approvalFrictionNetworkSandboxMarkerCount || 0,
+    approvalFrictionHighFrictionFileCount: entry.metrics.approvalFrictionHighFrictionFileCount || 0,
+    approvalFrictionCappedFileCount: entry.metrics.approvalFrictionCappedFileCount || 0,
+    approvalFrictionUnparsedFileCount: entry.metrics.approvalFrictionUnparsedFileCount || 0,
     cloudHandoffTone: entry.metrics.cloudHandoffTone || "low",
     cloudHandoffReady: Boolean(entry.metrics.cloudHandoffReady),
     cloudHandoffProjectReady: Boolean(entry.metrics.cloudHandoffProjectReady),
@@ -13515,6 +13949,14 @@ export async function benchmarkHistory(limit = 12) {
         turnTelemetryMaxContextTokens: latest.turnTelemetryMaxContextTokens - oldest.turnTelemetryMaxContextTokens,
         turnTelemetryMaxContextUsedPct: latest.turnTelemetryMaxContextUsedPct - oldest.turnTelemetryMaxContextUsedPct,
         turnTelemetryContextNearLimitCount: latest.turnTelemetryContextNearLimitCount - oldest.turnTelemetryContextNearLimitCount,
+        approvalFrictionMarkerCount: latest.approvalFrictionMarkerCount - oldest.approvalFrictionMarkerCount,
+        approvalFrictionPermissionRequestCount:
+          latest.approvalFrictionPermissionRequestCount - oldest.approvalFrictionPermissionRequestCount,
+        approvalFrictionSandboxDenialCount: latest.approvalFrictionSandboxDenialCount - oldest.approvalFrictionSandboxDenialCount,
+        approvalFrictionExecPolicyMarkerCount:
+          latest.approvalFrictionExecPolicyMarkerCount - oldest.approvalFrictionExecPolicyMarkerCount,
+        approvalFrictionHighFrictionFileCount:
+          latest.approvalFrictionHighFrictionFileCount - oldest.approvalFrictionHighFrictionFileCount,
         cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(oldest.cloudHandoffReady),
         cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(oldest.cloudHandoffHasGithubRemote),
         cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - oldest.cloudHandoffDirtyCount,
@@ -13711,6 +14153,14 @@ export async function benchmarkHistory(limit = 12) {
         turnTelemetryMaxContextTokens: latest.turnTelemetryMaxContextTokens - previous.turnTelemetryMaxContextTokens,
         turnTelemetryMaxContextUsedPct: latest.turnTelemetryMaxContextUsedPct - previous.turnTelemetryMaxContextUsedPct,
         turnTelemetryContextNearLimitCount: latest.turnTelemetryContextNearLimitCount - previous.turnTelemetryContextNearLimitCount,
+        approvalFrictionMarkerCount: latest.approvalFrictionMarkerCount - previous.approvalFrictionMarkerCount,
+        approvalFrictionPermissionRequestCount:
+          latest.approvalFrictionPermissionRequestCount - previous.approvalFrictionPermissionRequestCount,
+        approvalFrictionSandboxDenialCount: latest.approvalFrictionSandboxDenialCount - previous.approvalFrictionSandboxDenialCount,
+        approvalFrictionExecPolicyMarkerCount:
+          latest.approvalFrictionExecPolicyMarkerCount - previous.approvalFrictionExecPolicyMarkerCount,
+        approvalFrictionHighFrictionFileCount:
+          latest.approvalFrictionHighFrictionFileCount - previous.approvalFrictionHighFrictionFileCount,
         cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(previous.cloudHandoffReady),
         cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(previous.cloudHandoffHasGithubRemote),
         cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - previous.cloudHandoffDirtyCount,
@@ -13922,6 +14372,7 @@ export async function runBenchmark() {
   const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
   const turnTelemetry = scan.categories?.turnTelemetry || emptyTurnTelemetrySummary(scan.categories?.activeSessions || {});
+  const approvalFriction = scan.categories?.approvalFriction || emptyApprovalFrictionSummary(scan.categories?.activeSessions || {});
   const cloudHandoff = scan.codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const remoteHosts = scan.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const shellStartup = scan.codexConfig?.shellStartup || emptyShellStartupSummary();
@@ -13938,7 +14389,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v22",
+    scoreModel: "local-state-v23",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -14018,6 +14469,23 @@ export async function runBenchmark() {
     turnTelemetryContextNearLimitCount: turnTelemetry.contextNearLimitCount || 0,
     turnTelemetryCappedFileCount: turnTelemetry.cappedFileCount || 0,
     turnTelemetryUnparsedFileCount: turnTelemetry.unparsedFileCount || 0,
+    approvalFrictionTone: approvalFriction.tone || "low",
+    approvalFrictionLabel: approvalFriction.label || "No stops",
+    approvalFrictionScannedFileCount: approvalFriction.scannedFileCount || 0,
+    approvalFrictionFileCount: approvalFriction.fileCount || 0,
+    approvalFrictionSampledBytes: approvalFriction.sampledBytes || 0,
+    approvalFrictionParsedLineCount: approvalFriction.parsedLineCount || 0,
+    approvalFrictionMarkerCount: approvalFriction.markerCount || 0,
+    approvalFrictionApprovalMarkerCount: approvalFriction.approvalMarkerCount || 0,
+    approvalFrictionPermissionRequestCount: approvalFriction.permissionRequestCount || 0,
+    approvalFrictionSandboxDenialCount: approvalFriction.sandboxDenialCount || 0,
+    approvalFrictionExecPolicyMarkerCount: approvalFriction.execPolicyMarkerCount || 0,
+    approvalFrictionEscalationMarkerCount: approvalFriction.escalationMarkerCount || 0,
+    approvalFrictionDeniedMarkerCount: approvalFriction.deniedMarkerCount || 0,
+    approvalFrictionNetworkSandboxMarkerCount: approvalFriction.networkSandboxMarkerCount || 0,
+    approvalFrictionHighFrictionFileCount: approvalFriction.highFrictionFileCount || 0,
+    approvalFrictionCappedFileCount: approvalFriction.cappedFileCount || 0,
+    approvalFrictionUnparsedFileCount: approvalFriction.unparsedFileCount || 0,
     cloudHandoffTone: cloudHandoff.tone || "low",
     cloudHandoffReady: Boolean(cloudHandoff.cloudReady),
     cloudHandoffProjectReady: Boolean(cloudHandoff.projectReady),
