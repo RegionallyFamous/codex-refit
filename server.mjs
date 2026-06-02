@@ -50,6 +50,9 @@ const largeHistoryFileBytes = 20 * 1024 * 1024;
 const hugeHistoryFileBytes = 100 * 1024 * 1024;
 const largeTuiLogBytes = 50 * 1024 * 1024;
 const hugeTuiLogBytes = 500 * 1024 * 1024;
+const shellStartupMediumMs = 350;
+const shellStartupHighMs = 900;
+const shellStartupTimeoutMs = 2500;
 const builtInAgentNames = new Set(["default", "worker", "explorer"]);
 
 const paths = {
@@ -2102,6 +2105,148 @@ function buildShellEnvironmentSummary(values = {}) {
     tightPolicy,
     pathAvailable,
     homeAvailable,
+  };
+}
+
+function emptyShellStartupSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "Not measured",
+    action: "Run Speed Check",
+    detail: "Shell startup latency has not been measured yet.",
+    shellPath: null,
+    shellName: null,
+    sampleCount: 0,
+    okCount: 0,
+    failedCount: 0,
+    timeoutCount: 0,
+    minMs: 0,
+    medianMs: 0,
+    meanMs: 0,
+    maxMs: 0,
+    timeoutMs: shellStartupTimeoutMs,
+  };
+}
+
+async function resolveShellStartupPath() {
+  const candidates = [
+    process.env.CODEX_REFIT_SHELL_PATH,
+    process.env.SHELL,
+    "/bin/zsh",
+    "/bin/bash",
+    "/bin/sh",
+  ]
+    .filter(Boolean)
+    .map((candidate) => path.resolve(String(candidate)))
+    .filter((candidate, index, all) => all.indexOf(candidate) === index);
+
+  for (const candidate of candidates) {
+    const stats = await statOrNull(candidate);
+    if (stats?.isFile()) return candidate;
+  }
+
+  return null;
+}
+
+async function measureShellStartupOnce(shellPath, timeoutMs = shellStartupTimeoutMs) {
+  const start = performance.now();
+  try {
+    await execFileAsync(shellPath, ["-lc", ":"], {
+      timeout: timeoutMs,
+      maxBuffer: 1024,
+      env: {
+        ...process.env,
+        CODEX_REFIT_SHELL_STARTUP_CHECK: "1",
+      },
+    });
+    return {
+      ok: true,
+      ms: Math.round(performance.now() - start),
+      timeout: false,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      ms: Math.round(performance.now() - start),
+      timeout: error?.killed || error?.code === "ETIMEDOUT" || error?.signal === "SIGTERM",
+      error: error?.code || error?.message || "failed",
+    };
+  }
+}
+
+function medianNumber(values) {
+  const sorted = values.map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : Math.round((sorted[middle - 1] + sorted[middle]) / 2);
+}
+
+async function getShellStartupSummary({ samples = 1, timeoutMs = shellStartupTimeoutMs } = {}) {
+  const summary = emptyShellStartupSummary();
+  const shellPath = await resolveShellStartupPath();
+  if (!shellPath) {
+    return {
+      ...summary,
+      tone: "medium",
+      label: "No shell",
+      action: "Check SHELL",
+      detail: "Refit could not find a usable shell path from SHELL or the standard macOS shell locations.",
+    };
+  }
+
+  const sampleCount = Math.max(1, Math.min(5, Number(samples) || 1));
+  const results = [];
+  for (let index = 0; index < sampleCount; index += 1) {
+    results.push(await measureShellStartupOnce(shellPath, timeoutMs));
+  }
+
+  const okResults = results.filter((result) => result.ok);
+  const timings = okResults.map((result) => result.ms);
+  const failedCount = results.length - okResults.length;
+  const timeoutCount = results.filter((result) => result.timeout).length;
+  const minMs = timings.length ? Math.min(...timings) : 0;
+  const maxMs = timings.length ? Math.max(...timings) : Math.max(0, ...results.map((result) => result.ms));
+  const medianMs = medianNumber(timings);
+  const meanMs = timings.length ? Math.round(timings.reduce((total, value) => total + value, 0) / timings.length) : 0;
+  const highLoad = failedCount > 0 || timeoutCount > 0 || medianMs >= shellStartupHighMs || maxMs >= shellStartupTimeoutMs * 0.8;
+  const mediumLoad = highLoad || medianMs >= shellStartupMediumMs || maxMs >= shellStartupHighMs;
+  const shellName = path.basename(shellPath);
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = okResults.length ? `${medianMs.toLocaleString()} ms` : timeoutCount ? "Timed out" : "Failed";
+  const action = tone === "high" ? "Fix shell init" : tone === "medium" ? "Review shell init" : "Keep light";
+
+  return {
+    ...summary,
+    tone,
+    label,
+    action,
+    detail: [
+      `Refit timed ${shellName} -lc ':' ${sampleCount.toLocaleString()} time${sampleCount === 1 ? "" : "s"} and kept only timing metadata.`,
+      okResults.length
+        ? `Median startup was ${medianMs.toLocaleString()} ms; fastest was ${minMs.toLocaleString()} ms and slowest was ${maxMs.toLocaleString()} ms.`
+        : "No sample completed successfully.",
+      failedCount ? `${failedCount.toLocaleString()} sample${failedCount === 1 ? "" : "s"} failed or timed out.` : null,
+      tone === "high"
+        ? "Slow shell initialization can make every Codex command feel sluggish. Move heavyweight version-manager, network, or prompt setup out of non-interactive shell startup paths."
+        : tone === "medium"
+          ? "Shell startup is measurable enough to review if Codex command execution feels slow."
+          : "Shell startup looks light for repeated Codex commands.",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    shellPath,
+    shellName,
+    sampleCount,
+    okCount: okResults.length,
+    failedCount,
+    timeoutCount,
+    minMs,
+    medianMs,
+    meanMs,
+    maxMs,
+    timeoutMs,
   };
 }
 
@@ -7668,6 +7813,7 @@ async function getCodexConfigSummary() {
     fastModeFeature: true,
     shellSnapshot: true,
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
+    shellStartup: emptyShellStartupSummary(),
     notificationFlow: buildNotificationFlowSummary({}),
     telemetry: buildTelemetrySummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
@@ -7768,6 +7914,7 @@ async function getCodexConfigSummary() {
     summary.networkSandbox = buildNetworkSandboxSummary({}, []);
     summary.notificationFlow = buildNotificationFlowSummary({});
     summary.telemetry = buildTelemetrySummary({});
+    summary.shellStartup = await getShellStartupSummary();
     summary.historyRetention = buildHistoryRetentionSummary({}, historyMeta);
     summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
@@ -7810,6 +7957,7 @@ async function getCodexConfigSummary() {
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.shellEnvironmentSummary = buildShellEnvironmentSummary(values);
+    summary.shellStartup = await getShellStartupSummary();
     summary.notificationFlow = buildNotificationFlowSummary(values);
     summary.telemetry = buildTelemetrySummary(values);
     summary.contextBudgetSummary = buildContextBudgetSummary(values);
@@ -7913,6 +8061,7 @@ async function getCodexConfigSummary() {
     summary.managedConfig = await getManagedConfigSummary({ userValues: mcpValues, userSections: mcpSections });
   } catch (error) {
     summary.error = error.message;
+    summary.shellStartup = await getShellStartupSummary();
     summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.automation = await getAutomationSummary(null);
     summary.remoteHosts = await getRemoteHostSummary();
@@ -8026,6 +8175,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const webSearchLegacyKeys = codexConfig?.webSearchLegacyKeys || [];
   const webSearchLegacyKeyCount = Number(codexConfig?.webSearchLegacyKeyCount || webSearchLegacyKeys.length || 0);
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
+  const shellStartup = codexConfig?.shellStartup || emptyShellStartupSummary();
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const telemetry = codexConfig?.telemetry || buildTelemetrySummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
@@ -8662,6 +8812,31 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (shellStartup.status === "ready" && shellStartup.tone !== "low") {
+    addFix({
+      id: "shell-startup-latency",
+      label: "Shell Startup",
+      value: shellStartup.label,
+      tone: shellStartup.tone === "high" ? "high" : "medium",
+      action: shellStartup.action,
+      detail:
+        "Codex runs lots of small shell commands. Slow non-interactive shell startup can make the app feel slow even when local state is clean.",
+      snippet: [
+        "# Read-only no-op timing check:",
+        `time ${shellQuote(shellStartup.shellPath || process.env.SHELL || "/bin/zsh")} -lc ':'`,
+        "",
+        "# Keep non-interactive startup paths light:",
+        "# - Avoid network calls in .zshrc/.zprofile/.bashrc.",
+        "# - Lazy-load version managers and prompt frameworks.",
+        "# - Keep PATH setup simple for non-interactive shells.",
+        "",
+        "# Codex config:",
+        "[features]",
+        "shell_snapshot = true",
+      ].join("\n"),
+    });
+  }
+
   if (contextBudgetSummary.status === "ready" && contextBudgetSummary.tone !== "low") {
     addFix({
       id: "context-budget",
@@ -9128,6 +9303,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
+  const shellStartup = codexConfig?.shellStartup || emptyShellStartupSummary();
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const telemetry = codexConfig?.telemetry || buildTelemetrySummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
@@ -9433,6 +9609,22 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: shellSnapshot
         ? "Codex can snapshot the shell environment to speed up repeated commands."
         : "Set features.shell_snapshot = true so repeated command setup can be faster.",
+    },
+    {
+      id: "shell-startup",
+      label: "Shell Startup",
+      value: shellStartup.label,
+      tone: shellStartup.tone,
+      action: shellStartup.action,
+      priority:
+        shellStartup.tone === "high"
+          ? 90
+          : shellStartup.tone === "medium"
+            ? 68
+            : shellStartup.sampleCount
+              ? 26
+              : 14,
+      detail: shellStartup.detail,
     },
     {
       id: "shell-environment",
@@ -10036,6 +10228,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (shellStartup.status === "ready" && shellStartup.tone !== "low") {
+    addRecommendation({
+      id: "shell-startup-latency",
+      label: "Shell Startup",
+      value: shellStartup.label,
+      action: shellStartup.action,
+      tone: shellStartup.tone === "high" ? "high" : "medium",
+      priority: shellStartup.tone === "high" ? 86 : 62,
+      detail:
+        shellStartup.tone === "high"
+          ? `${shellStartup.detail} Fix shell startup before judging database cleanup results.`
+          : shellStartup.detail,
+    });
+  }
+
   if (activeReliefBytes > 1024 ** 3) {
     addRecommendation({
       id: "run-smart-optimize",
@@ -10608,6 +10815,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     fastModeFeature,
     shellSnapshot,
     shellEnvironmentSummary,
+    shellStartup,
     notificationFlow,
     telemetry,
     contextBudgetSummary,
@@ -11152,6 +11360,19 @@ function localScoreBreakdown(metrics) {
       detail: "SSH host readiness for Codex remote project offload.",
     },
     {
+      id: "shell-startup",
+      label: "Shell Startup",
+      points: Math.min(
+        6,
+        Math.max(0, Number(metrics.shellStartupMedianMs || 0) - 250) / 180 +
+          Math.max(0, Number(metrics.shellStartupMaxMs || 0) - shellStartupHighMs) / 450 +
+          Number(metrics.shellStartupFailedCount || 0) * 2 +
+          Number(metrics.shellStartupTimeoutCount || 0) * 3,
+      ),
+      value: metrics.shellStartupLabel || "Not measured",
+      detail: "No-op non-interactive shell startup timing for repeated Codex command execution.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -11348,6 +11569,12 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(2, Number(metrics.appServerWebsocketCount || 0) * 0.5);
   score -= Math.min(4, Number(metrics.remoteHostMissingIdentityFileCount || 0) * 2);
   if ((metrics.processCount >= 12 || metrics.backgroundProcessCount > 0) && !metrics.remoteHostConcreteCount) score -= 2;
+  score -= Math.min(
+    6,
+    Math.max(0, Number(metrics.shellStartupMedianMs || 0) - shellStartupMediumMs) / 140 +
+      Number(metrics.shellStartupFailedCount || 0) * 2 +
+      Number(metrics.shellStartupTimeoutCount || 0) * 3,
+  );
   if (metrics.historyInvalidConfig) score -= 2;
   if (metrics.historyFileHuge) score -= 4;
   else if (metrics.historyFileLarge) score -= 2;
@@ -11482,6 +11709,17 @@ function benchmarkGuidance(metrics) {
     guidance.push("Keep app-server WebSocket listeners loopback-only or authenticated; the manual calls WebSocket transport experimental and unsupported.");
   } else if (metrics.appServerTransportCount >= 6) {
     guidance.push("Close stale rich clients or integrations; many live app-server processes can make local Codex load harder to reason about.");
+  }
+  if (metrics.shellStartupTimeoutCount > 0 || metrics.shellStartupFailedCount > 0) {
+    guidance.push("Fix shell startup failures before judging Codex speed; Refit could not complete a no-op shell timing sample reliably.");
+  } else if (metrics.shellStartupMedianMs >= shellStartupHighMs) {
+    guidance.push(
+      `Fix slow shell startup: a no-op ${metrics.shellStartupShellName || "shell"} command took about ${Number(metrics.shellStartupMedianMs).toLocaleString()} ms before Codex could run anything useful.`,
+    );
+  } else if (metrics.shellStartupMedianMs >= shellStartupMediumMs) {
+    guidance.push(
+      `Review shell startup files; no-op command startup is ${Number(metrics.shellStartupMedianMs).toLocaleString()} ms, which can add up across many Codex tool calls.`,
+    );
   }
   if (metrics.modelXHighEffort && !metrics.hasFastTaskProfile) {
     guidance.push("Your default reasoning is xhigh/extra-high and no speed profile is recorded. Add a gpt-5.4-mini + low profile for small local tasks.");
@@ -11766,8 +12004,9 @@ function scoreMetricsFromScan(scan) {
   const automation = scan?.codexConfig?.automation || emptyAutomationSummary();
   const appServerTransport = scan?.processes?.appServerTransport || emptyAppServerTransportSummary();
   const remoteHosts = scan?.codexConfig?.remoteHosts || emptyRemoteHostSummary();
+  const shellStartup = scan?.codexConfig?.shellStartup || emptyShellStartupSummary();
   return {
-    scoreModel: "local-state-v21",
+    scoreModel: "local-state-v22",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -11873,6 +12112,17 @@ function scoreMetricsFromScan(scan) {
     remoteHostMissingUserCount: remoteHosts.missingUserCount || 0,
     remoteHostProxyCount: remoteHosts.proxyCount || 0,
     remoteHostCandidateCount: remoteHosts.candidateCount || 0,
+    shellStartupTone: shellStartup.tone || "low",
+    shellStartupLabel: shellStartup.label || "Not measured",
+    shellStartupShellName: shellStartup.shellName || null,
+    shellStartupSampleCount: shellStartup.sampleCount || 0,
+    shellStartupOkCount: shellStartup.okCount || 0,
+    shellStartupFailedCount: shellStartup.failedCount || 0,
+    shellStartupTimeoutCount: shellStartup.timeoutCount || 0,
+    shellStartupMinMs: shellStartup.minMs || 0,
+    shellStartupMedianMs: shellStartup.medianMs || 0,
+    shellStartupMeanMs: shellStartup.meanMs || 0,
+    shellStartupMaxMs: shellStartup.maxMs || 0,
   };
 }
 
@@ -12623,6 +12873,14 @@ function benchmarkDeltas(current, previous) {
     "remoteHostMissingUserCount",
     "remoteHostProxyCount",
     "remoteHostCandidateCount",
+    "shellStartupSampleCount",
+    "shellStartupOkCount",
+    "shellStartupFailedCount",
+    "shellStartupTimeoutCount",
+    "shellStartupMinMs",
+    "shellStartupMedianMs",
+    "shellStartupMeanMs",
+    "shellStartupMaxMs",
     "hasFastTaskProfile",
     "fastTaskProfileCount",
     "hasMiniProfile",
@@ -12884,6 +13142,17 @@ function summarizeBenchmarkEntry(entry) {
     remoteHostMissingUserCount: entry.metrics.remoteHostMissingUserCount || 0,
     remoteHostProxyCount: entry.metrics.remoteHostProxyCount || 0,
     remoteHostCandidateCount: entry.metrics.remoteHostCandidateCount || 0,
+    shellStartupTone: entry.metrics.shellStartupTone || "low",
+    shellStartupLabel: entry.metrics.shellStartupLabel || "Not measured",
+    shellStartupShellName: entry.metrics.shellStartupShellName || null,
+    shellStartupSampleCount: entry.metrics.shellStartupSampleCount || 0,
+    shellStartupOkCount: entry.metrics.shellStartupOkCount || 0,
+    shellStartupFailedCount: entry.metrics.shellStartupFailedCount || 0,
+    shellStartupTimeoutCount: entry.metrics.shellStartupTimeoutCount || 0,
+    shellStartupMinMs: entry.metrics.shellStartupMinMs || 0,
+    shellStartupMedianMs: entry.metrics.shellStartupMedianMs || 0,
+    shellStartupMeanMs: entry.metrics.shellStartupMeanMs || 0,
+    shellStartupMaxMs: entry.metrics.shellStartupMaxMs || 0,
     codexWorktreeBytes: entry.metrics.codexWorktreeBytes || 0,
     codexWorktreeCount: entry.metrics.codexWorktreeCount || 0,
     codexWorktreeLargeCount: entry.metrics.codexWorktreeLargeCount || 0,
@@ -13259,6 +13528,10 @@ export async function benchmarkHistory(limit = 12) {
         remoteHostMissingHostNameCount: latest.remoteHostMissingHostNameCount - oldest.remoteHostMissingHostNameCount,
         remoteHostMissingUserCount: latest.remoteHostMissingUserCount - oldest.remoteHostMissingUserCount,
         remoteHostCandidateCount: latest.remoteHostCandidateCount - oldest.remoteHostCandidateCount,
+        shellStartupFailedCount: latest.shellStartupFailedCount - oldest.shellStartupFailedCount,
+        shellStartupTimeoutCount: latest.shellStartupTimeoutCount - oldest.shellStartupTimeoutCount,
+        shellStartupMedianMs: latest.shellStartupMedianMs - oldest.shellStartupMedianMs,
+        shellStartupMaxMs: latest.shellStartupMaxMs - oldest.shellStartupMaxMs,
         codexWorktreeBytes: latest.codexWorktreeBytes - oldest.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - oldest.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - oldest.codexWorktreeLargeCount,
@@ -13451,6 +13724,10 @@ export async function benchmarkHistory(limit = 12) {
         remoteHostMissingHostNameCount: latest.remoteHostMissingHostNameCount - previous.remoteHostMissingHostNameCount,
         remoteHostMissingUserCount: latest.remoteHostMissingUserCount - previous.remoteHostMissingUserCount,
         remoteHostCandidateCount: latest.remoteHostCandidateCount - previous.remoteHostCandidateCount,
+        shellStartupFailedCount: latest.shellStartupFailedCount - previous.shellStartupFailedCount,
+        shellStartupTimeoutCount: latest.shellStartupTimeoutCount - previous.shellStartupTimeoutCount,
+        shellStartupMedianMs: latest.shellStartupMedianMs - previous.shellStartupMedianMs,
+        shellStartupMaxMs: latest.shellStartupMaxMs - previous.shellStartupMaxMs,
         codexWorktreeBytes: latest.codexWorktreeBytes - previous.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - previous.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - previous.codexWorktreeLargeCount,
@@ -13647,6 +13924,7 @@ export async function runBenchmark() {
   const turnTelemetry = scan.categories?.turnTelemetry || emptyTurnTelemetrySummary(scan.categories?.activeSessions || {});
   const cloudHandoff = scan.codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const remoteHosts = scan.codexConfig?.remoteHosts || emptyRemoteHostSummary();
+  const shellStartup = scan.codexConfig?.shellStartup || emptyShellStartupSummary();
   const appServerTransport = scan.processes?.appServerTransport || emptyAppServerTransportSummary();
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
@@ -13660,7 +13938,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v21",
+    scoreModel: "local-state-v22",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -13769,6 +14047,17 @@ export async function runBenchmark() {
     remoteHostMissingUserCount: remoteHosts.missingUserCount || 0,
     remoteHostProxyCount: remoteHosts.proxyCount || 0,
     remoteHostCandidateCount: remoteHosts.candidateCount || 0,
+    shellStartupTone: shellStartup.tone || "low",
+    shellStartupLabel: shellStartup.label || "Not measured",
+    shellStartupShellName: shellStartup.shellName || null,
+    shellStartupSampleCount: shellStartup.sampleCount || 0,
+    shellStartupOkCount: shellStartup.okCount || 0,
+    shellStartupFailedCount: shellStartup.failedCount || 0,
+    shellStartupTimeoutCount: shellStartup.timeoutCount || 0,
+    shellStartupMinMs: shellStartup.minMs || 0,
+    shellStartupMedianMs: shellStartup.medianMs || 0,
+    shellStartupMeanMs: shellStartup.meanMs || 0,
+    shellStartupMaxMs: shellStartup.maxMs || 0,
     codexWorktreeBytes: scan.categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: scan.categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: scan.categories.codexWorktrees?.largeWorktreeCount || 0,
