@@ -115,6 +115,56 @@ function configNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function normalizeConfigKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_");
+}
+
+function buildApprovalFlowSummary(values = {}) {
+  const approvalPolicy = values.approval_policy ?? null;
+  const approvalReviewer = values.approvals_reviewer || "user";
+  const policyText = String(approvalPolicy || "default");
+  const normalizedPolicy = normalizeConfigKey(policyText);
+  const normalizedReviewer = normalizeConfigKey(approvalReviewer);
+  const granularPolicy = /\bgranular\b/i.test(policyText);
+  const neverPolicy = normalizedPolicy === "never";
+  const interactiveApprovals = !neverPolicy;
+  const autoReviewApplies = interactiveApprovals && normalizedReviewer === "auto_review";
+  const label = autoReviewApplies
+    ? "Auto review"
+    : neverPolicy
+      ? "No prompts"
+      : granularPolicy
+        ? "Granular"
+        : approvalPolicy || "Default";
+  const tone = autoReviewApplies || interactiveApprovals ? "medium" : "low";
+  const action = autoReviewApplies ? "Check latency" : neverPolicy ? "Fast, high-trust" : "Review prompts";
+  const priority = autoReviewApplies ? 82 : neverPolicy ? 30 : granularPolicy ? 66 : 72;
+  const detail = autoReviewApplies
+    ? "Automatic approval review can reduce manual interruptions, but the Codex manual says it uses extra model calls for eligible interactive approval requests."
+    : neverPolicy
+      ? "Approval prompts are not expected from Codex itself. Use this only for trusted work because it reduces safety stops."
+      : granularPolicy
+        ? "Granular approval policy can keep some prompt categories interactive while rejecting others automatically. Tune it for trust and speed together."
+        : "Approval prompts can interrupt fast runs. Use /permissions or config only when the trust/safety tradeoff is right.";
+
+  return {
+    approvalPolicy,
+    approvalReviewer,
+    granularPolicy,
+    neverPolicy,
+    interactiveApprovals,
+    autoReviewApplies,
+    label,
+    tone,
+    action,
+    priority,
+    detail,
+  };
+}
+
 function parseTomlScalar(value) {
   const trimmed = String(value || "").trim();
   if (/^true$/i.test(trimmed)) return true;
@@ -1854,6 +1904,8 @@ async function getCodexConfigSummary() {
     model: null,
     reasoningEffort: null,
     approvalPolicy: null,
+    approvalReviewer: "user",
+    approvalFlow: buildApprovalFlowSummary({}),
     sandboxMode: null,
     serviceTier: null,
     desktopServiceTier: null,
@@ -1947,6 +1999,8 @@ async function getCodexConfigSummary() {
     summary.model = values.model || null;
     summary.reasoningEffort = values.model_reasoning_effort || values.reasoning_effort || null;
     summary.approvalPolicy = values.approval_policy || null;
+    summary.approvalReviewer = values.approvals_reviewer || "user";
+    summary.approvalFlow = buildApprovalFlowSummary(values);
     summary.sandboxMode = values.sandbox_mode || null;
     summary.serviceTier = values.service_tier || null;
     summary.desktopServiceTier = values["desktop.default-service-tier"] || null;
@@ -2090,6 +2144,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
   const authCache = codexConfig?.authCache || {};
+  const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const processSummary = context.processSummary || {};
   const backgroundSummary = processSummary.background || {};
   const hookSummary = codexConfig?.hookSummary || {};
@@ -2156,6 +2211,26 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "# If you intentionally need a temporary local speed run with hooks disabled, edit ~/.codex/config.toml:",
         "# [features]",
         "# hooks = false",
+      ].join("\n"),
+    });
+  }
+
+  if (approvalFlow.autoReviewApplies) {
+    addFix({
+      id: "approval-review-flow",
+      label: "Approval Review",
+      value: "Auto review",
+      tone: "medium",
+      action: "Review approval flow",
+      detail:
+        "Automatic approval review can save manual clicks, but it uses extra model calls for eligible interactive approvals. If latency matters more than auto-review, route approvals back to you.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# Faster interactive approvals: route eligible prompts to you instead of auto-review.",
+        'approvals_reviewer = "user"',
+        "",
+        "# For a trusted, scoped speed run only, you can also choose fewer approval prompts:",
+        '# approval_policy = "never"',
       ].join("\n"),
     });
   }
@@ -2430,6 +2505,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const projectReadyCount = Number(projectReadiness.readyCount || 0);
   const projectGapCount = Number(projectReadiness.missingGuidanceCount || 0) + Number(projectReadiness.missingCodexDirCount || 0);
   const authCache = codexConfig?.authCache || {};
+  const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const globalGuidanceReady = Boolean(codexConfig?.globalAgentsExists);
   const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
@@ -2604,14 +2680,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     {
       id: "permission-flow",
       label: "Permission Flow",
-      value: codexConfig?.approvalPolicy || "Default",
-      tone: codexConfig?.approvalPolicy === "never" ? "low" : "medium",
-      action: codexConfig?.approvalPolicy === "never" ? "Fast, high-trust" : "Review prompts",
-      priority: codexConfig?.approvalPolicy === "never" ? 30 : 72,
-      detail:
-        codexConfig?.approvalPolicy === "never"
-          ? "Approval prompts are not expected from Codex itself. Use this only for trusted work because it reduces safety stops."
-          : "Approval prompts can interrupt fast runs. Use /permissions or config only when the trust/safety tradeoff is right.",
+      value: approvalFlow.label || codexConfig?.approvalPolicy || "Default",
+      tone: approvalFlow.tone || "medium",
+      action: approvalFlow.action || "Review prompts",
+      priority: approvalFlow.priority || 72,
+      detail: approvalFlow.detail || "Approval prompts can interrupt fast runs. Use /permissions or config only when the trust/safety tradeoff is right.",
     },
     {
       id: "shell-snapshot",
@@ -2926,6 +2999,19 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (approvalFlow.autoReviewApplies) {
+    addRecommendation({
+      id: "approval-auto-review",
+      label: "Approval Review",
+      value: "Auto review",
+      action: "Review policy",
+      tone: "medium",
+      priority: 74,
+      detail:
+        "Auto-review can make approvals less manual, but it uses extra model calls for eligible interactive approval requests. Route approvals to you for the lowest-latency local run.",
+    });
+  }
+
   if (threadLimit >= 128) {
     addRecommendation({
       id: "thread-discipline",
@@ -3100,6 +3186,9 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     docsSource,
     model,
     reasoningEffort: effort,
+    approvalPolicy: codexConfig?.approvalPolicy || null,
+    approvalReviewer: codexConfig?.approvalReviewer || "user",
+    approvalFlow,
     fastMode,
     serviceTier: tier,
     desktopServiceTier: desktopTier,
@@ -3563,6 +3652,7 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
   score -= Math.min(8, Math.max(0, Number(metrics.hookTurnScopedCommandCount || 0) - 1) * 1.2);
   score -= Math.min(4, Math.max(0, Number(metrics.hookBroadMatcherCount || 0)) * 1.5);
+  if (metrics.approvalAutoReview) score -= 4;
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   return Math.round(clampNumber(score, 0, 100));
 }
@@ -3627,6 +3717,9 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Review ${Number(metrics.hookTurnScopedCommandCount).toLocaleString()} turn/tool-scope lifecycle hook command${metrics.hookTurnScopedCommandCount === 1 ? "" : "s"} with /hooks if Codex commands feel slow.`,
     );
+  }
+  if (metrics.approvalAutoReview) {
+    guidance.push("Auto-review is enabled for interactive approvals. It can reduce clicks, but uses extra model calls for eligible approval requests.");
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -4304,6 +4397,9 @@ function summarizeBenchmarkEntry(entry) {
     backgroundCpuPercent: entry.metrics.backgroundCpuPercent || 0,
     agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
     agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
+    approvalAutoReview: Boolean(entry.metrics.approvalAutoReview),
+    approvalInteractive: entry.metrics.approvalInteractive !== false,
+    approvalGranularPolicy: Boolean(entry.metrics.approvalGranularPolicy),
     hooksFeature: entry.metrics.hooksFeature !== false,
     hookCommandCount: entry.metrics.hookCommandCount || 0,
     hookTurnScopedCommandCount: entry.metrics.hookTurnScopedCommandCount || 0,
@@ -4436,6 +4532,9 @@ export async function runBenchmark() {
     backgroundCpuPercent: scan.processes?.background?.cpuPercent || 0,
     agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
     agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
+    approvalAutoReview: Boolean(scan.codexConfig?.approvalFlow?.autoReviewApplies),
+    approvalInteractive: scan.codexConfig?.approvalFlow?.interactiveApprovals !== false,
+    approvalGranularPolicy: Boolean(scan.codexConfig?.approvalFlow?.granularPolicy),
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
