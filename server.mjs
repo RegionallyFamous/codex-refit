@@ -36,6 +36,12 @@ const turnScopedHookEvents = new Set([
   "SubagentStop",
   "Stop",
 ]);
+const skillCatalogBudgetChars = 8000;
+const longSkillDescriptionChars = 600;
+const largeSkillFileBytes = 24 * 1024;
+const maxSkillCatalogFiles = 600;
+const maxSkillCatalogDirs = 4000;
+const maxSkillCatalogDepth = 10;
 
 const paths = {
   codexHome,
@@ -46,6 +52,11 @@ const paths = {
   generatedImagesArchive: path.join(codexHome, "archived_generated_images"),
   memories: path.join(codexHome, "memories"),
   memoriesExtensions: path.join(codexHome, "memories_extensions"),
+  codexSkills: path.join(codexHome, "skills"),
+  codexSystemSkills: path.join(codexHome, "skills", ".system"),
+  userAgentSkills: path.join(homeDir, ".agents", "skills"),
+  adminSkills: "/etc/codex/skills",
+  pluginCache: path.join(codexHome, "plugins", "cache"),
   configToml: path.join(codexHome, "config.toml"),
   authJson: path.join(codexHome, "auth.json"),
   globalAgents: path.join(codexHome, "AGENTS.md"),
@@ -505,6 +516,331 @@ function buildContextBudgetSummary(values = {}) {
     compactTooLate,
     compactEarly,
     smallWindow,
+  };
+}
+
+function displayPath(filePath) {
+  const resolved = path.resolve(filePath || "");
+  return resolved === homeDir ? "~" : resolved.startsWith(`${homeDir}${path.sep}`) ? `~${resolved.slice(homeDir.length)}` : resolved;
+}
+
+function repoSkillRootsFrom(startPath) {
+  const roots = [];
+  let current = path.resolve(startPath || rootDir);
+  const home = path.resolve(homeDir);
+
+  while (current && current !== path.dirname(current)) {
+    if (current === home) break;
+    roots.push(path.join(current, ".agents", "skills"));
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  return roots;
+}
+
+function skillCatalogRoots() {
+  const roots = [
+    {
+      scope: "codex-home",
+      label: "Codex Home Skills",
+      path: paths.codexSkills,
+      skipDirs: [paths.codexSystemSkills],
+    },
+    {
+      scope: "system",
+      label: "System Skills",
+      path: paths.codexSystemSkills,
+    },
+    {
+      scope: "user",
+      label: "User Skills",
+      path: paths.userAgentSkills,
+    },
+    {
+      scope: "admin",
+      label: "Admin Skills",
+      path: paths.adminSkills,
+    },
+    {
+      scope: "plugin",
+      label: "Plugin Skills",
+      path: paths.pluginCache,
+    },
+    ...repoSkillRootsFrom(process.cwd()).map((repoPath) => ({
+      scope: "repo",
+      label: "Current Repo Skills",
+      path: repoPath,
+    })),
+    ...repoSkillRootsFrom(rootDir).map((repoPath) => ({
+      scope: "repo",
+      label: "App Repo Skills",
+      path: repoPath,
+    })),
+  ];
+
+  const seen = new Set();
+  return roots
+    .map((root) => ({ ...root, path: path.resolve(root.path), skipDirs: (root.skipDirs || []).map((skip) => path.resolve(skip)) }))
+    .filter((root) => {
+      const key = root.path;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function shouldSkipSkillDir(dirPath, skipDirs = []) {
+  const base = path.basename(dirPath);
+  if ([".git", "node_modules", "dist", "release", "tmp", ".next", ".cache"].includes(base)) return true;
+  return skipDirs.some((skipPath) => pathContains(skipPath, dirPath));
+}
+
+async function findSkillFiles(root) {
+  const result = {
+    root: root.path,
+    label: root.label,
+    scope: root.scope,
+    exists: false,
+    fileCount: 0,
+    dirCount: 0,
+    truncated: false,
+    files: [],
+  };
+
+  const rootStats = await statOrNull(root.path);
+  if (!rootStats) return result;
+  result.exists = true;
+
+  const stack = [{ dir: root.path, depth: 0 }];
+  const seenDirs = new Set();
+
+  while (stack.length) {
+    if (result.files.length >= maxSkillCatalogFiles || result.dirCount >= maxSkillCatalogDirs) {
+      result.truncated = true;
+      break;
+    }
+
+    const { dir, depth } = stack.pop();
+    if (shouldSkipSkillDir(dir, root.skipDirs)) continue;
+
+    let realDir = dir;
+    try {
+      realDir = await fs.realpath(dir);
+    } catch {
+      // Keep scanning by visible path when realpath is unavailable.
+    }
+    if (seenDirs.has(realDir)) continue;
+    seenDirs.add(realDir);
+    result.dirCount += 1;
+
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const stats = await statOrNull(fullPath);
+      if (!stats) continue;
+
+      if (entry.name === "SKILL.md" && stats.isFile()) {
+        result.files.push(fullPath);
+        if (result.files.length >= maxSkillCatalogFiles) {
+          result.truncated = true;
+          break;
+        }
+        continue;
+      }
+
+      if (depth >= maxSkillCatalogDepth) continue;
+      if (stats.isDirectory() || stats.isSymbolicLink()) {
+        const targetStats = stats.isSymbolicLink() ? await fs.stat(fullPath).catch(() => null) : stats;
+        if (targetStats?.isDirectory() && !shouldSkipSkillDir(fullPath, root.skipDirs)) {
+          stack.push({ dir: fullPath, depth: depth + 1 });
+        }
+      }
+    }
+  }
+
+  result.fileCount = result.files.length;
+  return result;
+}
+
+function unquoteSkillValue(value) {
+  const trimmed = String(value || "").trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function yamlLikeField(text, fieldName) {
+  const lines = String(text || "").split(/\r?\n/);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const match = line.match(new RegExp(`^${fieldName}\\s*:\\s*(.*)$`));
+    if (!match) continue;
+
+    const raw = match[1].trim();
+    if (raw === "|" || raw === ">") {
+      const parts = [];
+      for (let next = index + 1; next < lines.length; next += 1) {
+        const nextLine = lines[next];
+        if (/^\S[^:]*:\s*/.test(nextLine)) break;
+        if (nextLine.trim()) parts.push(nextLine.trim());
+      }
+      return parts.join(raw === ">" ? " " : "\n").trim();
+    }
+
+    return unquoteSkillValue(raw);
+  }
+
+  return "";
+}
+
+async function readSkillMetadata(filePath, root) {
+  const stats = await statOrNull(filePath);
+  const fileBytes = stats?.isFile() ? stats.size : 0;
+  let text = "";
+  try {
+    text = await fs.readFile(filePath, "utf8");
+  } catch {
+    text = "";
+  }
+
+  const frontMatter = text.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
+  const metadataText = frontMatter ? frontMatter[1] : text.slice(0, 4096);
+  const name = yamlLikeField(metadataText, "name") || path.basename(path.dirname(filePath));
+  const description = yamlLikeField(metadataText, "description");
+  const descriptionChars = description.length;
+  const shownPath = displayPath(filePath);
+  const estimatedCatalogChars = name.length + descriptionChars + shownPath.length + 16;
+
+  return {
+    name,
+    scope: root.scope,
+    path: shownPath,
+    fileBytes,
+    descriptionChars,
+    estimatedCatalogChars,
+  };
+}
+
+async function getSkillCatalogSummary() {
+  const roots = skillCatalogRoots();
+  const discovered = await Promise.all(roots.map((root) => findSkillFiles(root)));
+  const skillFiles = [];
+
+  for (const rootResult of discovered) {
+    const root = roots.find((candidate) => candidate.path === rootResult.root) || {};
+    for (const filePath of rootResult.files) {
+      skillFiles.push({ filePath, root });
+    }
+  }
+
+  const seenFiles = new Set();
+  const uniqueSkillFiles = skillFiles.filter((item) => {
+    const resolved = path.resolve(item.filePath);
+    if (seenFiles.has(resolved)) return false;
+    seenFiles.add(resolved);
+    return true;
+  });
+
+  const skills = await Promise.all(uniqueSkillFiles.map((item) => readSkillMetadata(item.filePath, item.root)));
+  const skillCount = skills.length;
+  const estimatedCatalogChars = skills.reduce((total, skill) => total + skill.estimatedCatalogChars, 0);
+  const descriptionChars = skills.reduce((total, skill) => total + skill.descriptionChars, 0);
+  const longDescriptionCount = skills.filter((skill) => skill.descriptionChars >= longSkillDescriptionChars).length;
+  const largeSkillFileCount = skills.filter((skill) => skill.fileBytes >= largeSkillFileBytes).length;
+  const truncated = discovered.some((root) => root.truncated);
+  const scopeCounts = skills.reduce((counts, skill) => {
+    counts[skill.scope] = (counts[skill.scope] || 0) + 1;
+    return counts;
+  }, {});
+  const userManagedCount = (scopeCounts.user || 0) + (scopeCounts.repo || 0) + (scopeCounts["codex-home"] || 0) + (scopeCounts.plugin || 0);
+  const highLoad =
+    truncated ||
+    estimatedCatalogChars >= skillCatalogBudgetChars * 3 ||
+    skillCount >= 120 ||
+    longDescriptionCount >= 18;
+  const mediumLoad =
+    highLoad ||
+    estimatedCatalogChars >= skillCatalogBudgetChars ||
+    skillCount >= 40 ||
+    longDescriptionCount >= 6 ||
+    largeSkillFileCount >= 8;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = skillCount
+    ? `${skillCount.toLocaleString()} skill${skillCount === 1 ? "" : "s"}`
+    : "No skills";
+  const action = tone === "low" ? "Keep concise" : highLoad ? "Trim catalog" : "Review /skills";
+  const longestSkills = [...skills]
+    .sort((a, b) => b.descriptionChars - a.descriptionChars)
+    .slice(0, 8)
+    .map((skill) => ({
+      name: skill.name,
+      scope: skill.scope,
+      path: skill.path,
+      descriptionChars: skill.descriptionChars,
+      fileBytes: skill.fileBytes,
+    }));
+  const rootsSummary = discovered.map((root) => ({
+    label: root.label,
+    scope: root.scope,
+    path: displayPath(root.root),
+    exists: root.exists,
+    skillCount: root.fileCount,
+    dirCount: root.dirCount,
+    truncated: root.truncated,
+  }));
+
+  const detail =
+    tone === "low"
+      ? `Skill metadata looks light: ${skillCount.toLocaleString()} skill${skillCount === 1 ? "" : "s"} and about ${estimatedCatalogChars.toLocaleString()} catalog character${estimatedCatalogChars === 1 ? "" : "s"}.`
+      : [
+          `Codex includes skill name, description, and path metadata in the initial prompt, with a documented fallback cap around ${skillCatalogBudgetChars.toLocaleString()} characters when the context window is unknown.`,
+          `Refit estimates ${estimatedCatalogChars.toLocaleString()} catalog character${estimatedCatalogChars === 1 ? "" : "s"} across ${skillCount.toLocaleString()} skill${skillCount === 1 ? "" : "s"}.`,
+          longDescriptionCount
+            ? `${longDescriptionCount.toLocaleString()} description${longDescriptionCount === 1 ? "" : "s"} ${pluralVerb(longDescriptionCount)} at least ${longSkillDescriptionChars.toLocaleString()} characters.`
+            : null,
+          truncated ? "The scan hit its safety cap before finishing every skill root." : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    skillCount,
+    userManagedCount,
+    systemSkillCount: scopeCounts.system || 0,
+    pluginSkillCount: scopeCounts.plugin || 0,
+    userSkillCount: scopeCounts.user || 0,
+    repoSkillCount: scopeCounts.repo || 0,
+    codexHomeSkillCount: scopeCounts["codex-home"] || 0,
+    adminSkillCount: scopeCounts.admin || 0,
+    scopeCounts,
+    estimatedCatalogChars,
+    descriptionChars,
+    longDescriptionCount,
+    largeSkillFileCount,
+    largestDescriptionChars: longestSkills[0]?.descriptionChars || 0,
+    budgetChars: skillCatalogBudgetChars,
+    overBudget: estimatedCatalogChars >= skillCatalogBudgetChars,
+    truncated,
+    roots: rootsSummary,
+    longestSkills,
   };
 }
 
@@ -2506,6 +2842,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const memoryInjection = Boolean(codexConfig?.memoriesUseMemoriesEffective);
   const memoryGeneration = Boolean(codexConfig?.memoriesGenerateMemoriesEffective);
   const memoryReviewNeeded = memoryBytes > 2 * 1024 ** 2 || memoryFiles >= 50 || memoryInjection || memoryGeneration;
+  const skillCatalog = scan?.skillCatalog || {};
 
   if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
     addFix({
@@ -2516,6 +2853,29 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
       action: "Smart Optimize, then Run Check",
       detail:
         "Best local win: move stale active history, prune logs, checkpoint WAL, and compact databases with backups. This does not delete generated images.",
+    });
+  }
+
+  if (skillCatalog.status === "ready" && skillCatalog.tone !== "low") {
+    addFix({
+      id: "skill-catalog",
+      label: "Skill Catalog",
+      value: skillCatalog.label,
+      tone: skillCatalog.tone === "high" ? "high" : "medium",
+      action: "/skills",
+      detail:
+        "Codex starts each task with skill metadata so it can pick the right workflow. Keep installed skills intentional and descriptions concise so the skill list does not crowd the prompt.",
+      snippet: [
+        "/skills",
+        "",
+        "# Disable a stale skill without deleting it:",
+        "# ~/.codex/config.toml",
+        "[[skills.config]]",
+        'path = "/path/to/skill/SKILL.md"',
+        "enabled = false",
+        "",
+        "# Also shorten long SKILL.md descriptions: front-load the trigger words, then stop.",
+      ].join("\n"),
     });
   }
 
@@ -2928,6 +3288,9 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const authCache = codexConfig?.authCache || {};
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
+  const skillCatalog = scan?.skillCatalog || {};
+  const skillCatalogReady = skillCatalog.status === "ready";
+  const skillCatalogLoaded = skillCatalogReady && skillCatalog.tone !== "low";
   const globalGuidanceReady = Boolean(codexConfig?.globalAgentsExists);
   const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
@@ -3309,6 +3672,17 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: `${enabledPluginCount.toLocaleString()} plugin${enabledPluginCount === 1 ? "" : "s"} and ${enabledMcpCount.toLocaleString()} MCP server${enabledMcpCount === 1 ? "" : "s"} are enabled. ${mcpStartupDetail}`,
     },
     {
+      id: "skill-catalog",
+      label: "Skill Catalog",
+      value: skillCatalogReady ? skillCatalog.label : "Unknown",
+      tone: skillCatalogReady ? skillCatalog.tone : "medium",
+      action: skillCatalogLoaded ? skillCatalog.action || "/skills" : "Keep concise",
+      priority: skillCatalogLoaded ? (skillCatalog.tone === "high" ? 84 : 61) : 13,
+      detail:
+        skillCatalog.detail ||
+        "Codex uses skill name, description, and path metadata to choose reusable workflows. Keep descriptions clear and short.",
+    },
+    {
       id: "required-mcp",
       label: "Required MCP",
       value: requiredMcpCount ? requiredMcpCount.toLocaleString() : "None",
@@ -3494,6 +3868,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         mcpSummary.missingEnvVarCount > 0
           ? `${mcpSummary.missingEnvVarCount.toLocaleString()} referenced MCP environment variable${mcpSummary.missingEnvVarCount === 1 ? "" : "s"} ${pluralVerb(mcpSummary.missingEnvVarCount)} not visible to Refit. Check /mcp verbose and ~/.codex/.env before blaming Codex latency.`
           : `${mcpSummary.detail} Disable optional servers you do not need in every run.`,
+    });
+  }
+
+  if (skillCatalogLoaded) {
+    addRecommendation({
+      id: "skill-catalog-pressure",
+      label: "Skill Catalog",
+      value: skillCatalog.label,
+      action: skillCatalog.action || "/skills",
+      tone: skillCatalog.tone === "high" ? "high" : "medium",
+      priority: skillCatalog.tone === "high" ? 85 : 63,
+      detail:
+        skillCatalog.overBudget
+          ? `${skillCatalog.detail} Review unused local/plugin skills and shorten long descriptions before chasing deeper prompt-routing problems.`
+          : skillCatalog.detail,
     });
   }
 
@@ -3720,6 +4109,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     enabledMcpCount,
     requiredMcpCount,
     mcpSummary,
+    skillCatalog,
     runtime,
     processSummary,
     cards,
@@ -3935,6 +4325,7 @@ export async function scanCodex(options = {}) {
     state,
     preflight,
     codexConfig,
+    skillCatalog,
     runtime,
     processSummary,
   ] = await Promise.all([
@@ -3975,6 +4366,7 @@ export async function scanCodex(options = {}) {
     getStateStats(archiveOptions),
     getPreflightStatus(),
     getCodexConfigSummary(),
+    getSkillCatalogSummary(),
     getCodexRuntimeSummary(),
     getCodexProcessSummary(),
   ]);
@@ -4054,6 +4446,7 @@ export async function scanCodex(options = {}) {
     state,
     logs,
     codexConfig,
+    skillCatalog,
     runtime,
     processes: processSummary,
     categories,
@@ -4159,6 +4552,9 @@ function benchmarkLiveScore(metrics) {
   if (metrics.compactEarly) score -= 2;
   if (metrics.smallContextWindow) score -= 3;
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
+  score -= Math.min(5, Math.max(0, Number(metrics.skillEstimatedCatalogChars || 0) - skillCatalogBudgetChars) / 4000);
+  score -= Math.min(4, Math.max(0, Number(metrics.skillCount || 0) - 40) * 0.08);
+  if (metrics.skillCatalogTruncated) score -= 2;
   return Math.round(clampNumber(score, 0, 100));
 }
 
@@ -4217,6 +4613,15 @@ function benchmarkGuidance(metrics) {
   }
   if (metrics.memoriesUseMemories && metrics.memoryBytes > 10 * 1024 ** 2) {
     guidance.push(`Review ${formatBytesServer(metrics.memoryBytes)} of local memories if Codex starts carrying stale assumptions.`);
+  }
+  if (metrics.skillCatalogTruncated) {
+    guidance.push("Review installed skills with /skills; Refit hit its skill scan cap, so the local/plugin skill catalog may be oversized.");
+  } else if (metrics.skillEstimatedCatalogChars >= skillCatalogBudgetChars) {
+    guidance.push(
+      `Review the skill catalog with /skills; Refit estimates ${Number(metrics.skillEstimatedCatalogChars).toLocaleString()} skill metadata characters before Codex chooses a skill.`,
+    );
+  } else if (metrics.skillCount >= 40) {
+    guidance.push(`Keep skill descriptions tight; ${Number(metrics.skillCount).toLocaleString()} skills are available to Codex.`);
   }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
     guidance.push(
@@ -4910,6 +5315,12 @@ function benchmarkDeltas(current, previous) {
     "hookBroadMatcherCount",
     "memoryBytes",
     "memoryFiles",
+    "skillCount",
+    "skillUserManagedCount",
+    "skillPluginCount",
+    "skillEstimatedCatalogChars",
+    "skillDescriptionChars",
+    "skillLongDescriptionCount",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -4965,6 +5376,18 @@ function summarizeBenchmarkEntry(entry) {
     memoryFiles: entry.metrics.memoryFiles || 0,
     memoriesUseMemories: Boolean(entry.metrics.memoriesUseMemories),
     memoriesGenerateMemories: Boolean(entry.metrics.memoriesGenerateMemories),
+    skillCount: entry.metrics.skillCount || 0,
+    skillUserManagedCount: entry.metrics.skillUserManagedCount || 0,
+    skillSystemCount: entry.metrics.skillSystemCount || 0,
+    skillPluginCount: entry.metrics.skillPluginCount || 0,
+    skillUserCount: entry.metrics.skillUserCount || 0,
+    skillRepoCount: entry.metrics.skillRepoCount || 0,
+    skillEstimatedCatalogChars: entry.metrics.skillEstimatedCatalogChars || 0,
+    skillDescriptionChars: entry.metrics.skillDescriptionChars || 0,
+    skillLongDescriptionCount: entry.metrics.skillLongDescriptionCount || 0,
+    skillLargeFileCount: entry.metrics.skillLargeFileCount || 0,
+    skillCatalogOverBudget: Boolean(entry.metrics.skillCatalogOverBudget),
+    skillCatalogTruncated: Boolean(entry.metrics.skillCatalogTruncated),
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -5000,6 +5423,9 @@ export async function benchmarkHistory(limit = 12) {
         shellEnvSecretLikeNameCount: latest.shellEnvSecretLikeNameCount - oldest.shellEnvSecretLikeNameCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - oldest.toolOutputTokenLimit,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
+        skillCount: latest.skillCount - oldest.skillCount,
+        skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - oldest.skillEstimatedCatalogChars,
+        skillLongDescriptionCount: latest.skillLongDescriptionCount - oldest.skillLongDescriptionCount,
       }
     : null;
   const previousDeltas = latest && previous
@@ -5015,6 +5441,8 @@ export async function benchmarkHistory(limit = 12) {
         mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
         shellEnvVarCount: latest.shellEnvVarCount - previous.shellEnvVarCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - previous.toolOutputTokenLimit,
+        skillCount: latest.skillCount - previous.skillCount,
+        skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - previous.skillEstimatedCatalogChars,
       }
     : null;
   const trend =
@@ -5126,6 +5554,18 @@ export async function runBenchmark() {
     memoryFiles: scan.categories.memoryState?.fileCount || 0,
     memoriesUseMemories: Boolean(scan.codexConfig?.memoriesUseMemoriesEffective),
     memoriesGenerateMemories: Boolean(scan.codexConfig?.memoriesGenerateMemoriesEffective),
+    skillCount: scan.skillCatalog?.skillCount || 0,
+    skillUserManagedCount: scan.skillCatalog?.userManagedCount || 0,
+    skillSystemCount: scan.skillCatalog?.systemSkillCount || 0,
+    skillPluginCount: scan.skillCatalog?.pluginSkillCount || 0,
+    skillUserCount: scan.skillCatalog?.userSkillCount || 0,
+    skillRepoCount: scan.skillCatalog?.repoSkillCount || 0,
+    skillEstimatedCatalogChars: scan.skillCatalog?.estimatedCatalogChars || 0,
+    skillDescriptionChars: scan.skillCatalog?.descriptionChars || 0,
+    skillLongDescriptionCount: scan.skillCatalog?.longDescriptionCount || 0,
+    skillLargeFileCount: scan.skillCatalog?.largeSkillFileCount || 0,
+    skillCatalogOverBudget: Boolean(scan.skillCatalog?.overBudget),
+    skillCatalogTruncated: Boolean(scan.skillCatalog?.truncated),
   };
   metrics.scoreBreakdown = localScoreBreakdown(metrics);
   metrics.score = metrics.scoreBreakdown.score;
