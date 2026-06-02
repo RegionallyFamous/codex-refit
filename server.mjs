@@ -292,6 +292,177 @@ async function getCodexRuntimeSummary() {
   };
 }
 
+function parsePsElapsedSeconds(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const [dayText, clockText] = raw.includes("-") ? raw.split("-", 2) : ["0", raw];
+  const days = Number(dayText) || 0;
+  const parts = clockText.split(":").map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part))) return days * 86400;
+  if (parts.length === 3) return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return days * 86400 + parts[0] * 60 + parts[1];
+  if (parts.length === 1) return days * 86400 + parts[0];
+  return days * 86400;
+}
+
+function formatAgeServer(seconds) {
+  const safeSeconds = Math.max(0, Number(seconds) || 0);
+  const days = Math.floor(safeSeconds / 86400);
+  const hours = Math.floor((safeSeconds % 86400) / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m`;
+  return `${Math.floor(safeSeconds)}s`;
+}
+
+function codexProcessKind(command) {
+  const text = String(command || "");
+  if (!text) return null;
+  if (text.includes("Codex Refit.app") || text.includes("codex-refit")) return "refit";
+  if (text.includes("crashpad_handler")) return "crashpad";
+  if (text.includes("node_repl")) return "nodeRepl";
+  if (text.includes("/kernel.js")) return "kernel";
+  if (text.includes("app-server --analytics-default-enabled")) return "backgroundServer";
+  if (text.includes("app-server --listen")) return "threadServer";
+  if (text.includes("codex doctor")) return "doctor";
+  if (text.includes("Codex (Renderer)")) return "renderer";
+  if (text.includes("Codex (Service)")) return "service";
+  if (text.includes("/Applications/Codex.app/Contents/MacOS/Codex")) return "app";
+  if (text.includes("@openai/codex") || text.includes("/codex ") || /\bcodex\b/i.test(text)) return "cli";
+  return null;
+}
+
+function codexProcessLabel(kind) {
+  return {
+    app: "Codex app",
+    renderer: "Codex renderer",
+    service: "Codex service",
+    backgroundServer: "background app server",
+    threadServer: "thread app server",
+    nodeRepl: "Node REPL tool",
+    kernel: "tool kernel",
+    doctor: "Doctor check",
+    cli: "Codex CLI",
+    crashpad: "crash reporter",
+    refit: "Codex Refit",
+  }[kind] || "Codex helper";
+}
+
+function buildProcessLoadSnippet() {
+  return [
+    "# Read-only Codex load check. Counts processes and memory without printing auth contents.",
+    "ps -axo rss=,command= | awk '/Codex.app|codex app-server|node_repl|@openai\\/codex/ && !/Codex Refit/ {count++; rss+=$1} END {printf \"%d Codex processes, %.1f MB RSS\\n\", count, rss/1024}'",
+    "",
+    "# Then finish or archive idle Codex threads, close extra terminals, and restart Codex after active runs are done.",
+    "codex doctor --summary",
+  ].join("\n");
+}
+
+async function getCodexProcessSummary() {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,rss=,etime=,command="], {
+      timeout: 3000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    const processes = String(stdout || "")
+      .split(/\r?\n/)
+      .map((line) => {
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+        if (!match) return null;
+        const command = match[5];
+        const kind = codexProcessKind(command);
+        if (!kind) return null;
+        return {
+          pid: Number(match[1]),
+          ppid: Number(match[2]),
+          kind,
+          label: codexProcessLabel(kind),
+          rssBytes: (Number(match[3]) || 0) * 1024,
+          ageSeconds: parsePsElapsedSeconds(match[4]),
+        };
+      })
+      .filter(Boolean);
+
+    const pressureProcesses = processes.filter((processInfo) => !["refit", "crashpad"].includes(processInfo.kind));
+    const countByKind = pressureProcesses.reduce((counts, processInfo) => {
+      counts[processInfo.kind] = (counts[processInfo.kind] || 0) + 1;
+      return counts;
+    }, {});
+    const rssBytes = pressureProcesses.reduce((total, processInfo) => total + processInfo.rssBytes, 0);
+    const helperCount =
+      (countByKind.threadServer || 0) +
+      (countByKind.nodeRepl || 0) +
+      (countByKind.kernel || 0) +
+      (countByKind.backgroundServer || 0);
+    const appServerCount = (countByKind.threadServer || 0) + (countByKind.backgroundServer || 0);
+    const longestAgeSeconds = pressureProcesses.reduce((max, processInfo) => Math.max(max, processInfo.ageSeconds || 0), 0);
+    const largest = [...pressureProcesses]
+      .sort((a, b) => b.rssBytes - a.rssBytes)
+      .slice(0, 4)
+      .map((processInfo) => ({
+        kind: processInfo.kind,
+        label: processInfo.label,
+        rssBytes: processInfo.rssBytes,
+        ageSeconds: processInfo.ageSeconds,
+      }));
+
+    const highLoad = pressureProcesses.length >= 24 || helperCount >= 18 || rssBytes >= 6 * 1024 ** 3;
+    const mediumLoad = pressureProcesses.length >= 12 || helperCount >= 8 || rssBytes >= 2 * 1024 ** 3;
+    const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+    const detail =
+      pressureProcesses.length === 0
+        ? "No live Codex app or CLI processes were found."
+        : tone === "high"
+          ? `Refit sees ${pressureProcesses.length.toLocaleString()} live Codex processes using ${formatBytesServer(rssBytes)}. Many helper processes usually means finished threads, terminals, or tool kernels are still open.`
+          : tone === "medium"
+            ? `Refit sees ${pressureProcesses.length.toLocaleString()} live Codex processes using ${formatBytesServer(rssBytes)}. Close idle work before judging database cleanup.`
+            : `Refit sees ${pressureProcesses.length.toLocaleString()} live Codex process${pressureProcesses.length === 1 ? "" : "es"} using ${formatBytesServer(rssBytes)}. Live process load looks reasonable.`;
+
+    return {
+      status: "ready",
+      tone,
+      label: tone === "high" ? "Heavy" : tone === "medium" ? "Loaded" : "Steady",
+      processCount: pressureProcesses.length,
+      observedCount: processes.length,
+      helperCount,
+      appServerCount,
+      nodeReplCount: countByKind.nodeRepl || 0,
+      kernelCount: countByKind.kernel || 0,
+      threadServerCount: countByKind.threadServer || 0,
+      refitCount: processes.filter((processInfo) => processInfo.kind === "refit").length,
+      rssBytes,
+      longestAgeSeconds,
+      longestAgeLabel: longestAgeSeconds ? formatAgeServer(longestAgeSeconds) : "None",
+      detail,
+      action: tone === "low" ? "Keep current" : tone === "medium" ? "Close idle threads" : "Restart after active work",
+      largest,
+      counts: countByKind,
+    };
+  } catch (error) {
+    return {
+      status: "unavailable",
+      tone: "medium",
+      label: "Unknown",
+      processCount: 0,
+      observedCount: 0,
+      helperCount: 0,
+      appServerCount: 0,
+      nodeReplCount: 0,
+      kernelCount: 0,
+      threadServerCount: 0,
+      refitCount: 0,
+      rssBytes: 0,
+      longestAgeSeconds: 0,
+      longestAgeLabel: "Unknown",
+      detail: `Refit could not read live process load: ${error.message}`,
+      action: "Run ps manually",
+      largest: [],
+      counts: {},
+    };
+  }
+}
+
 function parseDoctorGeneratedAt(value) {
   if (!value) return null;
   const raw = String(value);
@@ -1557,6 +1728,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
   const authCache = codexConfig?.authCache || {};
+  const processSummary = context.processSummary || {};
 
   if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
     addFix({
@@ -1567,6 +1739,19 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
       action: "Smart Optimize, then Run Check",
       detail:
         "Best local win: move stale active history, prune logs, checkpoint WAL, and compact databases with backups. This does not delete generated images.",
+    });
+  }
+
+  if (processSummary.status === "ready" && processSummary.tone !== "low") {
+    addFix({
+      id: "live-process-load",
+      label: "Live Codex Load",
+      value: `${Number(processSummary.processCount || 0).toLocaleString()} procs`,
+      tone: processSummary.tone === "high" ? "high" : "medium",
+      action: "Close idle work",
+      detail:
+        "Many live Codex helpers can make the app feel slow even after local cleanup. Finish or archive idle threads, close extra terminals, then restart Codex after active runs are done.",
+      snippet: buildProcessLoadSnippet(),
     });
   }
 
@@ -1772,7 +1957,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   });
 }
 
-function buildCodexDoctor(scan, codexConfig, runtime = {}) {
+function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) {
   const categories = scan.categories || {};
   const activeReliefBytes = (categories.activeStaleSessions?.bytes || 0) + (categories.archivedSessionsInActiveTree?.bytes || 0);
   const logBytes = scan.logs?.bytes || 0;
@@ -1804,6 +1989,10 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
   const webSearchMode = codexConfig?.webSearchMode || "cached default";
   const docsSource = "Official Codex manual: Speed, Models, Config, AGENTS, MCP, Troubleshooting";
+  const processReady = processSummary?.status === "ready";
+  const processLoaded = processReady && processSummary.tone !== "low";
+  const processCount = Number(processSummary?.processCount || 0);
+  const processRssBytes = Number(processSummary?.rssBytes || 0);
 
   const localDetail =
     activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2
@@ -1838,6 +2027,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     : runtime?.cliVersion || runtime?.appVersion
       ? `Terminal Codex ${runtime.cliVersion || "not found"}; app binary ${runtime.appVersion || "not found"}.`
       : "Codex CLI was not found on PATH and the app binary was not detected.";
+
+  const processDetail =
+    processReady
+      ? `${processSummary.detail} Oldest live Codex process: ${processSummary.longestAgeLabel || "unknown"}.`
+      : processSummary?.detail || "Live Codex process load was not available for this scan.";
 
   const cards = [
     {
@@ -2002,6 +2196,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   const requiredMcpCount = Number(codexConfig?.requiredMcpCount || 0);
   const workflowAdvice = [
     {
+      id: "live-process-load",
+      label: "Live Codex Load",
+      value: processReady ? `${processCount.toLocaleString()} procs` : "Unknown",
+      tone: processSummary?.tone || "medium",
+      action: processReady ? processSummary.action || "Review load" : "Run local ps",
+      priority: processLoaded ? (processSummary.tone === "high" ? 94 : 78) : 24,
+      detail: processDetail,
+    },
+    {
       id: "project-playbooks",
       label: "Project Playbooks",
       value: existingProjectCount ? `${projectReadyCount}/${existingProjectCount}` : "None",
@@ -2096,6 +2299,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
       priority: 92,
       detail:
         "Codex should reuse cached login details. If the cache is missing or empty, repeated sign-in prompts can make every run feel slower.",
+    });
+  }
+
+  if (processLoaded) {
+    addRecommendation({
+      id: "live-process-load",
+      label: "Live Codex Load",
+      value: `${processCount.toLocaleString()} procs`,
+      action: processSummary.action || "Close idle work",
+      tone: processSummary.tone === "high" ? "high" : "medium",
+      priority: processSummary.tone === "high" ? 98 : 84,
+      detail:
+        processSummary.tone === "high"
+          ? `Codex currently has ${processCount.toLocaleString()} live processes using ${formatBytesServer(processRssBytes)}. Finish/archive idle threads and restart Codex after active work before judging deeper cleanup.`
+          : `Codex currently has ${processCount.toLocaleString()} live processes using ${formatBytesServer(processRssBytes)}. Close idle threads or extra terminals if the app feels slow.`,
     });
   }
 
@@ -2274,10 +2492,13 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     activeReliefBytes,
     logBytes,
     logWalBytes,
+    processSummary,
   });
 
   const headline =
-    runtime?.versionMismatch
+    processSummary?.tone === "high"
+      ? `Codex has ${processCount.toLocaleString()} live helper processes using ${formatBytesServer(processRssBytes)}.`
+      : runtime?.versionMismatch
       ? `Codex versions differ: CLI ${runtime.cliVersion}, app ${runtime.appVersion}.`
       : activeReliefBytes > 1024 ** 3
       ? `Best next win: move ${formatBytesServer(activeReliefBytes)} out of active sessions.`
@@ -2312,6 +2533,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     enabledMcpCount,
     requiredMcpCount,
     runtime,
+    processSummary,
     cards,
     profiles,
     configAdvice,
@@ -2519,6 +2741,7 @@ export async function scanCodex(options = {}) {
     preflight,
     codexConfig,
     runtime,
+    processSummary,
   ] = await Promise.all([
     summarizeDirectory(paths.archivedSessions, { label: "Archived Sessions", risk: "warn", largestLimit: 12 }),
     summarizeDirectory(paths.maintenanceArchive, {
@@ -2551,6 +2774,7 @@ export async function scanCodex(options = {}) {
     getPreflightStatus(),
     getCodexConfigSummary(),
     getCodexRuntimeSummary(),
+    getCodexProcessSummary(),
   ]);
 
   const codexHomeBytes = await duBytes(paths.codexHome);
@@ -2628,13 +2852,14 @@ export async function scanCodex(options = {}) {
     logs,
     codexConfig,
     runtime,
+    processes: processSummary,
     categories,
     largestSessionFiles,
   };
 
   addHotspots(scan);
   scan.smartPlan = buildSmartPlan(scan, { ...options, days: archiveChoice.days, archiveChoice });
-  scan.codexDoctor = buildCodexDoctor(scan, codexConfig, runtime);
+  scan.codexDoctor = buildCodexDoctor(scan, codexConfig, runtime, processSummary);
   return scan;
 }
 
