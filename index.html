@@ -185,9 +185,19 @@
               <p class="eyebrow">Codex Doctor</p>
               <h2>Speed Advice</h2>
             </div>
-            <small id="doctorSource">Reading local state and Codex settings</small>
+            <div class="doctor-actions">
+              <small id="doctorSource">Reading local state and Codex settings</small>
+              <button id="runOfficialDoctor" type="button">Run Official Doctor</button>
+            </div>
           </header>
           <p id="doctorHeadline" class="doctor-headline">Waiting for scan.</p>
+          <div id="officialDoctor" class="official-doctor" aria-live="polite" hidden>
+            <article>
+              <span>Official Doctor</span>
+              <strong>Not run yet</strong>
+              <small>Runs `codex doctor --json` on demand and shows a redacted summary.</small>
+            </article>
+          </div>
           <div id="doctorQueue" class="doctor-queue" aria-live="polite">
             <article>
               <span>Next Move</span>

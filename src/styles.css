@@ -1133,8 +1133,30 @@ body[data-hard-mode] .benchmark-breakdown {
   color: var(--cream);
 }
 
+.doctor-actions {
+  display: grid;
+  gap: 0.35rem;
+  justify-items: end;
+  min-width: 0;
+}
+
+.doctor-actions button {
+  min-height: 34px;
+  border: 1px solid rgba(112, 213, 200, 0.42);
+  border-radius: 999px;
+  padding: 0 0.82rem;
+  background: rgba(112, 213, 200, 0.16);
+  color: var(--cream);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.68rem;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
 .doctor-list,
-.doctor-queue {
+.doctor-queue,
+.official-doctor {
   display: grid;
   gap: 0.48rem;
 }
@@ -1145,6 +1167,14 @@ body[data-hard-mode] .benchmark-breakdown {
 
 .doctor-queue {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.official-doctor {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.official-doctor[hidden] {
+  display: none;
 }
 
 .doctor-profiles,
@@ -1178,6 +1208,7 @@ body[data-hard-mode] .doctor-fix-kit {
 
 .doctor-list article,
 .doctor-queue article,
+.official-doctor article,
 .doctor-profiles article,
 .doctor-config article,
 .doctor-workflow article,
@@ -1190,6 +1221,12 @@ body[data-hard-mode] .doctor-fix-kit {
   padding: 0.58rem;
   border-top: 8px solid var(--teal);
   background: rgba(12, 11, 8, 0.86);
+}
+
+.official-doctor article {
+  min-height: 74px;
+  border-top-color: var(--blue);
+  background: rgba(126, 154, 211, 0.08);
 }
 
 .doctor-queue article {
@@ -1209,6 +1246,7 @@ body[data-hard-mode] .doctor-fix-kit {
 
 .doctor-list article.medium,
 .doctor-queue article.medium,
+.official-doctor article.medium,
 .doctor-profiles article.medium,
 .doctor-config article.medium,
 .doctor-workflow article.medium,
@@ -1218,6 +1256,7 @@ body[data-hard-mode] .doctor-fix-kit {
 
 .doctor-list article.high,
 .doctor-queue article.high,
+.official-doctor article.high,
 .doctor-profiles article.high,
 .doctor-config article.high,
 .doctor-workflow article.high,
@@ -1229,6 +1268,8 @@ body[data-hard-mode] .doctor-fix-kit {
 .doctor-list small,
 .doctor-queue span,
 .doctor-queue small,
+.official-doctor span,
+.official-doctor small,
 .doctor-profiles span,
 .doctor-profiles small,
 .doctor-config span,
@@ -1247,6 +1288,8 @@ body[data-hard-mode] .doctor-fix-kit {
 .doctor-list strong,
 .doctor-queue span,
 .doctor-queue strong,
+.official-doctor span,
+.official-doctor strong,
 .doctor-profiles span,
 .doctor-profiles strong,
 .doctor-config span,
@@ -1260,6 +1303,7 @@ body[data-hard-mode] .doctor-fix-kit {
 
 .doctor-list strong,
 .doctor-queue strong,
+.official-doctor strong,
 .doctor-profiles strong,
 .doctor-config strong,
 .doctor-workflow strong,
@@ -2010,6 +2054,7 @@ body[data-busy] .app-shell {
 
   .doctor-list,
   .doctor-queue,
+  .official-doctor,
   .doctor-profiles,
   .doctor-config,
   .doctor-workflow,
@@ -2107,6 +2152,7 @@ body[data-busy] .app-shell {
   .summary-grid,
   .doctor-list,
   .doctor-queue,
+  .official-doctor,
   .doctor-profiles,
   .doctor-config,
   .doctor-workflow,

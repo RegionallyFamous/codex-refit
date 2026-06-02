@@ -292,6 +292,180 @@ async function getCodexRuntimeSummary() {
   };
 }
 
+function parseDoctorGeneratedAt(value) {
+  if (!value) return null;
+  const raw = String(value);
+  const secondsMatch = raw.match(/^(\d+)s since unix epoch$/);
+  if (secondsMatch) return new Date(Number(secondsMatch[1]) * 1000).toISOString();
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function doctorTone(status) {
+  if (status === "fail" || status === "error") return "high";
+  if (status === "warning" || status === "warn") return "medium";
+  return "low";
+}
+
+function doctorStatusLabel(status) {
+  return {
+    ok: "OK",
+    idle: "Idle",
+    warning: "Warning",
+    warn: "Warning",
+    fail: "Fail",
+    error: "Error",
+  }[status] || String(status || "Unknown");
+}
+
+function parseDoctorRolloutDetails(value) {
+  const text = String(value || "");
+  const match = text.match(/(\d+)\s+files,\s+(\d+)\s+total bytes/i);
+  if (!match) return null;
+  return { files: Number(match[1]), bytes: Number(match[2]) };
+}
+
+function buildOfficialDoctorSummary(report, meta = {}) {
+  const checks = Object.values(report?.checks || {});
+  const counts = checks.reduce(
+    (summary, check) => {
+      const status = check.status || "unknown";
+      summary.total += 1;
+      summary[status] = (summary[status] || 0) + 1;
+      return summary;
+    },
+    { total: 0, ok: 0, warning: 0, fail: 0, idle: 0, unknown: 0 },
+  );
+
+  const findings = checks
+    .filter((check) => ["fail", "warning", "error"].includes(check.status))
+    .map((check) => ({
+      id: check.id,
+      category: check.category || check.id,
+      status: check.status,
+      tone: doctorTone(check.status),
+      label: check.category || check.id,
+      value: doctorStatusLabel(check.status),
+      summary: check.summary || "Codex Doctor found an issue.",
+      remediation: check.remediation || null,
+      durationMs: check.durationMs || 0,
+      source: "official",
+    }));
+
+  const authDetails = report?.checks?.["auth.credentials"]?.details || {};
+  const reachabilityDetails = report?.checks?.["network.provider_reachability"]?.details || {};
+  if (
+    String(authDetails["auth env vars present"] || "").includes("OPENAI_API_KEY") &&
+    String(authDetails["stored ChatGPT tokens"] || "") === "true"
+  ) {
+    findings.push({
+      id: "auth.mixed-mode",
+      category: "auth",
+      status: "warning",
+      tone: "medium",
+      label: "auth",
+      value: "Mixed signals",
+      summary: `ChatGPT login and OPENAI_API_KEY are both present; reachability is using ${reachabilityDetails["reachability mode"] || "the active provider mode"}.`,
+      remediation: "Unset OPENAI_API_KEY for ChatGPT-token runs, or use API-key mode intentionally.",
+      source: "derived",
+    });
+  }
+
+  const updatesDetails = report?.checks?.["updates.status"]?.details || {};
+  if (String(updatesDetails["latest version status"] || "").includes("newer")) {
+    findings.push({
+      id: "updates.available",
+      category: "updates",
+      status: "warning",
+      tone: "medium",
+      label: "updates",
+      value: "Newer CLI",
+      summary: `Codex ${updatesDetails["latest version"]} is available; current doctor version is ${report?.codexVersion || "unknown"}.`,
+      remediation: updatesDetails["update action"] || "Update Codex with the documented installer for your setup.",
+      source: "derived",
+    });
+  }
+
+  const stateDetails = report?.checks?.["state.paths"]?.details || {};
+  const activeRollouts = parseDoctorRolloutDetails(stateDetails["active rollout files"]);
+  if (activeRollouts?.bytes > 5 * 1024 ** 3 || activeRollouts?.files > 50) {
+    findings.push({
+      id: "state.active-rollouts",
+      category: "state",
+      status: "warning",
+      tone: "medium",
+      label: "rollouts",
+      value: formatBytesServer(activeRollouts.bytes),
+      summary: `${activeRollouts.files.toLocaleString()} active rollout files are using ${formatBytesServer(activeRollouts.bytes)}.`,
+      remediation: "Run Smart Optimize to move stale active sessions out of active history, then run Speed Check again.",
+      source: "derived",
+    });
+  }
+
+  const sortedFindings = findings
+    .sort((a, b) => {
+      const rank = { high: 3, medium: 2, low: 1 };
+      return (rank[b.tone] || 0) - (rank[a.tone] || 0);
+    })
+    .slice(0, 8);
+
+  return {
+    status: report?.overallStatus || meta.status || "unknown",
+    tone: doctorTone(report?.overallStatus || meta.status),
+    codexVersion: report?.codexVersion || null,
+    generatedAt: parseDoctorGeneratedAt(report?.generatedAt) || new Date().toISOString(),
+    command: meta.command || "codex doctor --json",
+    exitCode: meta.exitCode ?? null,
+    durationMs: meta.durationMs || 0,
+    counts,
+    findings: sortedFindings,
+    headline: sortedFindings.length
+      ? `${sortedFindings.length.toLocaleString()} Doctor finding${sortedFindings.length === 1 ? "" : "s"} need attention.`
+      : "Official Codex Doctor did not find blocking issues.",
+  };
+}
+
+async function runOfficialDoctor() {
+  const cliPath = (await whichCommand("codex")) || ((await exists(codexAppCli)) ? codexAppCli : null);
+  if (!cliPath) throw new Error("No Codex CLI was found on PATH or in /Applications/Codex.app.");
+
+  const startedAt = performance.now();
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+  try {
+    const result = await execFileAsync(cliPath, ["doctor", "--json"], {
+      cwd: rootDir,
+      timeout: 45000,
+      maxBuffer: 2 * 1024 * 1024,
+      env: {
+        ...process.env,
+        NO_COLOR: "1",
+      },
+    });
+    stdout = result.stdout || "";
+    stderr = result.stderr || "";
+  } catch (error) {
+    stdout = error.stdout || "";
+    stderr = error.stderr || "";
+    exitCode = Number.isInteger(error.code) ? error.code : 1;
+    if (!stdout.trim()) throw new Error(`Codex Doctor failed: ${readFirstLine(stderr) || error.message}`);
+  }
+
+  let report;
+  try {
+    report = JSON.parse(stdout);
+  } catch {
+    throw new Error(`Codex Doctor returned non-JSON output: ${readFirstLine(stdout || stderr) || "empty output"}`);
+  }
+
+  return buildOfficialDoctorSummary(report, {
+    command: `${cliPath} doctor --json`,
+    exitCode,
+    durationMs: Math.round(performance.now() - startedAt),
+  });
+}
+
 function cutoffMs(days) {
   return Date.now() - days * 24 * 60 * 60 * 1000;
 }
@@ -3769,6 +3943,11 @@ async function handleRequest(req, res) {
 
     if (req.method === "POST" && url.pathname === "/api/benchmark") {
       sendJson(res, 200, await runBenchmark());
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/official-doctor") {
+      sendJson(res, 200, await runOfficialDoctor());
       return;
     }
 

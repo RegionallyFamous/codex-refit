@@ -53,6 +53,8 @@ const elements = {
   doctorConfig: $("#doctorConfig"),
   doctorWorkflow: $("#doctorWorkflow"),
   doctorFixKit: $("#doctorFixKit"),
+  runOfficialDoctor: $("#runOfficialDoctor"),
+  officialDoctor: $("#officialDoctor"),
   refitOutcome: $("#refitOutcome"),
   refitOutcomeTitle: $("#refitOutcomeTitle"),
   refitOutcomeActive: $("#refitOutcomeActive"),
@@ -315,6 +317,8 @@ function setBusy(nextBusy, label = "Working") {
   });
   if (busy) {
     elements.lastScan.textContent = label;
+  } else if (currentScan?.generatedAt) {
+    elements.lastScan.textContent = `Scanned ${formatDate(currentScan.generatedAt)}`;
   }
 }
 
@@ -495,6 +499,43 @@ function renderCodexDoctor(doctor) {
           .join("")
       : `<article><span>Fix Kit</span><strong>Waiting</strong><small>Run a scan to build next steps.</small></article>`;
   }
+}
+
+function renderOfficialDoctor(report) {
+  if (!elements.officialDoctor) return;
+  elements.officialDoctor.hidden = false;
+  const counts = report.counts || {};
+  const findings = report.findings || [];
+  const issueCount = findings.length;
+  const countLine = `${counts.ok || 0} ok / ${counts.warning || 0} warn / ${counts.fail || 0} fail`;
+  elements.officialDoctor.innerHTML = `
+    <article class="${escapeHtml(report.tone || "low")}">
+      <span>Official Doctor</span>
+      <strong>${escapeHtml(report.status || "unknown")}</strong>
+      <small>${escapeHtml(report.codexVersion ? `Codex ${report.codexVersion} • ${countLine}` : countLine)}</small>
+    </article>
+    <article>
+      <span>Last Run</span>
+      <strong>${escapeHtml(formatDate(report.generatedAt))}</strong>
+      <small>${escapeHtml(`${Math.round(Number(report.durationMs || 0) / 1000)}s • ${report.command || "codex doctor --json"}`)}</small>
+    </article>
+    ${
+      issueCount
+        ? findings
+            .slice(0, 4)
+            .map(
+              (finding) => `
+                <article class="${escapeHtml(finding.tone || "medium")}" title="${escapeHtml(finding.remediation || "")}">
+                  <span>${escapeHtml(finding.label || finding.category || "Finding")}</span>
+                  <strong>${escapeHtml(finding.value || finding.status || "--")}</strong>
+                  <small>${escapeHtml(finding.summary || finding.remediation || "Codex Doctor found something to inspect.")}</small>
+                </article>
+              `,
+            )
+            .join("")
+        : `<article class="low"><span>Findings</span><strong>Clear</strong><small>${escapeHtml(report.headline || "No official Doctor findings need attention.")}</small></article>`
+    }
+  `;
 }
 
 function renderScan(scan) {
@@ -968,6 +1009,32 @@ async function copyDoctorSnippet(button) {
   }
 }
 
+async function runOfficialDoctor() {
+  if (busy) return;
+  setBusy(true, "Official Codex Doctor running");
+  if (elements.runOfficialDoctor) elements.runOfficialDoctor.textContent = "Running";
+  try {
+    const result = await api("/api/official-doctor", { method: "POST" });
+    renderOfficialDoctor(result);
+    logOperation("Official Doctor", result.headline || "Codex Doctor finished.", result.tone === "high" ? "danger" : "info");
+  } catch (error) {
+    logOperation("Official Doctor", error.message, "danger");
+    if (elements.officialDoctor) {
+      elements.officialDoctor.hidden = false;
+      elements.officialDoctor.innerHTML = `
+        <article class="high">
+          <span>Official Doctor</span>
+          <strong>Failed</strong>
+          <small>${escapeHtml(error.message)}</small>
+        </article>
+      `;
+    }
+  } finally {
+    if (elements.runOfficialDoctor) elements.runOfficialDoctor.textContent = "Run Official Doctor";
+    setBusy(false);
+  }
+}
+
 elements.refreshScan.addEventListener("click", refreshScan);
 elements.safeSweep.addEventListener("click", () =>
   runAction("safeSweep", {
@@ -988,6 +1055,7 @@ $("#safeSweepDays")?.addEventListener("change", refreshScan);
 elements.archiveDeleteDays?.addEventListener("change", refreshScan);
 elements.clearLog.addEventListener("click", () => elements.operationLog.replaceChildren());
 elements.runBenchmark?.addEventListener("click", () => runBenchmark());
+elements.runOfficialDoctor?.addEventListener("click", runOfficialDoctor);
 elements.refreshRecovery?.addEventListener("click", () => refreshRecovery({ log: true }));
 elements.easyModeButton?.addEventListener("click", () => setHardMode(false));
 elements.hardModeButton?.addEventListener("click", () => setHardMode(true));
