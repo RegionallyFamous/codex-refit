@@ -260,6 +260,74 @@ function extractTrustedProjectPaths(sections, values) {
     .filter(Boolean);
 }
 
+function buildProfileHealthSummary(profiles = {}) {
+  const profileSummaries = profiles.profileSummaries || [];
+  const brokenProfiles = profileSummaries.filter((profile) => profile.error);
+  const weakFastProfiles = profileSummaries.filter((profile) => profile.weakFastProfile);
+  const slowFastProfiles = profileSummaries.filter((profile) => profile.slowFastProfile);
+  const explicitFastProfiles = profileSummaries.filter((profile) => profile.fastTask);
+  const highEffortProfiles = profileSummaries.filter((profile) => profile.highEffort && !profile.error);
+  const tone = brokenProfiles.length || slowFastProfiles.length ? "high" : weakFastProfiles.length ? "medium" : "low";
+  const label = brokenProfiles.length
+    ? `${brokenProfiles.length.toLocaleString()} broken`
+    : slowFastProfiles.length
+      ? `${slowFastProfiles.length.toLocaleString()} slow fast`
+      : weakFastProfiles.length
+        ? `${weakFastProfiles.length.toLocaleString()} weak`
+        : explicitFastProfiles.length
+          ? `${explicitFastProfiles.length.toLocaleString()} ready`
+          : profiles.profileCount
+            ? `${Number(profiles.profileCount).toLocaleString()} profile${profiles.profileCount === 1 ? "" : "s"}`
+            : "No profiles";
+  const action = brokenProfiles.length
+    ? "Fix profile files"
+    : slowFastProfiles.length
+      ? "Retune fast profiles"
+      : weakFastProfiles.length
+        ? "Add speed settings"
+        : explicitFastProfiles.length
+          ? "Use --profile"
+          : "Create speed profile";
+  const detail =
+    tone === "low"
+      ? explicitFastProfiles.length
+        ? `Speed profile${explicitFastProfiles.length === 1 ? "" : "s"} with explicit fast settings found: ${explicitFastProfiles
+            .map((profile) => profile.name)
+            .slice(0, 3)
+            .join(", ")}.`
+        : "No broken or misleading profile files were found."
+      : [
+          brokenProfiles.length
+            ? `${brokenProfiles.length.toLocaleString()} profile file${brokenProfiles.length === 1 ? "" : "s"} could not be read.`
+            : null,
+          slowFastProfiles.length
+            ? `${slowFastProfiles.length.toLocaleString()} speed-named profile${slowFastProfiles.length === 1 ? " uses" : "s use"} high reasoning.`
+            : null,
+          weakFastProfiles.length
+            ? `${weakFastProfiles.length.toLocaleString()} speed-named profile${weakFastProfiles.length === 1 ? " lacks" : "s lack"} explicit mini, Spark, low reasoning, Fast Mode, low verbosity, or lean summary settings.`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    brokenProfileCount: brokenProfiles.length,
+    weakFastProfileCount: weakFastProfiles.length,
+    slowFastProfileCount: slowFastProfiles.length,
+    explicitFastProfileCount: explicitFastProfiles.length,
+    highEffortProfileCount: highEffortProfiles.length,
+    brokenProfileNames: brokenProfiles.map((profile) => profile.name),
+    weakFastProfileNames: weakFastProfiles.map((profile) => profile.name),
+    slowFastProfileNames: slowFastProfiles.map((profile) => profile.name),
+    explicitFastProfileNames: explicitFastProfiles.map((profile) => profile.name),
+  };
+}
+
 async function getCodexProfileSummaries() {
   const empty = {
     profileCount: 0,
@@ -272,6 +340,12 @@ async function getCodexProfileSummaries() {
     miniProfileNames: [],
     hasDeepWorkProfile: false,
     deepWorkProfileNames: [],
+    brokenProfileCount: 0,
+    weakFastProfileCount: 0,
+    slowFastProfileCount: 0,
+    explicitFastProfileCount: 0,
+    highEffortProfileCount: 0,
+    profileHealth: buildProfileHealthSummary({ profileSummaries: [] }),
   };
 
   try {
@@ -294,9 +368,12 @@ async function getCodexProfileSummaries() {
             const reasoningEffort = values.model_reasoning_effort || values.reasoning_effort || null;
             const serviceTier = values.service_tier || null;
             const verbosity = values.model_verbosity || null;
+            const reasoningSummary = values.model_reasoning_summary || null;
             const normalizedName = name.toLowerCase();
             const normalizedModel = String(model || "").toLowerCase();
             const normalizedEffort = String(reasoningEffort || "").toLowerCase().replaceAll("_", "-");
+            const normalizedVerbosity = normalizeConfigKey(verbosity);
+            const normalizedSummary = normalizeConfigKey(reasoningSummary);
             const isHighEffort = ["high", "xhigh", "extra-high"].includes(normalizedEffort);
             const isLowEffort = ["low", "minimal", "none"].includes(normalizedEffort);
             const nameLooksFast = /fast|speed|quick|small|mini|spark|light|lite/.test(normalizedName);
@@ -304,7 +381,12 @@ async function getCodexProfileSummaries() {
             const mini = normalizedModel.includes("mini");
             const spark = normalizedModel.includes("spark");
             const fastMode = serviceTier === "fast" && values["features.fast_mode"] !== false;
-            const fastTask = spark || mini || fastMode || (nameLooksFast && !isHighEffort) || (isLowEffort && !nameLooksDeep);
+            const lowVerbosity = normalizedVerbosity === "low";
+            const leanSummary = ["none", "concise"].includes(normalizedSummary);
+            const explicitFastTask = spark || mini || fastMode || isLowEffort || lowVerbosity || leanSummary;
+            const slowFastProfile = nameLooksFast && isHighEffort;
+            const weakFastProfile = nameLooksFast && !explicitFastTask && !isHighEffort;
+            const fastTask = explicitFastTask && !isHighEffort && !nameLooksDeep;
             const deepWork = nameLooksDeep || (normalizedModel === "gpt-5.5" && isHighEffort);
 
             return {
@@ -314,10 +396,20 @@ async function getCodexProfileSummaries() {
               reasoningEffort,
               serviceTier,
               verbosity,
+              reasoningSummary,
               fastTask,
               deepWork,
               spark,
               mini,
+              fastMode,
+              lowEffort: isLowEffort,
+              highEffort: isHighEffort,
+              lowVerbosity,
+              leanSummary,
+              nameLooksFast,
+              explicitFastTask,
+              weakFastProfile,
+              slowFastProfile,
             };
           } catch (error) {
             return {
@@ -328,11 +420,16 @@ async function getCodexProfileSummaries() {
               deepWork: false,
               spark: false,
               mini: false,
+              nameLooksFast: /fast|speed|quick|small|mini|spark|light|lite/.test(name.toLowerCase()),
+              explicitFastTask: false,
+              weakFastProfile: false,
+              slowFastProfile: false,
             };
           }
         }),
       )
     ).filter(Boolean);
+    const profileHealth = buildProfileHealthSummary({ profileSummaries, profileCount: profileSummaries.length });
 
     return {
       profileCount: profileSummaries.length,
@@ -345,6 +442,12 @@ async function getCodexProfileSummaries() {
       miniProfileNames: profileSummaries.filter((profile) => profile.mini).map((profile) => profile.name),
       hasDeepWorkProfile: profileSummaries.some((profile) => profile.deepWork),
       deepWorkProfileNames: profileSummaries.filter((profile) => profile.deepWork).map((profile) => profile.name),
+      brokenProfileCount: profileHealth.brokenProfileCount,
+      weakFastProfileCount: profileHealth.weakFastProfileCount,
+      slowFastProfileCount: profileHealth.slowFastProfileCount,
+      explicitFastProfileCount: profileHealth.explicitFastProfileCount,
+      highEffortProfileCount: profileHealth.highEffortProfileCount,
+      profileHealth,
     };
   } catch {
     return empty;
@@ -5318,6 +5421,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const managedConfig = codexConfig?.managedConfig || emptyManagedConfigSummary();
   const commandRules = codexConfig?.commandRules || emptyCommandRuleSummary(codexConfig?.rulesFeature !== false);
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
+  const profileHealth = codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
   const currentLocalEnvironment = currentProject?.localEnvironment || null;
@@ -5873,6 +5977,40 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (profileHealth.status === "ready" && profileHealth.tone !== "low") {
+    const flaggedNames = [
+      ...(profileHealth.brokenProfileNames || []),
+      ...(profileHealth.slowFastProfileNames || []),
+      ...(profileHealth.weakFastProfileNames || []),
+    ];
+    addFix({
+      id: "profile-health",
+      label: "Profile Health",
+      value: profileHealth.label,
+      tone: profileHealth.tone,
+      action: profileHealth.action,
+      detail:
+        "Named profiles only help speed when their settings actually choose a faster model, lower reasoning, Fast Mode, or a leaner response shape.",
+      snippet: [
+        "# Check these profile files:",
+        ...(flaggedNames.length
+          ? flaggedNames.slice(0, 6).map((name) => `# ~/.codex/${name}.config.toml`)
+          : ["# ~/.codex/speed.config.toml"]),
+        "",
+        "# A reliable quick-task profile:",
+        'model = "gpt-5.4-mini"',
+        'model_reasoning_effort = "low"',
+        'model_verbosity = "low"',
+        'model_reasoning_summary = "concise"',
+        "",
+        "# Optional after /fast status confirms access:",
+        '# service_tier = "fast"',
+        "# [features]",
+        "# fast_mode = true",
+      ].join("\n"),
+    });
+  }
+
   if (
     currentProject &&
     (!currentProject.hasAgents ||
@@ -6042,6 +6180,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const managedConfig = codexConfig?.managedConfig || emptyManagedConfigSummary();
   const commandRules = codexConfig?.commandRules || emptyCommandRuleSummary(codexConfig?.rulesFeature !== false);
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
+  const profileHealth = codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
   const displayTier = codexConfig?.serviceTier || desktopTier || "standard";
@@ -6396,6 +6535,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         : "Reasoning effort is not set high. Keep using gpt-5.5 for complex work, and mini or Spark profiles for quick iteration when available.",
     },
     {
+      id: "profile-health",
+      label: "Profile Health",
+      value: profileHealth.label,
+      tone: profileHealth.tone,
+      action: profileHealth.action,
+      priority: profileHealth.tone === "high" ? 83 : profileHealth.tone === "medium" ? 61 : 24,
+      detail: profileHealth.detail,
+    },
+    {
       id: "fast-default",
       label: "Fast Default",
       value: fastMode ? "Fast" : fastModeFeature ? displayTier : "Feature off",
@@ -6727,6 +6875,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: "medium",
       priority: 76,
       detail: "Your default is tuned for deep work. Add a named speed profile so small tasks can start with mini/low settings on purpose.",
+    });
+  }
+
+  if (profileHealth.status === "ready" && profileHealth.tone !== "low") {
+    addRecommendation({
+      id: "profile-health",
+      label: "Profile Health",
+      value: profileHealth.label,
+      action: profileHealth.action,
+      tone: profileHealth.tone,
+      priority: profileHealth.tone === "high" ? 84 : 62,
+      detail: profileHealth.detail,
     });
   }
 
@@ -7180,6 +7340,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     authCache,
     projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
+    profileHealth,
     hasFastTaskProfile,
     fastTaskProfileNames,
     hasSparkProfile,
@@ -7619,6 +7780,9 @@ function benchmarkLiveScore(metrics) {
   if (metrics.modelXHighEffort) score -= metrics.hasFastTaskProfile ? 3 : 6;
   else if (metrics.modelHighEffort) score -= metrics.hasFastTaskProfile ? 2 : 4;
   if (metrics.modelDeepDefault && !metrics.hasFastTaskProfile) score -= 2;
+  score -= Math.min(7, Number(metrics.profileBrokenCount || 0) * 4);
+  score -= Math.min(5, Number(metrics.profileSlowFastCount || 0) * 3);
+  score -= Math.min(4, Number(metrics.profileWeakFastCount || 0) * 2);
   score -= Math.min(8, Math.max(0, Number(metrics.agentMaxDepth || 1) - 1) * 4);
   score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
   score -= Math.min(8, Number(metrics.customAgentInvalidCount || 0) * 4);
@@ -7725,6 +7889,13 @@ function benchmarkGuidance(metrics) {
     guidance.push("Your default reasoning is high. Keep it for deep work, but add a mini/low speed profile for quick scoped runs.");
   } else if (metrics.modelHighEffort) {
     guidance.push("Use your speed profile for quick tasks so high-reasoning defaults stay reserved for deep work.");
+  }
+  if (metrics.profileBrokenCount > 0) {
+    guidance.push(`Fix ${Number(metrics.profileBrokenCount).toLocaleString()} unreadable profile file${metrics.profileBrokenCount === 1 ? "" : "s"} before trusting profile-based speed advice.`);
+  } else if (metrics.profileSlowFastCount > 0) {
+    guidance.push(`Retune ${Number(metrics.profileSlowFastCount).toLocaleString()} speed-named profile${metrics.profileSlowFastCount === 1 ? "" : "s"} that still use high reasoning.`);
+  } else if (metrics.profileWeakFastCount > 0) {
+    guidance.push(`Add explicit mini, Spark, low reasoning, Fast Mode, low verbosity, or lean summary settings to ${Number(metrics.profileWeakFastCount).toLocaleString()} speed-named profile${metrics.profileWeakFastCount === 1 ? "" : "s"}.`);
   }
   if (metrics.agentMaxDepth > 1) {
     guidance.push(
@@ -7909,7 +8080,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v7",
+    scoreModel: "local-state-v8",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -8528,6 +8699,11 @@ function benchmarkDeltas(current, previous) {
     "hasMiniProfile",
     "hasSparkProfile",
     "hasDeepWorkProfile",
+    "profileBrokenCount",
+    "profileWeakFastCount",
+    "profileSlowFastCount",
+    "profileExplicitFastCount",
+    "profileHighEffortCount",
     "agentMaxThreads",
     "agentMaxDepth",
     "customAgentCount",
@@ -8639,6 +8815,12 @@ function summarizeBenchmarkEntry(entry) {
     hasMiniProfile: Boolean(entry.metrics.hasMiniProfile),
     hasSparkProfile: Boolean(entry.metrics.hasSparkProfile),
     hasDeepWorkProfile: Boolean(entry.metrics.hasDeepWorkProfile),
+    profileHealthTone: entry.metrics.profileHealthTone || "low",
+    profileBrokenCount: entry.metrics.profileBrokenCount || 0,
+    profileWeakFastCount: entry.metrics.profileWeakFastCount || 0,
+    profileSlowFastCount: entry.metrics.profileSlowFastCount || 0,
+    profileExplicitFastCount: entry.metrics.profileExplicitFastCount || 0,
+    profileHighEffortCount: entry.metrics.profileHighEffortCount || 0,
     agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
     agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
     customAgentCount: entry.metrics.customAgentCount || 0,
@@ -8828,6 +9010,11 @@ export async function benchmarkHistory(limit = 12) {
         hasMiniProfile: Number(latest.hasMiniProfile) - Number(oldest.hasMiniProfile),
         hasSparkProfile: Number(latest.hasSparkProfile) - Number(oldest.hasSparkProfile),
         hasDeepWorkProfile: Number(latest.hasDeepWorkProfile) - Number(oldest.hasDeepWorkProfile),
+        profileBrokenCount: latest.profileBrokenCount - oldest.profileBrokenCount,
+        profileWeakFastCount: latest.profileWeakFastCount - oldest.profileWeakFastCount,
+        profileSlowFastCount: latest.profileSlowFastCount - oldest.profileSlowFastCount,
+        profileExplicitFastCount: latest.profileExplicitFastCount - oldest.profileExplicitFastCount,
+        profileHighEffortCount: latest.profileHighEffortCount - oldest.profileHighEffortCount,
         mcpEnabledCount: latest.mcpEnabledCount - oldest.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - oldest.mcpRequiredCount,
         mcpMissingEnvVarCount: latest.mcpMissingEnvVarCount - oldest.mcpMissingEnvVarCount,
@@ -8894,6 +9081,11 @@ export async function benchmarkHistory(limit = 12) {
         hasMiniProfile: Number(latest.hasMiniProfile) - Number(previous.hasMiniProfile),
         hasSparkProfile: Number(latest.hasSparkProfile) - Number(previous.hasSparkProfile),
         hasDeepWorkProfile: Number(latest.hasDeepWorkProfile) - Number(previous.hasDeepWorkProfile),
+        profileBrokenCount: latest.profileBrokenCount - previous.profileBrokenCount,
+        profileWeakFastCount: latest.profileWeakFastCount - previous.profileWeakFastCount,
+        profileSlowFastCount: latest.profileSlowFastCount - previous.profileSlowFastCount,
+        profileExplicitFastCount: latest.profileExplicitFastCount - previous.profileExplicitFastCount,
+        profileHighEffortCount: latest.profileHighEffortCount - previous.profileHighEffortCount,
         mcpEnabledCount: latest.mcpEnabledCount - previous.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
         customAgentCount: latest.customAgentCount - previous.customAgentCount,
@@ -8982,6 +9174,7 @@ export async function runBenchmark() {
   const localEnvironment = currentProject?.localEnvironment || emptyLocalEnvironmentSummary({ hasCodexDir: Boolean(currentProject?.hasCodexDir) });
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
+  const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
   const modelEffort = scan.codexConfig?.reasoningEffort || "default";
@@ -8994,7 +9187,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v7",
+    scoreModel: "local-state-v8",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -9035,6 +9228,12 @@ export async function runBenchmark() {
     hasMiniProfile: Boolean(scan.codexConfig?.hasMiniProfile),
     hasSparkProfile: Boolean(scan.codexConfig?.hasSparkProfile),
     hasDeepWorkProfile: Boolean(scan.codexConfig?.hasDeepWorkProfile),
+    profileHealthTone: profileHealth.tone || "low",
+    profileBrokenCount: profileHealth.brokenProfileCount || 0,
+    profileWeakFastCount: profileHealth.weakFastProfileCount || 0,
+    profileSlowFastCount: profileHealth.slowFastProfileCount || 0,
+    profileExplicitFastCount: profileHealth.explicitFastProfileCount || 0,
+    profileHighEffortCount: profileHealth.highEffortProfileCount || 0,
     agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
     agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
     customAgentCount: scan.codexConfig?.customAgents?.agentCount || 0,
