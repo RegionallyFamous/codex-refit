@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Codex Refit keeps local Codex data quick by moving stale sessions out of active folders and compacting local databases."
+    />
+    <title>Codex Refit</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span>
+            <i></i>
+          </div>
+          <div>
+            <p class="eyebrow">Local Codex Care</p>
+            <h1>Codex Refit</h1>
+            <div class="status-strip" aria-label="Maintenance status">
+              <span>Local Only</span>
+              <span>Backup Ready</span>
+              <span id="modeStatus">Easy Mode</span>
+              <span id="preflightStatus"><span id="preflightLabel">Checking</span></span>
+            </div>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <label class="mode-switch">
+            <input id="advancedMode" type="checkbox" />
+            <span>Easy</span>
+            <span>Hard</span>
+          </label>
+          <span id="lastScan" class="scan-stamp">Not scanned</span>
+          <button id="refreshScan" class="primary" type="button">Rescan</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="summary-grid" aria-label="Current Codex storage">
+          <article class="metric">
+            <span>Codex Storage</span>
+            <strong id="totalCodexState">--</strong>
+            <small id="totalCodexHint">Scanning local files</small>
+          </article>
+          <article class="metric">
+            <span>Active Sessions</span>
+            <strong id="activeSessionSize">--</strong>
+            <small id="activeSessionHint">--</small>
+          </article>
+          <article class="metric">
+            <span>Logs</span>
+            <strong id="logDbSize">--</strong>
+            <small id="logDbHint">--</small>
+          </article>
+          <article class="metric accent">
+            <span>Safe Relief</span>
+            <strong id="likelyReclaim">--</strong>
+            <small id="likelyReclaimHint">Moves and safe cleanup first</small>
+          </article>
+        </section>
+
+        <section class="command-grid">
+          <article class="action-band">
+            <div>
+              <p class="eyebrow">Recommended</p>
+              <h2>Smart Optimize</h2>
+              <p id="smartPlanSummary" class="panel-note">
+                Chooses the safest useful cleanup from the current scan.
+              </p>
+              <div id="smartDecision" class="decision-panel" aria-live="polite">
+                <div>
+                  <span id="smartDecisionMode">Suggested: Safe</span>
+                  <strong id="smartDecisionHeadline">Finding local slowdown</strong>
+                </div>
+                <small id="smartDecisionReason">Codex Refit will pick the safest helpful steps.</small>
+              </div>
+              <div id="smartDiagnosis" class="diagnosis-strip" aria-live="polite">
+                <span>
+                  <small>Main Drag</small>
+                  <strong id="diagnosisCause">Scanning</strong>
+                </span>
+                <span>
+                  <small>Confidence</small>
+                  <strong id="diagnosisConfidence">--</strong>
+                </span>
+                <span>
+                  <small>Best Next Step</small>
+                  <strong id="diagnosisAction">Waiting</strong>
+                </span>
+              </div>
+              <div id="smartImpact" class="smart-impact" aria-live="polite">
+                <span>Active folder --</span>
+                <span>Logs --</span>
+                <span>Deletes off</span>
+              </div>
+              <div class="policy-control" aria-label="Smart Optimize policy" hidden>
+                <label>
+                  <input name="optimizePolicy" type="radio" value="auto" checked />
+                  <span>Auto</span>
+                </label>
+                <label>
+                  <input name="optimizePolicy" type="radio" value="safe" />
+                  <span>Safe</span>
+                </label>
+                <label>
+                  <input name="optimizePolicy" type="radio" value="reclaim" />
+                  <span>Recover Space</span>
+                </label>
+                <label>
+                  <input name="optimizePolicy" type="radio" value="max" />
+                  <span>Full Pass</span>
+                </label>
+              </div>
+              <div id="smartPlan" class="smart-plan" aria-live="polite">
+                <span>Planning safe cleanup</span>
+              </div>
+            </div>
+            <div id="boostRing" class="boost-ring" style="--boost: 0deg" aria-label="Easy win ratio">
+              <strong id="boostRingValue">0%</strong>
+              <span id="boostRingLabel">ready</span>
+            </div>
+            <div class="boost-controls">
+              <label hidden>
+                Stale after
+                <input id="safeSweepDays" type="number" min="1" max="90" value="5" />
+                days
+              </label>
+              <label id="archiveDeleteControl" class="reclaim-age" hidden>
+                Archived older than
+                <input id="archiveDeleteDays" type="number" min="1" max="3650" value="30" />
+                days
+              </label>
+              <label id="smartDeleteArmControl" class="smart-delete-arm" hidden>
+                <input id="smartDeleteArm" type="checkbox" />
+                <span id="smartDeleteArmLabel">Keep Archived</span>
+                <small id="smartDeleteArmMeta">Deletes off</small>
+              </label>
+              <button id="safeSweep" class="primary strong" type="button">Smart Optimize</button>
+              <small id="smartMoveHint" class="smart-move-hint">Waiting for scan</small>
+            </div>
+          </article>
+
+          <article class="benchmark-card">
+            <div>
+              <p class="eyebrow">Benchmark</p>
+              <h2>Speed Check</h2>
+            </div>
+            <div class="benchmark-score">
+              <strong id="benchmarkScore">--</strong>
+              <span id="benchmarkRating">Local</span>
+            </div>
+            <p id="benchmarkMeaning" class="benchmark-meaning">Waiting for a local speed check.</p>
+            <div class="benchmark-grid" aria-label="Benchmark details">
+              <span>Scan</span>
+              <strong id="benchmarkScan">--</strong>
+              <span>State DB</span>
+              <strong id="benchmarkState">--</strong>
+              <span>Delta</span>
+              <strong id="benchmarkDelta">--</strong>
+            </div>
+            <div id="benchmarkGuidance" class="benchmark-guidance" aria-live="polite">
+              <span>Run a check to see where local Codex state is adding drag.</span>
+            </div>
+            <button id="runBenchmark" type="button">Run Check</button>
+          </article>
+        </section>
+
+        <section class="doctor-panel" aria-label="Codex Doctor">
+          <header>
+            <div>
+              <p class="eyebrow">Codex Doctor</p>
+              <h2>Speed Advice</h2>
+            </div>
+            <small id="doctorSource">Reading local state and Codex settings</small>
+          </header>
+          <p id="doctorHeadline" class="doctor-headline">Waiting for scan.</p>
+          <div id="doctorQueue" class="doctor-queue" aria-live="polite">
+            <article>
+              <span>Next Move</span>
+              <strong>Scanning</strong>
+              <small>Ranking Codex speed wins.</small>
+            </article>
+          </div>
+          <div id="doctorList" class="doctor-list" aria-live="polite">
+            <article>
+              <span>Local State</span>
+              <strong>Scanning</strong>
+              <small>Checking sessions, logs, images, and caches.</small>
+            </article>
+          </div>
+          <div id="doctorProfiles" class="doctor-profiles" aria-live="polite">
+            <article>
+              <span>Speed Profile</span>
+              <strong>Reading settings</strong>
+              <small>Matching Codex setup to task size.</small>
+            </article>
+          </div>
+          <div id="doctorConfig" class="doctor-config" aria-live="polite">
+            <article>
+              <span>Config</span>
+              <strong>Reading file</strong>
+              <small>Checking durable speed settings.</small>
+            </article>
+          </div>
+          <div id="doctorWorkflow" class="doctor-workflow" aria-live="polite">
+            <article>
+              <span>Workflow</span>
+              <strong>Reading setup</strong>
+              <small>Checking concurrency and tool surface.</small>
+            </article>
+          </div>
+        </section>
+
+        <section id="refitOutcome" class="outcome-strip" aria-live="polite" hidden>
+          <div>
+            <p class="eyebrow">Last Refit</p>
+            <strong id="refitOutcomeTitle">No refit has run yet</strong>
+          </div>
+          <div class="outcome-grid" aria-label="Last refit outcome">
+            <span>
+              <small>Active Folder</small>
+              <strong id="refitOutcomeActive">--</strong>
+            </span>
+            <span>
+              <small>Logs</small>
+              <strong id="refitOutcomeLogs">--</strong>
+            </span>
+            <span>
+              <small>Stale Threads</small>
+              <strong id="refitOutcomeThreads">--</strong>
+            </span>
+            <span>
+              <small>Score</small>
+              <strong id="refitOutcomeScore">After check --</strong>
+            </span>
+          </div>
+        </section>
+
+        <div id="advancedDeck" class="advanced-deck" hidden>
+          <section class="panel advanced-console">
+            <header class="panel-head">
+              <div>
+                <p class="eyebrow">Advanced</p>
+                <h2>Manual Controls</h2>
+              </div>
+              <label class="arm-switch">
+                <input id="destructiveArm" type="checkbox" />
+                <span id="destructiveArmLabel">Deletes Off</span>
+              </label>
+            </header>
+            <div class="advanced-note">
+              <span>Choose actions yourself</span>
+              <span>Deletes stay locked until you allow them</span>
+              <span>Database steps make a backup first</span>
+            </div>
+          </section>
+
+          <section class="panel recovery-panel">
+            <header class="panel-head">
+              <div>
+                <p class="eyebrow">Recovery</p>
+                <h2>Backups</h2>
+              </div>
+              <button id="refreshRecovery" type="button">Refresh</button>
+            </header>
+            <div class="recovery-summary" aria-label="Recovery summary">
+              <span>
+                <small>Bundles</small>
+                <strong id="recoveryBackupCount">--</strong>
+              </span>
+              <span>
+                <small>Total</small>
+                <strong id="recoveryBackupSize">--</strong>
+              </span>
+              <span>
+                <small>Latest</small>
+                <strong id="recoveryLatestBackup">--</strong>
+              </span>
+            </div>
+            <div class="recovery-grid">
+              <div>
+                <strong>Latest Backups</strong>
+                <div id="recoveryBackupList" class="recovery-list" aria-live="polite">
+                  <span>Waiting for backup scan.</span>
+                </div>
+              </div>
+              <div>
+                <strong>Recent Runs</strong>
+                <div id="recoveryHistoryList" class="recovery-list" aria-live="polite">
+                  <span>Waiting for run history.</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="two-column">
+            <article class="panel">
+              <header class="panel-head">
+                <div>
+                  <p class="eyebrow">Storage</p>
+                  <h2>Storage Map</h2>
+                </div>
+              </header>
+              <div id="targetList" class="target-list" aria-live="polite"></div>
+            </article>
+
+            <article class="panel">
+              <header class="panel-head">
+                <div>
+                  <p class="eyebrow">Conversations</p>
+                  <h2>Thread Cleanup</h2>
+                </div>
+              </header>
+              <div class="control-list">
+                <div class="control-row">
+                  <div>
+                    <strong>Archive stale active threads</strong>
+                    <span id="staleThreadHint">--</span>
+                  </div>
+                  <label>
+                    <input id="archiveDays" type="number" min="1" max="365" value="5" />
+                    days
+                  </label>
+                  <button data-action="archiveStaleThreads" type="button">Archive</button>
+                </div>
+                <div class="control-row">
+                  <div>
+                    <strong>Move archived transcripts out of active sessions</strong>
+                    <span id="migrateHint">--</span>
+                  </div>
+                  <button data-action="migrateArchivedSessions" type="button">Move</button>
+                </div>
+                <div class="control-row danger-row">
+                  <div>
+                    <strong>Delete old archived conversations</strong>
+                    <span>Only archived conversations older than the cutoff can be removed.</span>
+                  </div>
+                  <label>
+                    <input id="deleteArchivedDays" type="number" min="1" max="3650" value="30" />
+                    days
+                  </label>
+                  <button data-action="deleteArchivedTranscripts" data-confirm="DELETE" type="button">
+                    Delete
+                  </button>
+                </div>
+              </div>
+            </article>
+          </section>
+
+          <section class="two-column">
+            <article class="panel">
+              <header class="panel-head">
+                <div>
+                  <p class="eyebrow">Database</p>
+                  <h2>Logs</h2>
+                </div>
+              </header>
+              <div class="control-list">
+                <div class="control-row">
+                  <div>
+                    <strong>Prune old logs</strong>
+                    <span id="logHint">Keeps recent logs, checkpoints the WAL, then compacts the database.</span>
+                  </div>
+                  <label>
+                    <input id="logDays" type="number" min="1" max="365" value="7" />
+                    days
+                  </label>
+                  <label class="check">
+                    <input id="backupLogs" type="checkbox" />
+                    Backup first
+                  </label>
+                  <button data-action="pruneLogs" type="button">Prune</button>
+                </div>
+                <div class="control-row">
+                  <div>
+                    <strong>Compact state database</strong>
+                    <span>Backs up the state database, compacts it, then runs SQLite optimize.</span>
+                  </div>
+                  <button data-action="vacuumState" type="button">Compact</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="panel">
+              <header class="panel-head">
+                <div>
+                  <p class="eyebrow">Files</p>
+                  <h2>Caches and Archives</h2>
+                </div>
+              </header>
+              <div class="control-list">
+                <div class="control-row">
+                  <div>
+                    <strong>Clear crash reports</strong>
+                    <span id="crashHint">--</span>
+                  </div>
+                  <label>
+                    <input id="crashDays" type="number" min="0" max="365" value="0" />
+                    days
+                  </label>
+                  <button data-action="deleteCrashDumps" type="button">Clear</button>
+                </div>
+                <div class="control-row">
+                  <div>
+                    <strong>Clean browser caches</strong>
+                    <span>Clears browser cache folders that Codex can rebuild.</span>
+                  </div>
+                  <button data-action="cleanBrowserCaches" type="button">Clean</button>
+                </div>
+                <div class="control-row danger-row">
+                  <div>
+                    <strong>Delete old Refit backups</strong>
+                    <span id="maintenanceHint">--</span>
+                  </div>
+                  <label>
+                    <input id="maintenanceDays" type="number" min="0" max="3650" value="14" />
+                    days
+                  </label>
+                  <button data-action="deleteMaintenanceArchives" data-confirm="DELETE" type="button">
+                    Delete
+                  </button>
+                </div>
+                <div class="control-row">
+                  <div>
+                    <strong>Move old generated images</strong>
+                    <span id="imageHint">--</span>
+                  </div>
+                  <label>
+                    <input id="imageDays" type="number" min="1" max="3650" value="14" />
+                    days
+                  </label>
+                  <button data-action="archiveGeneratedImages" type="button">
+                    Move
+                  </button>
+                </div>
+              </div>
+            </article>
+          </section>
+
+          <section class="panel">
+            <header class="panel-head">
+              <div>
+                <p class="eyebrow">Hotspots</p>
+                <h2>Largest Local Files</h2>
+              </div>
+            </header>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>File</th>
+                    <th>Size</th>
+                    <th>Modified</th>
+                    <th>Location</th>
+                  </tr>
+                </thead>
+                <tbody id="largestFiles">
+                  <tr>
+                    <td colspan="4">Waiting for scan...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel operations-panel">
+          <header class="panel-head">
+            <div>
+              <p class="eyebrow">Activity</p>
+              <h2>Activity Log</h2>
+            </div>
+            <button id="clearLog" type="button">Clear</button>
+          </header>
+          <div id="operationLog" class="operation-log" aria-live="polite"></div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

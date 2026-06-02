@@ -1,0 +1,19 @@
+{
+  "name": "codex-refit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "menubar": "electron electron/main.mjs",
+    "package:mac": "node scripts/package-mac-app.mjs",
+    "vite": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "start": "node server.mjs"
+  },
+  "devDependencies": {
+    "electron": "^42.3.0",
+    "vite": "^7.2.4"
+  }
+}
