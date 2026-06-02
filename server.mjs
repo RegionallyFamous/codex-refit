@@ -2442,6 +2442,222 @@ async function gitRootFor(startPath) {
   }
 }
 
+function emptyCloudHandoffSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "No project",
+    action: "Use local",
+    detail: "No current Git project was available for cloud handoff checks.",
+    path: null,
+    branch: null,
+    upstream: null,
+    hasGitRepo: false,
+    hasGithubRemote: false,
+    cloudReady: false,
+    projectReady: false,
+    detachedHead: false,
+    dirtyCount: 0,
+    stagedCount: 0,
+    unstagedCount: 0,
+    untrackedCount: 0,
+    conflictedCount: 0,
+    aheadCount: 0,
+    behindCount: 0,
+    remoteCount: 0,
+    githubRemoteCount: 0,
+    remotes: [],
+  };
+}
+
+async function gitOutput(root, args, { timeout = 3500, maxBuffer = 1024 * 1024 } = {}) {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", root, ...args], {
+      timeout,
+      maxBuffer,
+    });
+    return stdout.trim();
+  } catch {
+    return "";
+  }
+}
+
+function parseGitRemoteHost(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const sshMatch = text.match(/^[^@]+@([^:]+):(.+)$/);
+  if (sshMatch) return sshMatch[1];
+  try {
+    return new URL(text).host;
+  } catch {
+    return text.replace(/^https?:\/\//, "").split(/[/:]/)[0] || text;
+  }
+}
+
+function parseGitRemotes(output) {
+  const remotes = [];
+  const seen = new Set();
+  for (const line of String(output || "").split(/\r?\n/)) {
+    const match = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)$/);
+    if (!match || match[3] !== "fetch") continue;
+    const [, name, url] = match;
+    const key = `${name}:${url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const host = parseGitRemoteHost(url);
+    remotes.push({
+      name,
+      host,
+      github: /(^|\.)github\.com$/i.test(host),
+    });
+  }
+  return remotes;
+}
+
+function parseGitStatus(output) {
+  const status = {
+    branch: null,
+    upstream: null,
+    detachedHead: false,
+    stagedCount: 0,
+    unstagedCount: 0,
+    untrackedCount: 0,
+    conflictedCount: 0,
+    aheadCount: 0,
+    behindCount: 0,
+    dirtyCount: 0,
+  };
+
+  for (const line of String(output || "").split(/\r?\n/).filter(Boolean)) {
+    if (line.startsWith("## ")) {
+      const header = line.slice(3);
+      status.detachedHead = /^HEAD\b/.test(header);
+      const branchMatch = header.match(/^(.+?)(?:\.\.\.([^\s]+)|\s|$)/);
+      if (branchMatch) {
+        status.branch = branchMatch[1] === "HEAD" ? null : branchMatch[1];
+        status.upstream = branchMatch[2] || null;
+      }
+      const aheadMatch = header.match(/ahead (\d+)/);
+      const behindMatch = header.match(/behind (\d+)/);
+      status.aheadCount = aheadMatch ? Number(aheadMatch[1]) : 0;
+      status.behindCount = behindMatch ? Number(behindMatch[1]) : 0;
+      continue;
+    }
+
+    const x = line[0] || " ";
+    const y = line[1] || " ";
+    if (x === "?" && y === "?") {
+      status.untrackedCount += 1;
+      status.dirtyCount += 1;
+      continue;
+    }
+    if ((x === "U" || y === "U") || (x === "A" && y === "A") || (x === "D" && y === "D")) {
+      status.conflictedCount += 1;
+    }
+    if (x !== " " && x !== "?") status.stagedCount += 1;
+    if (y !== " " && y !== "?") status.unstagedCount += 1;
+    status.dirtyCount += 1;
+  }
+
+  return status;
+}
+
+async function getCloudHandoffSummary(currentProject = null) {
+  const summary = emptyCloudHandoffSummary();
+  const candidateRoot =
+    currentProject?.exists && currentProject.path
+      ? await gitRootFor(currentProject.path)
+      : (await gitRootFor(process.cwd())) || (await gitRootFor(rootDir));
+  if (!candidateRoot) return summary;
+
+  summary.path = candidateRoot;
+  summary.hasGitRepo = true;
+  summary.projectReady = Boolean(currentProject?.ready);
+
+  const [statusOutput, remoteOutput, branchOutput, upstreamOutput] = await Promise.all([
+    gitOutput(candidateRoot, ["status", "--porcelain=v1", "--branch", "--ahead-behind"]),
+    gitOutput(candidateRoot, ["remote", "-v"]),
+    gitOutput(candidateRoot, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    gitOutput(candidateRoot, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]),
+  ]);
+  const parsedStatus = parseGitStatus(statusOutput);
+  const remotes = parseGitRemotes(remoteOutput);
+  const githubRemoteCount = remotes.filter((remote) => remote.github).length;
+
+  Object.assign(summary, parsedStatus, {
+    branch: parsedStatus.branch || (branchOutput && branchOutput !== "HEAD" ? branchOutput : null),
+    upstream: parsedStatus.upstream || upstreamOutput || null,
+    remotes,
+    remoteCount: remotes.length,
+    githubRemoteCount,
+    hasGithubRemote: githubRemoteCount > 0,
+    detachedHead: parsedStatus.detachedHead || branchOutput === "HEAD",
+  });
+  summary.cloudReady = summary.hasGitRepo && summary.hasGithubRemote && !summary.detachedHead;
+
+  const hasLocalSetup = Boolean(currentProject?.localEnvironment?.hasSetupScript || currentProject?.localEnvironment?.hasActions);
+  const cleanAndPushed = summary.dirtyCount === 0 && summary.aheadCount === 0;
+  const highLoad = !summary.hasGithubRemote || summary.detachedHead || summary.conflictedCount > 0;
+  const mediumLoad =
+    highLoad ||
+    !summary.upstream ||
+    summary.dirtyCount > 0 ||
+    summary.aheadCount > 0 ||
+    summary.behindCount > 0 ||
+    !summary.projectReady ||
+    !hasLocalSetup;
+
+  summary.tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  summary.label = !summary.hasGithubRemote
+    ? "No GitHub remote"
+    : summary.detachedHead
+      ? "Detached HEAD"
+      : !summary.upstream
+        ? "No upstream"
+        : summary.dirtyCount
+          ? `${summary.dirtyCount.toLocaleString()} local change${summary.dirtyCount === 1 ? "" : "s"}`
+          : summary.aheadCount
+            ? `${summary.aheadCount.toLocaleString()} ahead`
+            : cleanAndPushed
+              ? "Cloud ready"
+              : "Review branch";
+  summary.action = !summary.hasGithubRemote
+    ? "Add GitHub remote"
+    : summary.detachedHead
+      ? "Checkout branch"
+      : summary.conflictedCount
+        ? "Resolve conflicts"
+        : !summary.upstream
+          ? "Set upstream"
+        : summary.dirtyCount || summary.aheadCount
+          ? "Push or handoff"
+          : !summary.projectReady || !hasLocalSetup
+            ? "Add cloud setup"
+            : "Offload heavy work";
+  summary.detail = [
+    `Codex cloud threads clone a GitHub-backed repo and can run heavy or parallel work away from the local app.`,
+    summary.branch ? `Current branch is ${summary.branch}.` : "No named branch was detected.",
+    summary.upstream ? `Upstream is ${summary.upstream}.` : "No upstream branch was detected.",
+    summary.hasGithubRemote
+      ? `${summary.githubRemoteCount.toLocaleString()} GitHub remote${summary.githubRemoteCount === 1 ? "" : "s"} found.`
+      : "No GitHub remote was found, so cloud tasks cannot clone this project until a GitHub remote exists.",
+    summary.dirtyCount
+      ? `${summary.dirtyCount.toLocaleString()} local change${summary.dirtyCount === 1 ? "" : "s"} detected; push a branch or use a local-to-cloud handoff that includes current working state.`
+      : "Working tree looks clean for branch-based cloud tasks.",
+    summary.aheadCount ? `${summary.aheadCount.toLocaleString()} local commit${summary.aheadCount === 1 ? "" : "s"} ahead of upstream.` : null,
+    summary.behindCount ? `${summary.behindCount.toLocaleString()} upstream commit${summary.behindCount === 1 ? "" : "s"} not pulled locally.` : null,
+    currentProject
+      ? currentProject.ready
+        ? "Project guidance and verification are ready enough for cloud work."
+        : `Project playbook score is ${currentProject.score}/100; improve AGENTS.md, setup, or verification before relying on cloud speed.`
+      : "No trusted project playbook was available, so Refit checked only local Git metadata.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return summary;
+}
+
 function directoryChain(rootPath, targetPath) {
   const root = path.resolve(rootPath || "");
   let target = path.resolve(targetPath || root);
@@ -5960,6 +6176,7 @@ async function getCodexConfigSummary() {
       currentProject: null,
       weakestProjects: [],
     },
+    cloudHandoff: emptyCloudHandoffSummary(),
     enabledPluginCount: 0,
     enabledMcpCount: 0,
     disabledMcpCount: 0,
@@ -5994,6 +6211,7 @@ async function getCodexConfigSummary() {
     summary.customPrompts = await getCustomPromptSummary();
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
+    summary.cloudHandoff = await getCloudHandoffSummary(null);
     return summary;
   }
   summary.exists = true;
@@ -6066,6 +6284,7 @@ async function getCodexConfigSummary() {
     summary.staleTrustedProjectPaths = summary.trustedProjectStatuses.filter((project) => !project.exists).map((project) => project.path);
     summary.staleTrustedProjectCount = summary.staleTrustedProjectPaths.length;
     summary.projectReadiness = await getTrustedProjectReadiness(summary.trustedProjectStatuses);
+    summary.cloudHandoff = await getCloudHandoffSummary(summary.projectReadiness.currentProject);
     summary.hookSummary = await getHookConfigSummary({
       hooksFeature: summary.hooksFeature,
       globalConfigText: text,
@@ -6233,6 +6452,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
   const currentLocalEnvironment = currentProject?.localEnvironment || null;
+  const cloudHandoff = codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const localEnvironmentNeedsWork = Boolean(
     currentProject &&
       (currentLocalEnvironment?.tone !== "low" ||
@@ -6947,6 +7167,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (cloudHandoff.hasGitRepo && cloudHandoff.tone !== "low") {
+    const branchName = cloudHandoff.branch || "your-branch";
+    addFix({
+      id: "cloud-handoff",
+      label: "Cloud Handoff",
+      value: cloudHandoff.label,
+      tone: cloudHandoff.tone === "high" ? "high" : "medium",
+      action: cloudHandoff.action,
+      detail:
+        "Codex cloud threads are useful for heavy or parallel work because they run in an isolated environment. Refit checks Git metadata only.",
+      snippet: [
+        "# Prepare a branch-based Codex cloud handoff:",
+        cloudHandoff.hasGithubRemote ? "git remote -v" : "# Add a GitHub remote first, then verify it:",
+        cloudHandoff.hasGithubRemote ? `git status --short --branch` : `git remote add origin git@github.com:OWNER/REPO.git`,
+        cloudHandoff.hasGithubRemote ? `git push -u origin ${shellQuote(branchName)}` : `git push -u origin ${shellQuote(branchName)}`,
+        "",
+        "# Then start the heavy/parallel task as a cloud thread in Codex.",
+        "# If you intentionally need current uncommitted work included, use the local-to-cloud handoff flow instead of a plain branch task.",
+      ].join("\n"),
+    });
+  }
+
   if (!hasGuidance) {
     addFix({
       id: "agents-guidance",
@@ -7117,6 +7359,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const modelIsSpark = normalizedModel.includes("spark");
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject || null;
+  const cloudHandoff = codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const existingProjectCount = Number(projectReadiness.existingCount || 0);
   const projectReadyCount = Number(projectReadiness.readyCount || 0);
   const projectGapCount =
@@ -7169,7 +7412,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       : memoriesFeature
         ? `Memories are enabled, but Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`
         : `Memories are off in config. Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`;
-  const docsSource = "Official Codex manual: Speed, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
+  const docsSource = "Official Codex manual: Speed, Cloud Threads, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
   const processReady = processSummary?.status === "ready";
   const processLoaded = processReady && processSummary.tone !== "low";
   const processCount = Number(processSummary?.processCount || 0);
@@ -7619,6 +7862,26 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: taskClarity.detail,
     },
     {
+      id: "cloud-handoff",
+      label: "Cloud Handoff",
+      value: cloudHandoff.label,
+      tone: cloudHandoff.tone,
+      action: cloudHandoff.action,
+      priority:
+        cloudHandoff.tone === "high"
+          ? processLoaded || backgroundLoaded
+            ? 89
+            : 73
+          : cloudHandoff.tone === "medium"
+            ? processLoaded || backgroundLoaded
+              ? 75
+              : 50
+            : cloudHandoff.cloudReady
+              ? 30
+              : 12,
+      detail: cloudHandoff.detail,
+    },
+    {
       id: "agent-fanout",
       label: "Agent Fan-out",
       value: `${agentMaxThreads.toLocaleString()} / depth ${agentMaxDepth.toLocaleString()}`,
@@ -7798,6 +8061,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: taskClarity.tone === "high" ? "high" : "medium",
       priority: taskClarity.tone === "high" ? 88 : 67,
       detail: taskClarity.detail,
+    });
+  }
+
+  if (cloudHandoff.hasGitRepo && (cloudHandoff.tone === "high" || ((processLoaded || backgroundLoaded) && cloudHandoff.tone !== "low"))) {
+    addRecommendation({
+      id: "cloud-handoff",
+      label: "Cloud Handoff",
+      value: cloudHandoff.label,
+      action: cloudHandoff.action,
+      tone: cloudHandoff.tone === "high" ? "high" : "medium",
+      priority: cloudHandoff.tone === "high" ? 86 : 66,
+      detail:
+        cloudHandoff.cloudReady && (cloudHandoff.dirtyCount || cloudHandoff.aheadCount)
+          ? `${cloudHandoff.detail} Push the branch or use local-to-cloud handoff before starting another heavy local thread.`
+          : cloudHandoff.detail,
     });
   }
 
@@ -8351,6 +8629,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     commandRules,
     authCache,
     projectReadiness,
+    cloudHandoff,
     profileCount: codexConfig?.profileCount || 0,
     profileHealth,
     hasFastTaskProfile,
@@ -8878,6 +9157,11 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(7, Number(metrics.taskClarityHighChurnFileCount || 0) * 1.5);
   score -= Math.min(4, Number(metrics.taskClarityMissingDoneMarkerFileCount || 0) * 0.6);
   score -= Math.min(4, Number(metrics.taskClarityMissingVerificationMarkerFileCount || 0) * 0.7);
+  if (metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffHasGithubRemote) score -= 3;
+  if (metrics.cloudHandoffDetachedHead) score -= 3;
+  if ((metrics.processCount >= 12 || metrics.backgroundProcessCount > 0) && metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffReady) score -= 2;
+  if (metrics.cloudHandoffConflictedCount) score -= Math.min(4, Number(metrics.cloudHandoffConflictedCount || 0) * 2);
+  if (metrics.cloudHandoffDirtyCount && (metrics.processCount >= 12 || metrics.backgroundProcessCount > 0)) score -= Math.min(3, Number(metrics.cloudHandoffDirtyCount || 0) * 0.2);
   score -= Math.min(8, Math.max(0, Number(metrics.mcpEnabledCount || 0) - 6) * 0.7);
   score -= Math.min(5, Number(metrics.mcpRequiredCount || 0) * 1.5);
   score -= Math.min(5, Number(metrics.mcpMissingEnvVarCount || 0) * 2);
@@ -8975,6 +9259,21 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Name the verification step in new prompts; ${Number(metrics.taskClarityMissingVerificationMarkerFileCount).toLocaleString()} sampled active thread${metrics.taskClarityMissingVerificationMarkerFileCount === 1 ? "" : "s"} lacked test/build/benchmark markers.`,
     );
+  }
+  if (metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffHasGithubRemote) {
+    guidance.push("Add a GitHub remote before expecting Codex cloud threads to offload heavy local work.");
+  } else if (metrics.cloudHandoffDetachedHead) {
+    guidance.push("Checkout a named branch before cloud handoff so Codex can clone and track the work cleanly.");
+  } else if (metrics.cloudHandoffConflictedCount > 0) {
+    guidance.push(
+      `Resolve ${Number(metrics.cloudHandoffConflictedCount).toLocaleString()} conflicted Git file${metrics.cloudHandoffConflictedCount === 1 ? "" : "s"} before using cloud handoff.`,
+    );
+  } else if (metrics.cloudHandoffReady && (metrics.processCount >= 12 || metrics.backgroundProcessCount > 0)) {
+    if (metrics.cloudHandoffDirtyCount || metrics.cloudHandoffAheadCount) {
+      guidance.push("Push the current branch or use local-to-cloud handoff so heavy work can leave the local Codex app cleanly.");
+    } else {
+      guidance.push("Cloud handoff looks ready. Use a cloud thread for independent heavy work instead of adding more local Codex load.");
+    }
   }
   if (metrics.processCount >= 24) {
     guidance.push(
@@ -9207,7 +9506,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v12",
+    scoreModel: "local-state-v13",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -9924,6 +10223,13 @@ function benchmarkDeltas(current, previous) {
     "taskClarityMissingVerificationMarkerFileCount",
     "taskClarityHighChurnFileCount",
     "taskClarityUnparsedFileCount",
+    "cloudHandoffReady",
+    "cloudHandoffHasGithubRemote",
+    "cloudHandoffDirtyCount",
+    "cloudHandoffConflictedCount",
+    "cloudHandoffAheadCount",
+    "cloudHandoffBehindCount",
+    "cloudHandoffGithubRemoteCount",
     "hasFastTaskProfile",
     "fastTaskProfileCount",
     "hasMiniProfile",
@@ -10052,6 +10358,21 @@ function summarizeBenchmarkEntry(entry) {
     taskClarityHighChurnFileCount: entry.metrics.taskClarityHighChurnFileCount || 0,
     taskClarityCappedFileCount: entry.metrics.taskClarityCappedFileCount || 0,
     taskClarityUnparsedFileCount: entry.metrics.taskClarityUnparsedFileCount || 0,
+    cloudHandoffTone: entry.metrics.cloudHandoffTone || "low",
+    cloudHandoffReady: Boolean(entry.metrics.cloudHandoffReady),
+    cloudHandoffProjectReady: Boolean(entry.metrics.cloudHandoffProjectReady),
+    cloudHandoffHasGitRepo: Boolean(entry.metrics.cloudHandoffHasGitRepo),
+    cloudHandoffHasGithubRemote: Boolean(entry.metrics.cloudHandoffHasGithubRemote),
+    cloudHandoffDetachedHead: Boolean(entry.metrics.cloudHandoffDetachedHead),
+    cloudHandoffDirtyCount: entry.metrics.cloudHandoffDirtyCount || 0,
+    cloudHandoffStagedCount: entry.metrics.cloudHandoffStagedCount || 0,
+    cloudHandoffUnstagedCount: entry.metrics.cloudHandoffUnstagedCount || 0,
+    cloudHandoffUntrackedCount: entry.metrics.cloudHandoffUntrackedCount || 0,
+    cloudHandoffConflictedCount: entry.metrics.cloudHandoffConflictedCount || 0,
+    cloudHandoffAheadCount: entry.metrics.cloudHandoffAheadCount || 0,
+    cloudHandoffBehindCount: entry.metrics.cloudHandoffBehindCount || 0,
+    cloudHandoffRemoteCount: entry.metrics.cloudHandoffRemoteCount || 0,
+    cloudHandoffGithubRemoteCount: entry.metrics.cloudHandoffGithubRemoteCount || 0,
     codexWorktreeBytes: entry.metrics.codexWorktreeBytes || 0,
     codexWorktreeCount: entry.metrics.codexWorktreeCount || 0,
     codexWorktreeLargeCount: entry.metrics.codexWorktreeLargeCount || 0,
@@ -10290,6 +10611,13 @@ export async function benchmarkHistory(limit = 12) {
           latest.taskClarityMissingVerificationMarkerFileCount - oldest.taskClarityMissingVerificationMarkerFileCount,
         taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - oldest.taskClarityHighChurnFileCount,
         taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - oldest.taskClarityUnparsedFileCount,
+        cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(oldest.cloudHandoffReady),
+        cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(oldest.cloudHandoffHasGithubRemote),
+        cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - oldest.cloudHandoffDirtyCount,
+        cloudHandoffConflictedCount: latest.cloudHandoffConflictedCount - oldest.cloudHandoffConflictedCount,
+        cloudHandoffAheadCount: latest.cloudHandoffAheadCount - oldest.cloudHandoffAheadCount,
+        cloudHandoffBehindCount: latest.cloudHandoffBehindCount - oldest.cloudHandoffBehindCount,
+        cloudHandoffGithubRemoteCount: latest.cloudHandoffGithubRemoteCount - oldest.cloudHandoffGithubRemoteCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - oldest.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - oldest.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - oldest.codexWorktreeLargeCount,
@@ -10393,6 +10721,13 @@ export async function benchmarkHistory(limit = 12) {
           latest.taskClarityMissingVerificationMarkerFileCount - previous.taskClarityMissingVerificationMarkerFileCount,
         taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - previous.taskClarityHighChurnFileCount,
         taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - previous.taskClarityUnparsedFileCount,
+        cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(previous.cloudHandoffReady),
+        cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(previous.cloudHandoffHasGithubRemote),
+        cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - previous.cloudHandoffDirtyCount,
+        cloudHandoffConflictedCount: latest.cloudHandoffConflictedCount - previous.cloudHandoffConflictedCount,
+        cloudHandoffAheadCount: latest.cloudHandoffAheadCount - previous.cloudHandoffAheadCount,
+        cloudHandoffBehindCount: latest.cloudHandoffBehindCount - previous.cloudHandoffBehindCount,
+        cloudHandoffGithubRemoteCount: latest.cloudHandoffGithubRemoteCount - previous.cloudHandoffGithubRemoteCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - previous.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - previous.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - previous.codexWorktreeLargeCount,
@@ -10519,6 +10854,7 @@ export async function runBenchmark() {
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
+  const cloudHandoff = scan.codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
   const modelEffort = scan.codexConfig?.reasoningEffort || "default";
@@ -10531,7 +10867,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v12",
+    scoreModel: "local-state-v13",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -10579,6 +10915,21 @@ export async function runBenchmark() {
     taskClarityHighChurnFileCount: taskClarity.highChurnFileCount || 0,
     taskClarityCappedFileCount: taskClarity.cappedFileCount || 0,
     taskClarityUnparsedFileCount: taskClarity.unparsedFileCount || 0,
+    cloudHandoffTone: cloudHandoff.tone || "low",
+    cloudHandoffReady: Boolean(cloudHandoff.cloudReady),
+    cloudHandoffProjectReady: Boolean(cloudHandoff.projectReady),
+    cloudHandoffHasGitRepo: Boolean(cloudHandoff.hasGitRepo),
+    cloudHandoffHasGithubRemote: Boolean(cloudHandoff.hasGithubRemote),
+    cloudHandoffDetachedHead: Boolean(cloudHandoff.detachedHead),
+    cloudHandoffDirtyCount: cloudHandoff.dirtyCount || 0,
+    cloudHandoffStagedCount: cloudHandoff.stagedCount || 0,
+    cloudHandoffUnstagedCount: cloudHandoff.unstagedCount || 0,
+    cloudHandoffUntrackedCount: cloudHandoff.untrackedCount || 0,
+    cloudHandoffConflictedCount: cloudHandoff.conflictedCount || 0,
+    cloudHandoffAheadCount: cloudHandoff.aheadCount || 0,
+    cloudHandoffBehindCount: cloudHandoff.behindCount || 0,
+    cloudHandoffRemoteCount: cloudHandoff.remoteCount || 0,
+    cloudHandoffGithubRemoteCount: cloudHandoff.githubRemoteCount || 0,
     codexWorktreeBytes: scan.categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: scan.categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: scan.categories.codexWorktrees?.largeWorktreeCount || 0,
