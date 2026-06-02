@@ -14,6 +14,28 @@ const homeDir = os.homedir();
 const appSupport = path.join(homeDir, "Library", "Application Support");
 const codexHome = path.resolve(process.env.CODEX_HOME || path.join(homeDir, ".codex"));
 const codexAppCli = "/Applications/Codex.app/Contents/Resources/codex";
+const hookEvents = [
+  "PreToolUse",
+  "PermissionRequest",
+  "PostToolUse",
+  "PreCompact",
+  "PostCompact",
+  "UserPromptSubmit",
+  "SubagentStop",
+  "Stop",
+  "SessionStart",
+  "SubagentStart",
+];
+const turnScopedHookEvents = new Set([
+  "PreToolUse",
+  "PermissionRequest",
+  "PostToolUse",
+  "PreCompact",
+  "PostCompact",
+  "UserPromptSubmit",
+  "SubagentStop",
+  "Stop",
+]);
 
 const paths = {
   codexHome,
@@ -27,6 +49,7 @@ const paths = {
   configToml: path.join(codexHome, "config.toml"),
   authJson: path.join(codexHome, "auth.json"),
   globalAgents: path.join(codexHome, "AGENTS.md"),
+  globalHooks: path.join(codexHome, "hooks.json"),
   stateDb: path.join(codexHome, "state_5.sqlite"),
   logsDb: path.join(codexHome, "logs_2.sqlite"),
   chromiumCodex: path.join(appSupport, "Codex"),
@@ -916,6 +939,156 @@ async function readJsonOrNull(targetPath) {
   }
 }
 
+function emptyHookSource({ scope, format, sourcePath, active = true, exists = false, error = null }) {
+  return {
+    scope,
+    format,
+    path: sourcePath,
+    active,
+    exists,
+    error,
+    groupCount: 0,
+    commandCount: 0,
+    turnScopedCommandCount: 0,
+    broadMatcherCount: 0,
+    eventCounts: {},
+  };
+}
+
+function incrementHookEvent(source, event, commandCount = 0) {
+  if (!hookEvents.includes(event)) return;
+  source.eventCounts[event] = (source.eventCounts[event] || 0) + commandCount;
+  source.commandCount += commandCount;
+  if (turnScopedHookEvents.has(event)) source.turnScopedCommandCount += commandCount;
+}
+
+function summarizeHookJsonConfig(json, source) {
+  const hooks = json?.hooks && typeof json.hooks === "object" ? json.hooks : json;
+  if (!hooks || typeof hooks !== "object") return source;
+
+  for (const event of hookEvents) {
+    const groups = Array.isArray(hooks[event]) ? hooks[event] : [];
+    source.groupCount += groups.length;
+    for (const group of groups) {
+      if (!group || typeof group !== "object") continue;
+      const matcher = group.matcher === undefined ? "*" : String(group.matcher);
+      if (matcher === "*" || matcher === ".*") source.broadMatcherCount += 1;
+      const handlers = Array.isArray(group.hooks) ? group.hooks : [];
+      const commandCount = handlers.filter((handler) => handler && typeof handler === "object").length;
+      incrementHookEvent(source, event, commandCount);
+    }
+  }
+  return source;
+}
+
+function summarizeInlineTomlHooks(text, source) {
+  let currentEvent = null;
+  let inHandler = false;
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const handlerMatch = line.match(/^\[\[hooks\.([A-Za-z]+)\.hooks\]\]$/);
+    if (handlerMatch) {
+      currentEvent = handlerMatch[1];
+      inHandler = true;
+      continue;
+    }
+    const groupMatch = line.match(/^\[\[hooks\.([A-Za-z]+)\]\]$/);
+    if (groupMatch) {
+      currentEvent = groupMatch[1];
+      inHandler = false;
+      if (hookEvents.includes(currentEvent)) source.groupCount += 1;
+      continue;
+    }
+    if (!currentEvent || !hookEvents.includes(currentEvent)) continue;
+    if (/^matcher\s*=\s*["']?\*["']?\s*$/.test(line) || /^matcher\s*=\s*["']?\.\*["']?\s*$/.test(line)) {
+      source.broadMatcherCount += 1;
+    }
+    if (inHandler && /^command(?:_windows)?\s*=/.test(line)) {
+      incrementHookEvent(source, currentEvent, 1);
+      inHandler = false;
+    }
+  }
+  return source;
+}
+
+async function summarizeHooksJsonFile(sourcePath, { scope, active = true } = {}) {
+  const existsOnDisk = await exists(sourcePath);
+  const source = emptyHookSource({ scope, format: "hooks.json", sourcePath, active, exists: existsOnDisk });
+  if (!existsOnDisk) return source;
+  const json = await readJsonOrNull(sourcePath);
+  if (!json) return { ...source, error: "Could not parse hooks.json" };
+  return summarizeHookJsonConfig(json, source);
+}
+
+async function summarizeInlineHooksFile(sourcePath, { scope, active = true, text = null } = {}) {
+  const existsOnDisk = text !== null || (await exists(sourcePath));
+  const source = emptyHookSource({ scope, format: "config.toml", sourcePath, active, exists: existsOnDisk });
+  if (!existsOnDisk) return source;
+  try {
+    const configText = text ?? (await fs.readFile(sourcePath, "utf8"));
+    return summarizeInlineTomlHooks(configText, source);
+  } catch (error) {
+    return { ...source, error: error.message };
+  }
+}
+
+function mergeHookSources(sources, hooksFeature = true) {
+  const activeSources = sources.filter((source) => source.exists && source.active);
+  const commandCount = activeSources.reduce((total, source) => total + source.commandCount, 0);
+  const turnScopedCommandCount = activeSources.reduce((total, source) => total + source.turnScopedCommandCount, 0);
+  const groupCount = activeSources.reduce((total, source) => total + source.groupCount, 0);
+  const broadMatcherCount = activeSources.reduce((total, source) => total + source.broadMatcherCount, 0);
+  const eventCounts = {};
+  for (const source of activeSources) {
+    for (const [event, count] of Object.entries(source.eventCounts || {})) {
+      eventCounts[event] = (eventCounts[event] || 0) + count;
+    }
+  }
+  const highLoad = hooksFeature && (turnScopedCommandCount >= 6 || commandCount >= 10 || broadMatcherCount >= 4);
+  const mediumLoad = hooksFeature && (turnScopedCommandCount >= 2 || commandCount >= 4 || broadMatcherCount >= 1);
+  const tone = !hooksFeature ? "low" : highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = !hooksFeature ? "Disabled" : commandCount ? `${commandCount.toLocaleString()} hooks` : "None";
+  const detail =
+    !hooksFeature
+      ? "Lifecycle hooks are disabled by config."
+      : commandCount
+        ? `${commandCount.toLocaleString()} hook command${commandCount === 1 ? "" : "s"} can load from ${activeSources.length.toLocaleString()} active source${activeSources.length === 1 ? "" : "s"}; ${turnScopedCommandCount.toLocaleString()} can run at turn or tool scope. Use /hooks to review trust and disable stale hooks.`
+        : "No active lifecycle hook commands were found in user or current trusted project config.";
+
+  return {
+    hooksFeature,
+    status: "ready",
+    tone,
+    label,
+    sourceCount: activeSources.length,
+    groupCount,
+    commandCount,
+    turnScopedCommandCount,
+    broadMatcherCount,
+    eventCounts,
+    sources,
+    detail,
+  };
+}
+
+async function getHookConfigSummary({ hooksFeature = true, globalConfigText = null, currentProject = null } = {}) {
+  const sources = [
+    await summarizeHooksJsonFile(paths.globalHooks, { scope: "user" }),
+    await summarizeInlineHooksFile(paths.configToml, { scope: "user", text: globalConfigText }),
+  ];
+
+  if (currentProject?.path && currentProject.exists) {
+    const projectCodexDir = path.join(currentProject.path, ".codex");
+    sources.push(
+      await summarizeHooksJsonFile(path.join(projectCodexDir, "hooks.json"), { scope: "current project" }),
+      await summarizeInlineHooksFile(path.join(projectCodexDir, "config.toml"), { scope: "current project" }),
+    );
+  }
+
+  return mergeHookSources(sources, hooksFeature);
+}
+
 async function listDirNames(targetPath) {
   try {
     return (await fs.readdir(targetPath, { withFileTypes: true })).map((dirent) => dirent.name);
@@ -1692,6 +1865,21 @@ async function getCodexConfigSummary() {
     fastModeFeature: true,
     shellSnapshot: true,
     goalsFeature: false,
+    hooksFeature: true,
+    hookSummary: {
+      hooksFeature: true,
+      status: "ready",
+      tone: "low",
+      label: "None",
+      sourceCount: 0,
+      groupCount: 0,
+      commandCount: 0,
+      turnScopedCommandCount: 0,
+      broadMatcherCount: 0,
+      eventCounts: {},
+      sources: [],
+      detail: "No active lifecycle hook commands were found in user or current trusted project config.",
+    },
     memoriesFeature: false,
     memoriesUseMemories: null,
     memoriesUseMemoriesEffective: false,
@@ -1746,7 +1934,10 @@ async function getCodexConfigSummary() {
 
   Object.assign(summary, await getCodexProfileSummaries());
 
-  if (!(await exists(paths.configToml))) return summary;
+  if (!(await exists(paths.configToml))) {
+    summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
+    return summary;
+  }
   summary.exists = true;
 
   try {
@@ -1767,6 +1958,7 @@ async function getCodexConfigSummary() {
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.goalsFeature = values["features.goals"] === true;
+    summary.hooksFeature = (values["features.hooks"] ?? values["features.codex_hooks"]) !== false;
     summary.memoriesFeature = values["features.memories"] === true;
     summary.memoriesUseMemories = values["memories.use_memories"] ?? null;
     summary.memoriesUseMemoriesEffective = summary.memoriesFeature && summary.memoriesUseMemories !== false;
@@ -1795,6 +1987,11 @@ async function getCodexConfigSummary() {
     summary.staleTrustedProjectPaths = summary.trustedProjectStatuses.filter((project) => !project.exists).map((project) => project.path);
     summary.staleTrustedProjectCount = summary.staleTrustedProjectPaths.length;
     summary.projectReadiness = await getTrustedProjectReadiness(summary.trustedProjectStatuses);
+    summary.hookSummary = await getHookConfigSummary({
+      hooksFeature: summary.hooksFeature,
+      globalConfigText: text,
+      currentProject: summary.projectReadiness.currentProject,
+    });
     summary.enabledPluginCount = sections.filter((section) => section.startsWith('plugins."') && values[`${section}.enabled`] === true).length;
     const mcpSections = sections.filter(isTopLevelMcpSection);
     summary.enabledMcpCount = mcpSections.filter((section) => values[`${section}.enabled`] !== false).length;
@@ -1895,6 +2092,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const authCache = codexConfig?.authCache || {};
   const processSummary = context.processSummary || {};
   const backgroundSummary = processSummary.background || {};
+  const hookSummary = codexConfig?.hookSummary || {};
   const agentMaxThreads = Number(codexConfig?.agentMaxThreadsEffective ?? 6);
   const agentMaxDepth = Number(codexConfig?.agentMaxDepthEffective ?? 1);
   const agentFanoutRisk = agentMaxDepth > 1 || agentMaxThreads >= 12;
@@ -1939,6 +2137,26 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
       detail:
         "Long-running terminal commands under Codex can make everything feel slow. Use /ps to inspect them and /stop only after confirming the work is no longer needed.",
       snippet: buildBackgroundTerminalSnippet(),
+    });
+  }
+
+  if (hookSummary.status === "ready" && hookSummary.hooksFeature && hookSummary.tone !== "low") {
+    addFix({
+      id: "hook-load",
+      label: "Lifecycle Hooks",
+      value: `${Number(hookSummary.commandCount || 0).toLocaleString()} hooks`,
+      tone: hookSummary.tone === "high" ? "high" : "medium",
+      action: "Review /hooks",
+      detail:
+        "Matching hooks from multiple files can all run, and turn/tool-scope hooks can add latency around frequent actions. Review loaded hooks before disabling anything.",
+      snippet: [
+        "# In Codex:",
+        "/hooks",
+        "",
+        "# If you intentionally need a temporary local speed run with hooks disabled, edit ~/.codex/config.toml:",
+        "# [features]",
+        "# hooks = false",
+      ].join("\n"),
     });
   }
 
@@ -2221,6 +2439,17 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const memoriesFeature = Boolean(codexConfig?.memoriesFeature);
   const memoriesUse = Boolean(codexConfig?.memoriesUseMemoriesEffective);
   const memoriesGenerate = Boolean(codexConfig?.memoriesGenerateMemoriesEffective);
+  const hookSummary = codexConfig?.hookSummary || {};
+  const hooksFeature = hookSummary.hooksFeature !== false;
+  const hookCommandCount = Number(hookSummary.commandCount || 0);
+  const hookTurnScopedCount = Number(hookSummary.turnScopedCommandCount || 0);
+  const hookTone = hookSummary.tone || "low";
+  const hookLabel = hooksFeature ? hookSummary.label || (hookCommandCount ? `${hookCommandCount} hooks` : "None") : "Disabled";
+  const hookDetail =
+    hookSummary.detail ||
+    (hooksFeature
+      ? "No active lifecycle hook commands were found in user or current trusted project config."
+      : "Lifecycle hooks are disabled by config.");
   const memoryStateLabel = memoriesUse
     ? "Injecting"
     : memoriesGenerate
@@ -2394,6 +2623,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: shellSnapshot
         ? "Codex can snapshot the shell environment to speed up repeated commands."
         : "Set features.shell_snapshot = true so repeated command setup can be faster.",
+    },
+    {
+      id: "hooks",
+      label: "Lifecycle Hooks",
+      value: hookLabel,
+      tone: hookTone,
+      action: hooksFeature && hookCommandCount ? "Review /hooks" : hooksFeature ? "No hooks found" : "Disabled",
+      priority: hookTone === "high" ? 88 : hookTone === "medium" ? 74 : 22,
+      detail: hookDetail,
     },
     {
       id: "fast-default",
@@ -2774,6 +3012,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (hooksFeature && hookSummary.status === "ready" && hookTone !== "low") {
+    addRecommendation({
+      id: "hook-load",
+      label: "Lifecycle Hooks",
+      value: `${hookCommandCount.toLocaleString()} hooks`,
+      action: "Review /hooks",
+      tone: hookTone === "high" ? "high" : "medium",
+      priority: hookTone === "high" ? 89 : 69,
+      detail:
+        hookTurnScopedCount > 0
+          ? `${hookTurnScopedCount.toLocaleString()} hook command${hookTurnScopedCount === 1 ? "" : "s"} can run at turn or tool scope. Matching hooks from multiple files all run, so stale hooks can add latency.`
+          : "Lifecycle hooks are configured. Review loaded hook sources and trust state with /hooks.",
+    });
+  }
+
   if (memoryTone === "medium") {
     addRecommendation({
       id: "memory-context",
@@ -2855,6 +3108,8 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellSnapshot,
     goalsFeature,
     webSearchMode,
+    hooksFeature,
+    hookSummary,
     memoriesFeature,
     memoriesUseMemories: codexConfig?.memoriesUseMemories ?? null,
     memoriesUseMemoriesEffective: memoriesUse,
@@ -3306,6 +3561,8 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(8, ((Number(metrics.backgroundRssBytes || 0) / 1024 ** 3) || 0) * 2);
   score -= Math.min(8, Math.max(0, Number(metrics.agentMaxDepth || 1) - 1) * 4);
   score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
+  score -= Math.min(8, Math.max(0, Number(metrics.hookTurnScopedCommandCount || 0) - 1) * 1.2);
+  score -= Math.min(4, Math.max(0, Number(metrics.hookBroadMatcherCount || 0)) * 1.5);
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   return Math.round(clampNumber(score, 0, 100));
 }
@@ -3365,6 +3622,11 @@ function benchmarkGuidance(metrics) {
   }
   if (metrics.memoriesUseMemories && metrics.memoryBytes > 10 * 1024 ** 2) {
     guidance.push(`Review ${formatBytesServer(metrics.memoryBytes)} of local memories if Codex starts carrying stale assumptions.`);
+  }
+  if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
+    guidance.push(
+      `Review ${Number(metrics.hookTurnScopedCommandCount).toLocaleString()} turn/tool-scope lifecycle hook command${metrics.hookTurnScopedCommandCount === 1 ? "" : "s"} with /hooks if Codex commands feel slow.`,
+    );
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -4009,6 +4271,9 @@ function benchmarkDeltas(current, previous) {
     "backgroundCpuPercent",
     "agentMaxThreads",
     "agentMaxDepth",
+    "hookCommandCount",
+    "hookTurnScopedCommandCount",
+    "hookBroadMatcherCount",
     "memoryBytes",
     "memoryFiles",
   ];
@@ -4039,6 +4304,10 @@ function summarizeBenchmarkEntry(entry) {
     backgroundCpuPercent: entry.metrics.backgroundCpuPercent || 0,
     agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
     agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
+    hooksFeature: entry.metrics.hooksFeature !== false,
+    hookCommandCount: entry.metrics.hookCommandCount || 0,
+    hookTurnScopedCommandCount: entry.metrics.hookTurnScopedCommandCount || 0,
+    hookBroadMatcherCount: entry.metrics.hookBroadMatcherCount || 0,
     memoryBytes: entry.metrics.memoryBytes || 0,
     memoryFiles: entry.metrics.memoryFiles || 0,
     memoriesUseMemories: Boolean(entry.metrics.memoriesUseMemories),
@@ -4167,6 +4436,10 @@ export async function runBenchmark() {
     backgroundCpuPercent: scan.processes?.background?.cpuPercent || 0,
     agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
     agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
+    hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
+    hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
+    hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
+    hookBroadMatcherCount: scan.codexConfig?.hookSummary?.broadMatcherCount || 0,
     memoryBytes: scan.categories.memoryState?.bytes || 0,
     memoryFiles: scan.categories.memoryState?.fileCount || 0,
     memoriesUseMemories: Boolean(scan.codexConfig?.memoriesUseMemoriesEffective),
