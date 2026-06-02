@@ -356,6 +356,76 @@ function tomlInlineTableValues(value) {
   return [...String(value).matchAll(/=\s*["']([^"']+)["']/g)].map((match) => match[1]).filter(Boolean);
 }
 
+function tomlInlineTableKeys(value) {
+  if (value === undefined || value === null) return [];
+  return [...String(value).matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=/g)].map((match) => match[1]).filter(Boolean);
+}
+
+function shellEnvSecretNameCount() {
+  return Object.keys(process.env).filter((name) => /key|secret|token|password|passwd|credential|cookie|session|private|auth/i.test(name)).length;
+}
+
+function buildShellEnvironmentSummary(values = {}) {
+  const inherit = values["shell_environment_policy.inherit"] || "all";
+  const includeOnly = tomlArrayStringNames(values["shell_environment_policy.include_only"]);
+  const exclude = tomlArrayStringNames(values["shell_environment_policy.exclude"]);
+  const inlineSetKeys = tomlInlineTableKeys(values["shell_environment_policy.set"]);
+  const setPrefix = "shell_environment_policy.set.";
+  const tableSetKeys = Object.keys(values)
+    .filter((key) => key.startsWith(setPrefix))
+    .map((key) => key.slice(setPrefix.length));
+  const setKeys = [...new Set([...inlineSetKeys, ...tableSetKeys])];
+  const configPresent = Object.keys(values).some((key) => key.startsWith("shell_environment_policy."));
+  const envVarCount = Object.keys(process.env).length;
+  const secretLikeNameCount = shellEnvSecretNameCount();
+  const ignoreDefaultExcludes = values["shell_environment_policy.ignore_default_excludes"] === true;
+  const inheritMode = String(inherit || "all").toLowerCase();
+  const hasIncludeOnly = includeOnly.length > 0;
+  const hasTrimmedBase = inheritMode === "core" || inheritMode === "none";
+  const tightPolicy = hasTrimmedBase || hasIncludeOnly;
+  const normalizedInclude = includeOnly.map((name) => name.toUpperCase());
+  const normalizedSet = setKeys.map((name) => name.toUpperCase());
+  const pathAvailable = (!hasIncludeOnly && inheritMode !== "none") || normalizedInclude.includes("PATH") || normalizedSet.includes("PATH");
+  const homeAvailable = (!hasIncludeOnly && inheritMode !== "none") || normalizedInclude.includes("HOME") || normalizedSet.includes("HOME");
+  const highLoad = (!tightPolicy && envVarCount >= 180 && secretLikeNameCount > 0) || (ignoreDefaultExcludes && secretLikeNameCount > 0) || !pathAvailable;
+  const mediumLoad =
+    highLoad ||
+    (!tightPolicy && (envVarCount >= 80 || secretLikeNameCount > 0)) ||
+    !homeAvailable ||
+    exclude.length >= 6 ||
+    setKeys.length >= 8;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = tightPolicy ? (hasIncludeOnly ? "Allowlist" : inheritMode === "none" ? "Clean start" : "Core env") : "All env";
+  const action = tone === "low" ? "Keep scoped" : tightPolicy ? "Review policy" : "Trim env";
+  const detail = tightPolicy
+    ? `Shell env policy starts from ${inheritMode} with ${includeOnly.length.toLocaleString()} allowlist pattern${includeOnly.length === 1 ? "" : "s"} and ${setKeys.length.toLocaleString()} explicit override${setKeys.length === 1 ? "" : "s"}.`
+    : `Shell env policy inherits all visible variables. Refit sees ${envVarCount.toLocaleString()} env var${envVarCount === 1 ? "" : "s"} in this process, including ${secretLikeNameCount.toLocaleString()} secret-looking name${secretLikeNameCount === 1 ? "" : "s"}.`;
+
+  return {
+    status: "ready",
+    configPresent,
+    inherit: inheritMode,
+    label,
+    tone,
+    action,
+    detail:
+      ignoreDefaultExcludes && secretLikeNameCount > 0
+        ? `${detail} Default KEY/SECRET/TOKEN excludes are disabled, so review this before running broad shell commands.`
+        : !pathAvailable
+          ? `${detail} PATH is not clearly available to spawned commands; that can make normal tooling fail.`
+          : detail,
+    envVarCount,
+    secretLikeNameCount,
+    includeOnlyCount: includeOnly.length,
+    excludeCount: exclude.length,
+    setCount: setKeys.length,
+    ignoreDefaultExcludes,
+    tightPolicy,
+    pathAvailable,
+    homeAvailable,
+  };
+}
+
 function mcpEnvVarNames(values, section) {
   const names = [];
   const add = (value) => {
@@ -2092,6 +2162,7 @@ async function getCodexConfigSummary() {
     fastMode: false,
     fastModeFeature: true,
     shellSnapshot: true,
+    shellEnvironmentSummary: buildShellEnvironmentSummary({}),
     goalsFeature: false,
     hooksFeature: true,
     hookSummary: {
@@ -2188,6 +2259,7 @@ async function getCodexConfigSummary() {
     summary.fastModeFeature = values["features.fast_mode"] !== false;
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
+    summary.shellEnvironmentSummary = buildShellEnvironmentSummary(values);
     summary.goalsFeature = values["features.goals"] === true;
     summary.hooksFeature = (values["features.hooks"] ?? values["features.codex_hooks"]) !== false;
     summary.memoriesFeature = values["features.memories"] === true;
@@ -2331,6 +2403,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const emptyGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const fastMode = Boolean(codexConfig?.fastMode);
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
+  const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -2446,6 +2519,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Keep required = true only for servers every session truly needs.",
         "# If desktop Codex cannot see MCP env vars, put them in ~/.codex/.env and restart the app.",
+      ].join("\n"),
+    });
+  }
+
+  if (shellEnvironmentSummary.status === "ready" && shellEnvironmentSummary.tone !== "low") {
+    addFix({
+      id: "shell-environment-policy",
+      label: "Shell Env",
+      value: shellEnvironmentSummary.label,
+      tone: shellEnvironmentSummary.tone === "high" ? "high" : "medium",
+      action: "Trim env policy",
+      detail:
+        "Codex forwards environment variables to spawned commands according to shell_environment_policy. A trimmed policy keeps commands predictable and avoids dragging secrets into local subprocesses.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# Start with a small command environment, then add project-specific vars intentionally.",
+        "[shell_environment_policy]",
+        'inherit = "core"',
+        "ignore_default_excludes = false",
+        'include_only = ["PATH", "HOME", "SHELL", "TMPDIR"]',
+        "",
+        "# Add required build or MCP variables explicitly instead of inheriting everything.",
       ].join("\n"),
     });
   }
@@ -2705,6 +2800,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const fastMode = Boolean(codexConfig?.fastMode);
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
+  const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -2912,6 +3008,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: shellSnapshot
         ? "Codex can snapshot the shell environment to speed up repeated commands."
         : "Set features.shell_snapshot = true so repeated command setup can be faster.",
+    },
+    {
+      id: "shell-environment",
+      label: "Shell Env",
+      value: shellEnvironmentSummary.label,
+      tone: shellEnvironmentSummary.tone,
+      action: shellEnvironmentSummary.action,
+      priority: shellEnvironmentSummary.tone === "high" ? 86 : shellEnvironmentSummary.tone === "medium" ? 64 : 24,
+      detail: shellEnvironmentSummary.detail,
     },
     {
       id: "hooks",
@@ -3273,6 +3378,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (shellEnvironmentSummary.status === "ready" && shellEnvironmentSummary.tone !== "low") {
+    addRecommendation({
+      id: "shell-environment-policy",
+      label: "Shell Env",
+      value: shellEnvironmentSummary.label,
+      action: shellEnvironmentSummary.action,
+      tone: shellEnvironmentSummary.tone === "high" ? "high" : "medium",
+      priority: shellEnvironmentSummary.tone === "high" ? 81 : 57,
+      detail:
+        shellEnvironmentSummary.pathAvailable
+          ? `${shellEnvironmentSummary.detail} Use shell_environment_policy to keep spawned commands fast, predictable, and scoped.`
+          : `${shellEnvironmentSummary.detail} Restore PATH with include_only or set before judging command failures.`,
+    });
+  }
+
   if (currentProject && !currentProject.ready) {
     addRecommendation({
       id: "project-playbook",
@@ -3432,6 +3552,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     displayServiceTier: displayTier,
     fastModeFeature,
     shellSnapshot,
+    shellEnvironmentSummary,
     goalsFeature,
     webSearchMode,
     hooksFeature,
@@ -3895,6 +4016,9 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(5, Number(metrics.mcpRequiredCount || 0) * 1.5);
   score -= Math.min(5, Number(metrics.mcpMissingEnvVarCount || 0) * 2);
   score -= Math.min(3, Number(metrics.mcpLongStartupTimeoutCount || 0) * 1.2);
+  if (!metrics.shellEnvTightPolicy) score -= Math.min(5, Math.max(0, Number(metrics.shellEnvVarCount || 0) - 80) * 0.035);
+  if (!metrics.shellEnvTightPolicy) score -= Math.min(4, Number(metrics.shellEnvSecretLikeNameCount || 0) * 0.35);
+  if (metrics.shellEnvMissingPath) score -= 6;
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   return Math.round(clampNumber(score, 0, 100));
 }
@@ -3973,6 +4097,13 @@ function benchmarkGuidance(metrics) {
     );
   } else if (metrics.mcpEnabledCount >= 8) {
     guidance.push(`Trim optional MCP servers for quick local tasks; ${Number(metrics.mcpEnabledCount).toLocaleString()} are enabled.`);
+  }
+  if (metrics.shellEnvMissingPath) {
+    guidance.push("Shell environment policy does not clearly preserve PATH for spawned commands. Restore PATH before chasing tool failures.");
+  } else if (!metrics.shellEnvTightPolicy && metrics.shellEnvVarCount >= 80) {
+    guidance.push(
+      `Trim shell_environment_policy for spawned commands; Refit sees ${Number(metrics.shellEnvVarCount).toLocaleString()} visible env var${metrics.shellEnvVarCount === 1 ? "" : "s"}.`,
+    );
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -4623,6 +4754,8 @@ function benchmarkDeltas(current, previous) {
     "mcpStdioCount",
     "mcpHttpCount",
     "mcpLongStartupTimeoutCount",
+    "shellEnvVarCount",
+    "shellEnvSecretLikeNameCount",
     "hookCommandCount",
     "hookTurnScopedCommandCount",
     "hookBroadMatcherCount",
@@ -4665,6 +4798,10 @@ function summarizeBenchmarkEntry(entry) {
     mcpStdioCount: entry.metrics.mcpStdioCount || 0,
     mcpHttpCount: entry.metrics.mcpHttpCount || 0,
     mcpLongStartupTimeoutCount: entry.metrics.mcpLongStartupTimeoutCount || 0,
+    shellEnvVarCount: entry.metrics.shellEnvVarCount || 0,
+    shellEnvSecretLikeNameCount: entry.metrics.shellEnvSecretLikeNameCount || 0,
+    shellEnvTightPolicy: Boolean(entry.metrics.shellEnvTightPolicy),
+    shellEnvMissingPath: Boolean(entry.metrics.shellEnvMissingPath),
     hooksFeature: entry.metrics.hooksFeature !== false,
     hookCommandCount: entry.metrics.hookCommandCount || 0,
     hookTurnScopedCommandCount: entry.metrics.hookTurnScopedCommandCount || 0,
@@ -4704,6 +4841,8 @@ export async function benchmarkHistory(limit = 12) {
         mcpEnabledCount: latest.mcpEnabledCount - oldest.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - oldest.mcpRequiredCount,
         mcpMissingEnvVarCount: latest.mcpMissingEnvVarCount - oldest.mcpMissingEnvVarCount,
+        shellEnvVarCount: latest.shellEnvVarCount - oldest.shellEnvVarCount,
+        shellEnvSecretLikeNameCount: latest.shellEnvSecretLikeNameCount - oldest.shellEnvSecretLikeNameCount,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
       }
     : null;
@@ -4718,6 +4857,7 @@ export async function benchmarkHistory(limit = 12) {
         backgroundProcessCount: latest.backgroundProcessCount - previous.backgroundProcessCount,
         mcpEnabledCount: latest.mcpEnabledCount - previous.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
+        shellEnvVarCount: latest.shellEnvVarCount - previous.shellEnvVarCount,
       }
     : null;
   const trend =
@@ -4811,6 +4951,10 @@ export async function runBenchmark() {
     mcpStdioCount: scan.codexConfig?.mcpSummary?.stdioCount || 0,
     mcpHttpCount: scan.codexConfig?.mcpSummary?.httpCount || 0,
     mcpLongStartupTimeoutCount: scan.codexConfig?.mcpSummary?.longStartupTimeoutCount || 0,
+    shellEnvVarCount: scan.codexConfig?.shellEnvironmentSummary?.envVarCount || 0,
+    shellEnvSecretLikeNameCount: scan.codexConfig?.shellEnvironmentSummary?.secretLikeNameCount || 0,
+    shellEnvTightPolicy: Boolean(scan.codexConfig?.shellEnvironmentSummary?.tightPolicy),
+    shellEnvMissingPath: scan.codexConfig?.shellEnvironmentSummary?.pathAvailable === false,
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
