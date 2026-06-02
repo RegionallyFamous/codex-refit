@@ -58,11 +58,13 @@ const paths = {
   memoriesExtensions: path.join(codexHome, "memories_extensions"),
   customPrompts: path.join(codexHome, "prompts"),
   customAgents: path.join(codexHome, "agents"),
+  userRules: path.join(codexHome, "rules"),
   codexSkills: path.join(codexHome, "skills"),
   codexSystemSkills: path.join(codexHome, "skills", ".system"),
   userAgentSkills: path.join(homeDir, ".agents", "skills"),
   adminConfigRoot,
   adminSkills: path.join(adminConfigRoot, "skills"),
+  adminRules: path.join(adminConfigRoot, "rules"),
   managedConfigToml: path.join(adminConfigRoot, "managed_config.toml"),
   requirementsToml: path.join(adminConfigRoot, "requirements.toml"),
   pluginCache: path.join(codexHome, "plugins", "cache"),
@@ -689,6 +691,471 @@ async function getManagedConfigSummary({ userValues = {}, userSections = [] } = 
       error: source.error,
     })),
   };
+}
+
+const broadCommandRuleTokens = new Set([
+  "bash",
+  "sh",
+  "zsh",
+  "python",
+  "python3",
+  "node",
+  "npm",
+  "pnpm",
+  "yarn",
+  "bun",
+  "deno",
+  "curl",
+  "wget",
+  "git",
+  "gh",
+  "make",
+  "cargo",
+  "go",
+  "ruby",
+  "perl",
+  "php",
+  "docker",
+  "kubectl",
+]);
+const largeCommandRuleFileBytes = 24 * 1024;
+
+function emptyCommandRuleSummary(rulesFeature = true) {
+  return {
+    status: "ready",
+    tone: "low",
+    label: rulesFeature ? "None" : "Disabled",
+    action: rulesFeature ? "No rules" : "Feature off",
+    detail: rulesFeature
+      ? "No active Codex command rule files were found in user, team, or current trusted project layers."
+      : "Codex command rules are disabled by features.rules = false.",
+    rulesFeature,
+    sourceCount: 0,
+    activeSourceCount: 0,
+    fileCount: 0,
+    ruleCount: 0,
+    promptCount: 0,
+    forbiddenCount: 0,
+    allowCount: 0,
+    broadRuleCount: 0,
+    broadPromptRuleCount: 0,
+    missingJustificationCount: 0,
+    testedRuleCount: 0,
+    parseWarningCount: 0,
+    largeFileCount: 0,
+    totalBytes: 0,
+    ruleFiles: [],
+    broadRules: [],
+    sources: [],
+  };
+}
+
+function scanExpressionUntilComma(text, startIndex = 0) {
+  let depth = 0;
+  let quote = null;
+  let escaping = false;
+  let lineComment = false;
+  for (let index = startIndex; index < text.length; index += 1) {
+    const char = text[index];
+    if (lineComment) {
+      if (char === "\n") lineComment = false;
+      continue;
+    }
+    if (quote) {
+      if (quote.length === 3) {
+        if (text.startsWith(quote, index)) {
+          index += 2;
+          quote = null;
+        }
+        continue;
+      }
+      if (escaping) {
+        escaping = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaping = true;
+        continue;
+      }
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "#") {
+      lineComment = true;
+      continue;
+    }
+    if (text.startsWith('"""', index) || text.startsWith("'''", index)) {
+      quote = text.slice(index, index + 3);
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "[" || char === "{" || char === "(") depth += 1;
+    if (char === "]" || char === "}" || char === ")") depth = Math.max(0, depth - 1);
+    if (char === "," && depth === 0) return index;
+  }
+  return text.length;
+}
+
+function extractNamedArgument(callText, name) {
+  const match = new RegExp(`\\b${escapeRegExp(name)}\\s*=`).exec(callText);
+  if (!match) return null;
+  let start = match.index + match[0].length;
+  while (start < callText.length && /\s/.test(callText[start])) start += 1;
+  const end = scanExpressionUntilComma(callText, start);
+  return callText.slice(start, end).trim();
+}
+
+function unquoteStarlarkString(value) {
+  const text = String(value || "").trim();
+  const triple = text.match(/^(["']{3})([\s\S]*)\1$/);
+  if (triple) return triple[2];
+  const quoted = text.match(/^["']([\s\S]*)["']$/);
+  return quoted ? quoted[1] : text;
+}
+
+function starlarkStringLiterals(value) {
+  const text = String(value || "");
+  const tokens = [];
+  const pattern = /("""|'''|"|')([\s\S]*?)\1/g;
+  let match;
+  while ((match = pattern.exec(text))) {
+    tokens.push(match[2]);
+  }
+  return tokens.filter(Boolean);
+}
+
+function extractStarlarkCallBodies(text, functionName) {
+  const source = String(text || "");
+  const bodies = [];
+  const finder = new RegExp(`\\b${escapeRegExp(functionName)}\\s*\\(`, "g");
+  let match;
+  while ((match = finder.exec(source))) {
+    const openIndex = source.indexOf("(", match.index);
+    let depth = 0;
+    let quote = null;
+    let escaping = false;
+    let lineComment = false;
+    for (let index = openIndex; index < source.length; index += 1) {
+      const char = source[index];
+      if (lineComment) {
+        if (char === "\n") lineComment = false;
+        continue;
+      }
+      if (quote) {
+        if (quote.length === 3) {
+          if (source.startsWith(quote, index)) {
+            index += 2;
+            quote = null;
+          }
+          continue;
+        }
+        if (escaping) {
+          escaping = false;
+          continue;
+        }
+        if (char === "\\") {
+          escaping = true;
+          continue;
+        }
+        if (char === quote) quote = null;
+        continue;
+      }
+      if (char === "#") {
+        lineComment = true;
+        continue;
+      }
+      if (source.startsWith('"""', index) || source.startsWith("'''", index)) {
+        quote = source.slice(index, index + 3);
+        index += 2;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        continue;
+      }
+      if (char === "(") depth += 1;
+      if (char === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          bodies.push(source.slice(openIndex + 1, index));
+          finder.lastIndex = index + 1;
+          break;
+        }
+      }
+    }
+  }
+  return bodies;
+}
+
+function parseCommandRulesText(text, sourcePath) {
+  const ruleBodies = extractStarlarkCallBodies(text, "prefix_rule");
+  const rules = ruleBodies.map((body, index) => {
+    const patternExpression = extractNamedArgument(body, "pattern");
+    const patternTokens = starlarkStringLiterals(patternExpression);
+    const decisionExpression = extractNamedArgument(body, "decision");
+    const decision = normalizeConfigKey(decisionExpression ? unquoteStarlarkString(decisionExpression) : "allow");
+    const normalizedDecision = ["allow", "prompt", "forbidden"].includes(decision) ? decision : "unknown";
+    const justification = extractNamedArgument(body, "justification");
+    const hasJustification = Boolean(unquoteStarlarkString(justification || "").trim());
+    const hasMatchExamples = extractNamedArgument(body, "match") !== null || extractNamedArgument(body, "not_match") !== null;
+    const firstToken = normalizeConfigKey(patternTokens[0] || "");
+    const broad = patternTokens.length <= 1 || broadCommandRuleTokens.has(firstToken);
+    const broadPrompt = broad && normalizedDecision === "prompt";
+    return {
+      index: index + 1,
+      sourcePath: displayPath(sourcePath),
+      decision: normalizedDecision,
+      patternTokens,
+      patternLabel: patternTokens.length ? patternTokens.join(" ") : "unknown",
+      broad,
+      broadPrompt,
+      missingJustification: ["prompt", "forbidden"].includes(normalizedDecision) && !hasJustification,
+      tested: hasMatchExamples,
+      parseWarning: !patternExpression || !patternTokens.length || normalizedDecision === "unknown",
+    };
+  });
+  return rules;
+}
+
+async function summarizeCommandRuleFile(filePath, { scope, active = true } = {}) {
+  const stats = await statOrNull(filePath);
+  const source = {
+    scope,
+    path: displayPath(filePath),
+    active,
+    exists: Boolean(stats?.isFile()),
+    bytes: stats?.isFile() ? stats.size : 0,
+    modifiedAt: stats?.isFile() ? stats.mtime.toISOString() : null,
+    ruleCount: 0,
+    promptCount: 0,
+    forbiddenCount: 0,
+    allowCount: 0,
+    broadRuleCount: 0,
+    broadPromptRuleCount: 0,
+    missingJustificationCount: 0,
+    testedRuleCount: 0,
+    parseWarningCount: 0,
+    large: Boolean(stats?.isFile() && stats.size >= largeCommandRuleFileBytes),
+    rules: [],
+    error: null,
+  };
+  if (!stats?.isFile()) return source;
+  try {
+    const text = await fs.readFile(filePath, "utf8");
+    const rules = parseCommandRulesText(text, filePath);
+    source.rules = rules;
+    source.ruleCount = rules.length;
+    source.promptCount = rules.filter((rule) => rule.decision === "prompt").length;
+    source.forbiddenCount = rules.filter((rule) => rule.decision === "forbidden").length;
+    source.allowCount = rules.filter((rule) => rule.decision === "allow").length;
+    source.broadRuleCount = rules.filter((rule) => rule.broad).length;
+    source.broadPromptRuleCount = rules.filter((rule) => rule.broadPrompt).length;
+    source.missingJustificationCount = rules.filter((rule) => rule.missingJustification).length;
+    source.testedRuleCount = rules.filter((rule) => rule.tested).length;
+    source.parseWarningCount = rules.filter((rule) => rule.parseWarning).length;
+  } catch (error) {
+    source.error = error.message;
+    source.parseWarningCount = 1;
+  }
+  return source;
+}
+
+async function summarizeCommandRuleRoot(root, { scope, active = true } = {}) {
+  const existsOnDisk = await exists(root);
+  const summary = {
+    scope,
+    root: displayPath(root),
+    active,
+    exists: existsOnDisk,
+    fileCount: 0,
+    ruleCount: 0,
+    promptCount: 0,
+    forbiddenCount: 0,
+    allowCount: 0,
+    broadRuleCount: 0,
+    broadPromptRuleCount: 0,
+    missingJustificationCount: 0,
+    testedRuleCount: 0,
+    parseWarningCount: 0,
+    largeFileCount: 0,
+    bytes: 0,
+    files: [],
+    error: null,
+  };
+  if (!existsOnDisk) return summary;
+
+  let entries = [];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    return { ...summary, error: error.message };
+  }
+
+  const ruleFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".rules"))
+    .map((entry) => path.join(root, entry.name))
+    .sort((a, b) => a.localeCompare(b));
+  const files = await Promise.all(ruleFiles.map((filePath) => summarizeCommandRuleFile(filePath, { scope, active })));
+  summary.files = files;
+  summary.fileCount = files.length;
+  summary.ruleCount = files.reduce((total, file) => total + file.ruleCount, 0);
+  summary.promptCount = files.reduce((total, file) => total + file.promptCount, 0);
+  summary.forbiddenCount = files.reduce((total, file) => total + file.forbiddenCount, 0);
+  summary.allowCount = files.reduce((total, file) => total + file.allowCount, 0);
+  summary.broadRuleCount = files.reduce((total, file) => total + file.broadRuleCount, 0);
+  summary.broadPromptRuleCount = files.reduce((total, file) => total + file.broadPromptRuleCount, 0);
+  summary.missingJustificationCount = files.reduce((total, file) => total + file.missingJustificationCount, 0);
+  summary.testedRuleCount = files.reduce((total, file) => total + file.testedRuleCount, 0);
+  summary.parseWarningCount = files.reduce((total, file) => total + file.parseWarningCount, 0);
+  summary.largeFileCount = files.filter((file) => file.large).length;
+  summary.bytes = files.reduce((total, file) => total + file.bytes, 0);
+  return summary;
+}
+
+async function commandRuleRoots(currentProject = null) {
+  const roots = [
+    { scope: "user", root: paths.userRules, active: true },
+    { scope: "team", root: paths.adminRules, active: true },
+  ];
+
+  if (currentProject?.path && currentProject.exists) {
+    roots.push({
+      scope: "current project",
+      root: path.join(currentProject.path, ".codex", "rules"),
+      active: true,
+    });
+  }
+
+  return roots;
+}
+
+function mergeCommandRuleSources(sources, rulesFeature = true) {
+  const activeSources = sources.filter((source) => source.active && source.exists);
+  const ruleFiles = activeSources.flatMap((source) => source.files || []);
+  const allRules = ruleFiles.flatMap((file) => file.rules || []);
+  const ruleCount = allRules.length;
+  const fileCount = ruleFiles.length;
+  const promptCount = allRules.filter((rule) => rule.decision === "prompt").length;
+  const forbiddenCount = allRules.filter((rule) => rule.decision === "forbidden").length;
+  const allowCount = allRules.filter((rule) => rule.decision === "allow").length;
+  const broadRuleCount = allRules.filter((rule) => rule.broad).length;
+  const broadPromptRuleCount = allRules.filter((rule) => rule.broadPrompt).length;
+  const missingJustificationCount = allRules.filter((rule) => rule.missingJustification).length;
+  const testedRuleCount = allRules.filter((rule) => rule.tested).length;
+  const parseWarningCount =
+    allRules.filter((rule) => rule.parseWarning).length + activeSources.filter((source) => source.error).length + ruleFiles.filter((file) => file.error).length;
+  const largeFileCount = ruleFiles.filter((file) => file.large).length;
+  const totalBytes = ruleFiles.reduce((total, file) => total + file.bytes, 0);
+  const broadRules = allRules
+    .filter((rule) => rule.broad)
+    .slice(0, 8)
+    .map((rule) => ({
+      decision: rule.decision,
+      pattern: rule.patternLabel,
+      sourcePath: rule.sourcePath,
+    }));
+  const highLoad = rulesFeature && (broadPromptRuleCount >= 2 || promptCount >= 20 || parseWarningCount > 0 || largeFileCount >= 2);
+  const mediumLoad = rulesFeature && (highLoad || broadRuleCount >= 1 || promptCount >= 5 || forbiddenCount >= 5 || fileCount >= 6);
+  const tone = !rulesFeature ? "low" : highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = !rulesFeature ? "Disabled" : ruleCount ? `${ruleCount.toLocaleString()} rule${ruleCount === 1 ? "" : "s"}` : "None";
+  const action =
+    !rulesFeature
+      ? "Feature off"
+      : tone === "low"
+        ? ruleCount
+          ? "Keep narrow"
+          : "No rules"
+        : parseWarningCount
+          ? "Test rules"
+          : broadRuleCount
+            ? "Narrow broad rules"
+            : "Review execpolicy";
+  const detail =
+    !rulesFeature
+      ? "Codex command rules are disabled by features.rules = false."
+      : ruleCount
+        ? [
+            "Codex scans .rules files at startup and uses prefix_rule entries to allow, prompt, or block commands outside the sandbox.",
+            `Refit found ${ruleCount.toLocaleString()} active command rule${ruleCount === 1 ? "" : "s"} in ${fileCount.toLocaleString()} file${fileCount === 1 ? "" : "s"}: ${promptCount.toLocaleString()} prompt, ${forbiddenCount.toLocaleString()} forbidden, ${allowCount.toLocaleString()} allow.`,
+            broadRuleCount ? `${broadRuleCount.toLocaleString()} rule${broadRuleCount === 1 ? "" : "s"} match a broad command prefix; broad prompt rules can add approval churn.` : null,
+            missingJustificationCount ? `${missingJustificationCount.toLocaleString()} prompt/forbidden rule${missingJustificationCount === 1 ? "" : "s"} lack a justification.` : null,
+            parseWarningCount ? `${parseWarningCount.toLocaleString()} rule file or rule${parseWarningCount === 1 ? " needs" : "s need"} testing with codex execpolicy check.` : null,
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : "No active Codex command rule files were found in user, team, or current trusted project layers.";
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    rulesFeature,
+    sourceCount: sources.length,
+    activeSourceCount: activeSources.length,
+    fileCount,
+    ruleCount,
+    promptCount,
+    forbiddenCount,
+    allowCount,
+    broadRuleCount,
+    broadPromptRuleCount,
+    missingJustificationCount,
+    testedRuleCount,
+    parseWarningCount,
+    largeFileCount,
+    totalBytes,
+    ruleFiles: ruleFiles.map((file) => ({
+      scope: file.scope,
+      path: file.path,
+      active: file.active,
+      exists: file.exists,
+      bytes: file.bytes,
+      modifiedAt: file.modifiedAt,
+      ruleCount: file.ruleCount,
+      promptCount: file.promptCount,
+      forbiddenCount: file.forbiddenCount,
+      allowCount: file.allowCount,
+      broadRuleCount: file.broadRuleCount,
+      broadPromptRuleCount: file.broadPromptRuleCount,
+      missingJustificationCount: file.missingJustificationCount,
+      testedRuleCount: file.testedRuleCount,
+      parseWarningCount: file.parseWarningCount,
+      large: file.large,
+      error: file.error,
+    })),
+    broadRules,
+    sources: sources.map((source) => ({
+      scope: source.scope,
+      root: source.root,
+      active: source.active,
+      exists: source.exists,
+      fileCount: source.fileCount,
+      ruleCount: source.ruleCount,
+      promptCount: source.promptCount,
+      forbiddenCount: source.forbiddenCount,
+      allowCount: source.allowCount,
+      broadRuleCount: source.broadRuleCount,
+      broadPromptRuleCount: source.broadPromptRuleCount,
+      missingJustificationCount: source.missingJustificationCount,
+      testedRuleCount: source.testedRuleCount,
+      parseWarningCount: source.parseWarningCount,
+      largeFileCount: source.largeFileCount,
+      bytes: source.bytes,
+      error: source.error,
+    })),
+  };
+}
+
+async function getCommandRuleSummary({ rulesFeature = true, currentProject = null } = {}) {
+  const roots = await commandRuleRoots(currentProject);
+  const sources = await Promise.all(roots.map((entry) => summarizeCommandRuleRoot(entry.root, entry)));
+  return mergeCommandRuleSources(sources, rulesFeature);
 }
 
 function shellEnvSecretNameCount() {
@@ -3825,6 +4292,8 @@ async function getCodexConfigSummary() {
     managedConfig: emptyManagedConfigSummary(),
     goalsFeature: false,
     hooksFeature: true,
+    rulesFeature: true,
+    commandRules: emptyCommandRuleSummary(true),
     hookSummary: {
       hooksFeature: true,
       status: "ready",
@@ -3903,6 +4372,7 @@ async function getCodexConfigSummary() {
     summary.customAgents = await getCustomAgentSummary(null);
     summary.customPrompts = await getCustomPromptSummary();
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
+    summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
     return summary;
   }
   summary.exists = true;
@@ -3930,6 +4400,7 @@ async function getCodexConfigSummary() {
     summary.contextBudgetSummary = buildContextBudgetSummary(values);
     summary.goalsFeature = values["features.goals"] === true;
     summary.hooksFeature = (values["features.hooks"] ?? values["features.codex_hooks"]) !== false;
+    summary.rulesFeature = values["features.rules"] !== false;
     summary.memoriesFeature = values["features.memories"] === true;
     summary.memoriesUseMemories = values["memories.use_memories"] ?? null;
     summary.memoriesUseMemoriesEffective = summary.memoriesFeature && summary.memoriesUseMemories !== false;
@@ -3988,6 +4459,10 @@ async function getCodexConfigSummary() {
     });
     summary.customAgents = await getCustomAgentSummary(summary.projectReadiness.currentProject);
     summary.customPrompts = await getCustomPromptSummary();
+    summary.commandRules = await getCommandRuleSummary({
+      rulesFeature: summary.rulesFeature,
+      currentProject: summary.projectReadiness.currentProject,
+    });
     summary.mcpSummary = buildMcpConfigSummary(mcpValues, mcpSections);
     summary.enabledMcpCount = summary.mcpSummary.enabledCount;
     summary.disabledMcpCount = summary.mcpSummary.disabledCount;
@@ -3996,6 +4471,7 @@ async function getCodexConfigSummary() {
   } catch (error) {
     summary.error = error.message;
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
+    summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
   }
 
   return summary;
@@ -4090,6 +4566,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
   const customPrompts = codexConfig?.customPrompts || emptyCustomPromptSummary();
   const managedConfig = codexConfig?.managedConfig || emptyManagedConfigSummary();
+  const commandRules = codexConfig?.commandRules || emptyCommandRuleSummary(codexConfig?.rulesFeature !== false);
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -4261,6 +4738,30 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# On managed Macs, an MDM profile can also set com.openai.codex payloads.",
         "# Cloud-managed requirements can be assigned by ChatGPT Business/Enterprise admins.",
+      ].join("\n"),
+    });
+  }
+
+  if (commandRules.status === "ready" && commandRules.tone !== "low") {
+    const rulePaths = (commandRules.ruleFiles || []).map((file) => file.path).filter(Boolean).slice(0, 4);
+    const rulesArgs = rulePaths.length ? rulePaths.map((rulePath) => `  --rules ${shellQuote(rulePath)} \\`) : ["  --rules ~/.codex/rules/default.rules \\"];
+    addFix({
+      id: "command-rules",
+      label: "Command Rules",
+      value: commandRules.label,
+      tone: commandRules.tone === "high" ? "high" : "medium",
+      action: commandRules.action || "Review execpolicy",
+      detail:
+        "Command rules decide whether Codex can run matching commands outside the sandbox. Broad prompt rules can add repeated approval stops.",
+      snippet: [
+        "# Test how active command rules handle a specific command:",
+        "codex execpolicy check --pretty \\",
+        ...rulesArgs,
+        "  -- <command>",
+        "",
+        "# Keep prefix_rule patterns narrow, for example:",
+        '# pattern = ["pnpm", "run", "lint"]',
+        '# Avoid broad prompt patterns such as ["bash"], ["python"], or ["curl"] unless you really want every matching escalation to stop.',
       ].join("\n"),
     });
   }
@@ -4662,6 +5163,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
   const customPrompts = codexConfig?.customPrompts || emptyCustomPromptSummary();
   const managedConfig = codexConfig?.managedConfig || emptyManagedConfigSummary();
+  const commandRules = codexConfig?.commandRules || emptyCommandRuleSummary(codexConfig?.rulesFeature !== false);
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -4877,6 +5379,24 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
               : 55
             : 16,
       detail: managedConfig.detail,
+    },
+    {
+      id: "command-rules",
+      label: "Command Rules",
+      value: commandRules.label,
+      tone: commandRules.tone,
+      action: commandRules.action,
+      priority:
+        commandRules.tone === "high"
+          ? 89
+          : commandRules.tone === "medium"
+            ? commandRules.broadRuleCount
+              ? 73
+              : 56
+            : commandRules.ruleCount
+              ? 30
+              : 15,
+      detail: commandRules.detail,
     },
     {
       id: "shell-snapshot",
@@ -5296,6 +5816,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (commandRules.status === "ready" && commandRules.tone !== "low") {
+    addRecommendation({
+      id: "command-rules",
+      label: "Command Rules",
+      value: commandRules.label,
+      action: commandRules.action || "Review execpolicy",
+      tone: commandRules.tone === "high" ? "high" : "medium",
+      priority: commandRules.broadPromptRuleCount || commandRules.parseWarningCount ? 87 : 59,
+      detail:
+        commandRules.broadPromptRuleCount > 0
+          ? `${commandRules.detail} Narrow broad prompt rules before changing approval policy.`
+          : commandRules.detail,
+    });
+  }
+
   if (threadLimit >= 128) {
     addRecommendation({
       id: "thread-discipline",
@@ -5605,7 +6140,9 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     goalsFeature,
     webSearchMode,
     hooksFeature,
+    rulesFeature: codexConfig?.rulesFeature !== false,
     hookSummary,
+    commandRules,
     memoriesFeature,
     memoriesUseMemories: codexConfig?.memoriesUseMemories ?? null,
     memoriesUseMemoriesEffective: memoriesUse,
@@ -5624,6 +6161,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     customAgents,
     customPrompts,
     managedConfig,
+    commandRules,
     authCache,
     projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
@@ -6099,6 +6637,9 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(5, Number(metrics.managedConfigConflictCount || 0) * 2);
   score -= Math.min(3, Number(metrics.managedMcpBlockedCount || 0) * 1.5);
   score -= Math.min(3, Number(metrics.managedHookCount || 0) * 0.75);
+  score -= Math.min(5, Number(metrics.commandRuleBroadPromptCount || 0) * 1.5);
+  score -= Math.min(4, Math.max(0, Number(metrics.commandRulePromptCount || 0) - 6) * 0.2);
+  score -= Math.min(3, Number(metrics.commandRuleParseWarningCount || 0) * 1.5);
   return Math.round(clampNumber(score, 0, 100));
 }
 
@@ -6193,6 +6734,20 @@ function benchmarkGuidance(metrics) {
   if (metrics.managedMcpBlockedCount > 0) {
     guidance.push(
       `${Number(metrics.managedMcpBlockedCount).toLocaleString()} MCP server${metrics.managedMcpBlockedCount === 1 ? "" : "s"} may be outside the managed allowlist; check admin policy before debugging MCP startup.`,
+    );
+  }
+  if (metrics.commandRuleBroadPromptCount > 0) {
+    guidance.push(
+      `Narrow ${Number(metrics.commandRuleBroadPromptCount).toLocaleString()} broad command prompt rule${metrics.commandRuleBroadPromptCount === 1 ? "" : "s"}; broad prefix_rule patterns can make routine escalations stop repeatedly.`,
+    );
+  } else if (metrics.commandRulePromptCount >= 8) {
+    guidance.push(
+      `Review ${Number(metrics.commandRulePromptCount).toLocaleString()} prompt command rule${metrics.commandRulePromptCount === 1 ? "" : "s"} with codex execpolicy check before changing approval policy.`,
+    );
+  }
+  if (metrics.commandRuleParseWarningCount > 0) {
+    guidance.push(
+      `Test ${Number(metrics.commandRuleParseWarningCount).toLocaleString()} command rule warning${metrics.commandRuleParseWarningCount === 1 ? "" : "s"} with codex execpolicy check.`,
     );
   }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
@@ -6936,6 +7491,12 @@ function benchmarkDeltas(current, previous) {
     "managedConfigConflictCount",
     "managedMcpBlockedCount",
     "managedHookCount",
+    "commandRuleCount",
+    "commandRulePromptCount",
+    "commandRuleForbiddenCount",
+    "commandRuleBroadCount",
+    "commandRuleBroadPromptCount",
+    "commandRuleParseWarningCount",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -7054,6 +7615,20 @@ function summarizeBenchmarkEntry(entry) {
     managedMcpBlockedCount: entry.metrics.managedMcpBlockedCount || 0,
     managedHookCount: entry.metrics.managedHookCount || 0,
     managedFeaturePinCount: entry.metrics.managedFeaturePinCount || 0,
+    commandRulesFeature: entry.metrics.commandRulesFeature !== false,
+    commandRuleSourceCount: entry.metrics.commandRuleSourceCount || 0,
+    commandRuleFileCount: entry.metrics.commandRuleFileCount || 0,
+    commandRuleCount: entry.metrics.commandRuleCount || 0,
+    commandRulePromptCount: entry.metrics.commandRulePromptCount || 0,
+    commandRuleForbiddenCount: entry.metrics.commandRuleForbiddenCount || 0,
+    commandRuleAllowCount: entry.metrics.commandRuleAllowCount || 0,
+    commandRuleBroadCount: entry.metrics.commandRuleBroadCount || 0,
+    commandRuleBroadPromptCount: entry.metrics.commandRuleBroadPromptCount || 0,
+    commandRuleMissingJustificationCount: entry.metrics.commandRuleMissingJustificationCount || 0,
+    commandRuleTestedCount: entry.metrics.commandRuleTestedCount || 0,
+    commandRuleParseWarningCount: entry.metrics.commandRuleParseWarningCount || 0,
+    commandRuleLargeFileCount: entry.metrics.commandRuleLargeFileCount || 0,
+    commandRuleBytes: entry.metrics.commandRuleBytes || 0,
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -7105,6 +7680,10 @@ export async function benchmarkHistory(limit = 12) {
         managedRequirementKeyCount: latest.managedRequirementKeyCount - oldest.managedRequirementKeyCount,
         managedConfigConflictCount: latest.managedConfigConflictCount - oldest.managedConfigConflictCount,
         managedMcpBlockedCount: latest.managedMcpBlockedCount - oldest.managedMcpBlockedCount,
+        commandRuleCount: latest.commandRuleCount - oldest.commandRuleCount,
+        commandRulePromptCount: latest.commandRulePromptCount - oldest.commandRulePromptCount,
+        commandRuleBroadPromptCount: latest.commandRuleBroadPromptCount - oldest.commandRuleBroadPromptCount,
+        commandRuleParseWarningCount: latest.commandRuleParseWarningCount - oldest.commandRuleParseWarningCount,
       }
     : null;
   const previousDeltas = latest && previous
@@ -7129,6 +7708,8 @@ export async function benchmarkHistory(limit = 12) {
         customPromptCount: latest.customPromptCount - previous.customPromptCount,
         managedConfigConflictCount: latest.managedConfigConflictCount - previous.managedConfigConflictCount,
         managedMcpBlockedCount: latest.managedMcpBlockedCount - previous.managedMcpBlockedCount,
+        commandRulePromptCount: latest.commandRulePromptCount - previous.commandRulePromptCount,
+        commandRuleBroadPromptCount: latest.commandRuleBroadPromptCount - previous.commandRuleBroadPromptCount,
       }
     : null;
   const trend =
@@ -7184,6 +7765,7 @@ export async function runBenchmark() {
     (scan.categories.browserCaches?.bytes || 0) +
     (scan.categories.archivedSessionsInActiveTree?.bytes || 0);
   const managedConfigSummary = scan.codexConfig?.managedConfig || emptyManagedConfigSummary();
+  const commandRuleSummary = scan.codexConfig?.commandRules || emptyCommandRuleSummary(scan.codexConfig?.rulesFeature !== false);
 
   const metrics = {
     scoreModel: "local-state-v2",
@@ -7284,6 +7866,20 @@ export async function runBenchmark() {
     managedMcpBlockedCount: managedConfigSummary.managedMcpBlockedCount || 0,
     managedHookCount: managedConfigSummary.managedHookCount || 0,
     managedFeaturePinCount: managedConfigSummary.featurePinCount || 0,
+    commandRulesFeature: commandRuleSummary.rulesFeature !== false,
+    commandRuleSourceCount: commandRuleSummary.activeSourceCount || 0,
+    commandRuleFileCount: commandRuleSummary.fileCount || 0,
+    commandRuleCount: commandRuleSummary.ruleCount || 0,
+    commandRulePromptCount: commandRuleSummary.promptCount || 0,
+    commandRuleForbiddenCount: commandRuleSummary.forbiddenCount || 0,
+    commandRuleAllowCount: commandRuleSummary.allowCount || 0,
+    commandRuleBroadCount: commandRuleSummary.broadRuleCount || 0,
+    commandRuleBroadPromptCount: commandRuleSummary.broadPromptRuleCount || 0,
+    commandRuleMissingJustificationCount: commandRuleSummary.missingJustificationCount || 0,
+    commandRuleTestedCount: commandRuleSummary.testedRuleCount || 0,
+    commandRuleParseWarningCount: commandRuleSummary.parseWarningCount || 0,
+    commandRuleLargeFileCount: commandRuleSummary.largeFileCount || 0,
+    commandRuleBytes: commandRuleSummary.totalBytes || 0,
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
