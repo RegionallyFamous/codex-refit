@@ -321,6 +321,154 @@ async function statOrNull(targetPath) {
   }
 }
 
+async function readJsonOrNull(targetPath) {
+  try {
+    return JSON.parse(await fs.readFile(targetPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function listDirNames(targetPath) {
+  try {
+    return (await fs.readdir(targetPath, { withFileTypes: true })).map((dirent) => dirent.name);
+  } catch {
+    return [];
+  }
+}
+
+function pathContains(parentPath, childPath) {
+  const parent = path.resolve(parentPath || "");
+  const child = path.resolve(childPath || "");
+  return child === parent || child.startsWith(`${parent}${path.sep}`);
+}
+
+function scriptLooksUseful(value) {
+  const script = String(value || "").trim();
+  return Boolean(script && !/no test specified/i.test(script));
+}
+
+async function getProjectReadinessSummary(projectStatus) {
+  const projectPath = projectStatus?.path;
+  const existsOnDisk = Boolean(projectStatus?.exists);
+  const summary = {
+    path: projectPath,
+    label: projectPath ? basenameLabel(projectPath) : "Project",
+    exists: existsOnDisk,
+    score: 0,
+    ready: false,
+    hasGit: false,
+    hasAgents: false,
+    hasAgentsFile: false,
+    agentsBytes: 0,
+    hasCodexDir: false,
+    hasProjectConfig: false,
+    hasLocalEnvironmentHint: false,
+    codexFiles: [],
+    hasPackageJson: false,
+    hasDevScript: false,
+    hasBuildScript: false,
+    hasTestScript: false,
+    scripts: {},
+    gaps: existsOnDisk ? [] : ["Project path is missing"],
+  };
+
+  if (!projectPath || !existsOnDisk) return summary;
+
+  const codexDir = path.join(projectPath, ".codex");
+  const [agentsBytes, agentsOverrideBytes, packageJson, codexDirStats, projectConfigStats, gitStats] = await Promise.all([
+    fileSize(path.join(projectPath, "AGENTS.md")),
+    fileSize(path.join(projectPath, "AGENTS.override.md")),
+    readJsonOrNull(path.join(projectPath, "package.json")),
+    statOrNull(codexDir),
+    statOrNull(path.join(codexDir, "config.toml")),
+    statOrNull(path.join(projectPath, ".git")),
+  ]);
+
+  summary.agentsBytes = Math.max(agentsBytes, agentsOverrideBytes);
+  summary.hasAgents = summary.agentsBytes > 0;
+  summary.hasAgentsFile = agentsBytes > 0 || agentsOverrideBytes > 0;
+  summary.hasGit = Boolean(gitStats);
+  summary.hasCodexDir = Boolean(codexDirStats?.isDirectory());
+  summary.hasProjectConfig = Boolean(projectConfigStats?.isFile());
+
+  if (summary.hasCodexDir) {
+    summary.codexFiles = (await listDirNames(codexDir)).slice(0, 12);
+    summary.hasLocalEnvironmentHint = summary.codexFiles.some((name) => /action|environment|local|setup|worktree/i.test(name));
+  }
+
+  if (packageJson && typeof packageJson === "object") {
+    const scripts = packageJson.scripts && typeof packageJson.scripts === "object" ? packageJson.scripts : {};
+    summary.hasPackageJson = true;
+    summary.scripts = Object.fromEntries(
+      ["dev", "start", "build", "test", "lint", "typecheck", "package:mac"]
+        .filter((name) => scripts[name])
+        .map((name) => [name, scripts[name]]),
+    );
+    summary.hasDevScript = scriptLooksUseful(scripts.dev || scripts.start);
+    summary.hasBuildScript = scriptLooksUseful(scripts.build);
+    summary.hasTestScript = scriptLooksUseful(scripts.test || scripts.lint || scripts.typecheck);
+  }
+
+  if (!summary.hasAgents) {
+    summary.gaps.push(summary.hasAgentsFile ? "Fill in AGENTS.md" : "Add AGENTS.md");
+  }
+  if (!summary.hasCodexDir) summary.gaps.push("Add .codex local setup/actions");
+  if (summary.hasPackageJson && !summary.hasDevScript && !summary.hasBuildScript) summary.gaps.push("Document run/build command");
+  if (summary.hasPackageJson && !summary.hasTestScript && !summary.hasBuildScript) {
+    summary.gaps.push("Add or document verification command");
+  }
+
+  summary.score = Math.min(
+    100,
+    (summary.hasAgents ? 35 : 0) +
+      (summary.hasProjectConfig ? 15 : summary.hasCodexDir ? 8 : 0) +
+      (summary.hasLocalEnvironmentHint ? 10 : 0) +
+      (summary.hasDevScript || summary.hasBuildScript ? 15 : 0) +
+      (summary.hasTestScript ? 25 : 0) +
+      (summary.hasGit ? 5 : 0),
+  );
+  summary.ready = summary.score >= 70 && summary.hasAgents;
+  return summary;
+}
+
+function chooseCurrentProjectReadiness(projects) {
+  const candidates = [process.cwd(), rootDir].map((candidate) => path.resolve(candidate));
+  return (
+    projects
+      .filter((project) => project.exists)
+      .sort((a, b) => {
+        const aMatch = candidates.some((candidate) => pathContains(a.path, candidate)) ? 1 : 0;
+        const bMatch = candidates.some((candidate) => pathContains(b.path, candidate)) ? 1 : 0;
+        if (aMatch !== bMatch) return bMatch - aMatch;
+        return String(b.path || "").length - String(a.path || "").length;
+      })[0] || null
+  );
+}
+
+async function getTrustedProjectReadiness(trustedProjectStatuses) {
+  const projects = await Promise.all((trustedProjectStatuses || []).map((project) => getProjectReadinessSummary(project)));
+  const existingProjects = projects.filter((project) => project.exists);
+  const currentProject = chooseCurrentProjectReadiness(projects);
+
+  return {
+    projects,
+    existingCount: existingProjects.length,
+    readyCount: existingProjects.filter((project) => project.ready).length,
+    missingGuidanceCount: existingProjects.filter((project) => !project.hasAgents).length,
+    missingCodexDirCount: existingProjects.filter((project) => !project.hasCodexDir).length,
+    missingVerificationCount: existingProjects.filter((project) => project.hasPackageJson && !project.hasTestScript && !project.hasBuildScript).length,
+    averageScore: existingProjects.length
+      ? Math.round(existingProjects.reduce((total, project) => total + project.score, 0) / existingProjects.length)
+      : 0,
+    currentProject,
+    weakestProjects: existingProjects
+      .filter((project) => !project.ready)
+      .sort((a, b) => a.score - b.score)
+      .slice(0, 5),
+  };
+}
+
 async function duBytes(targetPath) {
   const stats = await statOrNull(targetPath);
   if (!stats) return 0;
@@ -893,6 +1041,17 @@ async function getCodexConfigSummary() {
     trustedProjectPaths: [],
     trustedProjectStatuses: [],
     staleTrustedProjectPaths: [],
+    projectReadiness: {
+      projects: [],
+      existingCount: 0,
+      readyCount: 0,
+      missingGuidanceCount: 0,
+      missingCodexDirCount: 0,
+      missingVerificationCount: 0,
+      averageScore: 0,
+      currentProject: null,
+      weakestProjects: [],
+    },
     enabledPluginCount: 0,
     enabledMcpCount: 0,
     disabledMcpCount: 0,
@@ -944,6 +1103,7 @@ async function getCodexConfigSummary() {
     }));
     summary.staleTrustedProjectPaths = summary.trustedProjectStatuses.filter((project) => !project.exists).map((project) => project.path);
     summary.staleTrustedProjectCount = summary.staleTrustedProjectPaths.length;
+    summary.projectReadiness = await getTrustedProjectReadiness(summary.trustedProjectStatuses);
     summary.enabledPluginCount = sections.filter((section) => section.startsWith('plugins."') && values[`${section}.enabled`] === true).length;
     const mcpSections = sections.filter(isTopLevelMcpSection);
     summary.enabledMcpCount = mcpSections.filter((section) => values[`${section}.enabled`] !== false).length;
@@ -958,6 +1118,44 @@ async function getCodexConfigSummary() {
 
 function projectTableForPath(projectPath) {
   return `[projects."${String(projectPath || "").replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"]`;
+}
+
+function projectCommandLine(project, candidates, fallback) {
+  const scripts = project?.scripts || {};
+  const scriptName = candidates.find((name) => scripts[name]);
+  return scriptName ? `npm run ${scriptName}` : fallback;
+}
+
+function buildProjectPlaybookSnippet(project) {
+  const projectPath = project?.path || "/path/to/project";
+  const runCommand = projectCommandLine(project, ["dev", "start"], "Document the local run command.");
+  const buildCommand = projectCommandLine(project, ["build", "package:mac"], "Document the build command.");
+  const verifyCommand = projectCommandLine(project, ["test", "lint", "typecheck", "build"], "Document the smallest useful verification command.");
+  const lines = [
+    `# ${path.join(projectPath, "AGENTS.md")}`,
+    "",
+    "## Project Playbook",
+    `- Run locally: \`${runCommand}\``,
+    `- Build/package: \`${buildCommand}\``,
+    `- Verify changes: \`${verifyCommand}\``,
+    "- Keep changes scoped and preserve generated assets unless explicitly asked.",
+    "- After UI changes, run the relevant build and check the packaged app when behavior depends on Electron.",
+    "",
+    "## Done When",
+    "- The requested behavior is visible in the app or covered by the smallest relevant command.",
+    "- The working tree only contains intentional changes.",
+  ];
+
+  if (!project?.hasCodexDir) {
+    lines.push(
+      "",
+      "# Also configure Codex app Local Environments for this project:",
+      "# - setup script for worktrees, such as npm install && npm run build",
+      "# - actions for common commands, such as dev, build, and test",
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
@@ -977,6 +1175,8 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const fastMode = Boolean(codexConfig?.fastMode);
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
+  const projectReadiness = codexConfig?.projectReadiness || {};
+  const currentProject = projectReadiness.currentProject;
 
   if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
     addFix({
@@ -1033,6 +1233,22 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "# If Codex-Spark is available for your account, test it in a separate profile:",
         '# model = "gpt-5.3-codex-spark"',
       ].join("\n"),
+    });
+  }
+
+  if (
+    currentProject &&
+    (!currentProject.hasAgents || !currentProject.hasCodexDir || (!currentProject.hasTestScript && !currentProject.hasBuildScript))
+  ) {
+    addFix({
+      id: "project-playbook",
+      label: "Project Playbook",
+      value: `${currentProject.score}/100`,
+      tone: currentProject.score >= 70 ? "low" : "medium",
+      action: currentProject.hasAgents ? "Add setup/actions" : "Add AGENTS.md",
+      detail:
+        "Project-level guidance and local environment actions help Codex start with run, build, and verification context instead of rediscovering it.",
+      snippet: buildProjectPlaybookSnippet(currentProject),
     });
   }
 
@@ -1184,6 +1400,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   const fastTaskProfileNames = codexConfig?.fastTaskProfileNames || [];
   const hasSparkProfile = Boolean(codexConfig?.hasSparkProfile);
   const hasMiniProfile = Boolean(codexConfig?.hasMiniProfile);
+  const projectReadiness = codexConfig?.projectReadiness || {};
+  const currentProject = projectReadiness.currentProject || null;
+  const existingProjectCount = Number(projectReadiness.existingCount || 0);
+  const projectReadyCount = Number(projectReadiness.readyCount || 0);
+  const projectGapCount = Number(projectReadiness.missingGuidanceCount || 0) + Number(projectReadiness.missingCodexDirCount || 0);
   const globalGuidanceReady = Boolean(codexConfig?.globalAgentsExists);
   const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
@@ -1209,6 +1430,14 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     : emptyGlobalGuidance
       ? "Global AGENTS.md exists but is empty, so Codex skips it."
       : "No global AGENTS guidance found; adding durable guidance can reduce repeated correction loops.";
+
+  const projectDetail = currentProject
+    ? currentProject.ready
+      ? `${currentProject.label} has a useful project playbook score (${currentProject.score}/100).`
+      : `${currentProject.label} is missing ${currentProject.gaps.slice(0, 3).join(", ")}. Add project guidance or local environment actions so Codex does not rediscover setup every run.`
+    : existingProjectCount
+      ? `${projectReadyCount}/${existingProjectCount} trusted projects look Codex-ready. Add AGENTS.md and local setup/actions to the projects you use most.`
+      : "No existing trusted projects were found to inspect.";
 
   const runtimeDetail = runtime?.versionMismatch
     ? `Terminal Codex is ${runtime.cliVersion}; the bundled app binary is ${runtime.appVersion}. The manual notes app and CLI versions can differ.`
@@ -1368,6 +1597,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   const requiredMcpCount = Number(codexConfig?.requiredMcpCount || 0);
   const workflowAdvice = [
     {
+      id: "project-playbooks",
+      label: "Project Playbooks",
+      value: existingProjectCount ? `${projectReadyCount}/${existingProjectCount}` : "None",
+      tone: projectGapCount || currentProject?.ready === false ? "medium" : "low",
+      action: currentProject?.ready === false ? "Add repo guidance" : projectGapCount ? "Improve top projects" : "Keep current",
+      priority: currentProject?.ready === false ? 86 : projectGapCount ? 66 : 22,
+      detail: projectDetail,
+    },
+    {
       id: "runtime-version",
       label: "Codex Runtime",
       value: runtime?.versionMismatch ? "Mismatch" : runtime?.cliVersion || runtime?.appVersion || "Missing",
@@ -1515,6 +1753,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     });
   }
 
+  if (currentProject && !currentProject.ready) {
+    addRecommendation({
+      id: "project-playbook",
+      label: "Project Playbook",
+      value: `${currentProject.score}/100`,
+      action: currentProject.hasAgents ? "Add setup/actions" : "Add AGENTS.md",
+      tone: "medium",
+      priority: 72,
+      detail: projectDetail,
+    });
+  }
+
   if (trustedProjectCount >= 20) {
     addRecommendation({
       id: "trusted-project-review",
@@ -1631,6 +1881,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     goalsFeature,
     webSearchMode,
     maxConcurrentThreadsPerSession: codexConfig?.maxConcurrentThreadsPerSession || null,
+    projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
     hasFastTaskProfile,
     fastTaskProfileNames,
