@@ -495,6 +495,23 @@ function mcpServerDescriptors(sections) {
   return descriptors;
 }
 
+function modelProviderDescriptors(sections = []) {
+  const descriptors = [];
+  const seen = new Set();
+  for (const section of sections) {
+    const match = section.match(/^model_providers\.(?:"([^"]+)"|([A-Za-z0-9_-]+))$/);
+    if (!match) continue;
+    const name = match[1] || match[2];
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    descriptors.push({
+      name,
+      section,
+    });
+  }
+  return descriptors;
+}
+
 function tomlArrayStringNames(value) {
   if (value === undefined || value === null) return [];
   const text = String(value);
@@ -512,6 +529,276 @@ function tomlInlineTableValues(value) {
 function tomlInlineTableKeys(value) {
   if (value === undefined || value === null) return [];
   return [...String(value).matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=/g)].map((match) => match[1]).filter(Boolean);
+}
+
+function hostLabelFromUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  try {
+    const url = new URL(text);
+    return url.host || text;
+  } catch {
+    return text.replace(/^https?:\/\//, "").split("/")[0] || text;
+  }
+}
+
+function providerEnvVarNames(values = {}, section) {
+  const names = [];
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) names.push(value);
+  };
+  add(values[`${section}.env_key`]);
+  for (const value of tomlInlineTableValues(values[`${section}.env_http_headers`])) add(value);
+  const envHeaderPrefix = `${section}.env_http_headers.`;
+  for (const [key, value] of Object.entries(values)) {
+    if (key.startsWith(envHeaderPrefix)) add(value);
+  }
+  return [...new Set(names)];
+}
+
+function projectIgnoredConfigKeys(values = {}, sections = []) {
+  const ignoredTopLevel = new Set([
+    "openai_base_url",
+    "chatgpt_base_url",
+    "apps_mcp_product_sku",
+    "model_provider",
+    "notify",
+    "profile",
+    "experimental_realtime_ws_base_url",
+    "otel",
+  ]);
+  const ignored = new Set();
+  for (const key of Object.keys(values)) {
+    const top = key.split(".")[0];
+    if (ignoredTopLevel.has(top)) ignored.add(top);
+    if (key.startsWith("model_providers.")) ignored.add("model_providers");
+    if (key.startsWith("profiles.")) ignored.add("profiles");
+    if (key.startsWith("otel.")) ignored.add("otel");
+  }
+  for (const section of sections) {
+    if (section.startsWith("model_providers.")) ignored.add("model_providers");
+    if (section.startsWith("profiles.")) ignored.add("profiles");
+    if (section.startsWith("otel.")) ignored.add("otel");
+  }
+  return [...ignored].sort((a, b) => a.localeCompare(b));
+}
+
+function emptyModelProviderSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "OpenAI default",
+    action: "Keep default",
+    detail: "No custom model providers were found. Codex will use the built-in OpenAI provider unless a run overrides it.",
+    activeProvider: "openai",
+    activeProviderCustom: false,
+    openaiBaseUrlConfigured: false,
+    providerCount: 0,
+    customProviderCount: 0,
+    envKeyCount: 0,
+    missingEnvKeyCount: 0,
+    activeMissingEnvKeyCount: 0,
+    envHeaderCount: 0,
+    missingEnvHeaderCount: 0,
+    authCommandCount: 0,
+    activeAuthCommand: false,
+    authConflictCount: 0,
+    slowAuthTimeoutCount: 0,
+    invalidBuiltInOverrideCount: 0,
+    remoteNoAuthCount: 0,
+    activeRemoteNoAuth: false,
+    projectIgnoredKeyCount: 0,
+    projectIgnoredKeys: [],
+    providers: [],
+  };
+}
+
+function buildModelProviderSummary(values = {}, sections = [], projectConfig = null) {
+  const summary = emptyModelProviderSummary();
+  const activeProvider = String(values.model_provider || "openai");
+  const descriptors = modelProviderDescriptors(sections);
+  const reservedCustomProviderNames = new Set(["openai", "ollama", "lmstudio"]);
+  const providerSections = new Set(descriptors.map((descriptor) => descriptor.section));
+  const projectIgnoredKeys = projectConfig ? projectIgnoredConfigKeys(projectConfig.values || {}, projectConfig.sections || []) : [];
+  const openaiBaseUrlConfigured = Boolean(values.openai_base_url);
+
+  const providers = descriptors.map((descriptor) => {
+    const section = descriptor.section;
+    const baseUrl = values[`${section}.base_url`] || "";
+    const baseHost = hostLabelFromUrl(baseUrl);
+    const localBaseUrl = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(String(baseUrl || ""));
+    const envKey = values[`${section}.env_key`] || null;
+    const envHeaderNames = providerEnvVarNames(values, section).filter((name) => name !== envKey);
+    const missingEnvKey = Boolean(envKey && process.env[envKey] === undefined);
+    const missingEnvHeaderCount = envHeaderNames.filter((name) => process.env[name] === undefined).length;
+    const hasAuthCommand = Boolean(values[`${section}.auth.command`]);
+    const authTimeoutMs = configNumber(values[`${section}.auth.timeout_ms`]) ?? (hasAuthCommand ? 5000 : null);
+    const requiresOpenAiAuth = values[`${section}.requires_openai_auth`] === true;
+    const hasExperimentalBearerToken = Boolean(values[`${section}.experimental_bearer_token`]);
+    const authConflict = hasAuthCommand && Boolean(envKey || hasExperimentalBearerToken || requiresOpenAiAuth);
+    const remoteNoAuth = Boolean(baseUrl && !localBaseUrl && !envKey && !hasAuthCommand && !requiresOpenAiAuth);
+    const active = descriptor.name === activeProvider;
+
+    return {
+      name: descriptor.name,
+      active,
+      baseHost,
+      localBaseUrl,
+      wireApi: values[`${section}.wire_api`] || null,
+      requiresOpenAiAuth,
+      envKeyConfigured: Boolean(envKey),
+      envKeyName: envKey,
+      envKeyPresent: envKey ? !missingEnvKey : null,
+      envHeaderCount: envHeaderNames.length,
+      missingEnvHeaderCount,
+      hasAuthCommand,
+      authTimeoutMs,
+      authRefreshIntervalMs: configNumber(values[`${section}.auth.refresh_interval_ms`]),
+      authConflict,
+      slowAuthTimeout: Boolean(hasAuthCommand && authTimeoutMs > 5000),
+      invalidBuiltInOverride: reservedCustomProviderNames.has(descriptor.name),
+      remoteNoAuth,
+    };
+  });
+
+  const activeProviderCustom = providers.some((provider) => provider.active);
+  const activeProviderKnownBuiltIn =
+    ["openai", "amazon-bedrock", "ollama", "lmstudio"].includes(activeProvider) || activeProviderCustom;
+  const missingEnvKeyCount = providers.filter((provider) => provider.envKeyConfigured && !provider.envKeyPresent).length;
+  const activeMissingEnvKeyCount = providers.filter((provider) => provider.active && provider.envKeyConfigured && !provider.envKeyPresent).length;
+  const envHeaderCount = providers.reduce((total, provider) => total + provider.envHeaderCount, 0);
+  const missingEnvHeaderCount = providers.reduce((total, provider) => total + provider.missingEnvHeaderCount, 0);
+  const authCommandCount = providers.filter((provider) => provider.hasAuthCommand).length;
+  const activeAuthCommand = providers.some((provider) => provider.active && provider.hasAuthCommand);
+  const authConflictCount = providers.filter((provider) => provider.authConflict).length;
+  const slowAuthTimeoutCount = providers.filter((provider) => provider.slowAuthTimeout).length;
+  const invalidBuiltInOverrideCount = providers.filter((provider) => provider.invalidBuiltInOverride).length;
+  const remoteNoAuthCount = providers.filter((provider) => provider.remoteNoAuth).length;
+  const activeRemoteNoAuth = providers.some((provider) => provider.active && provider.remoteNoAuth);
+  const unknownActiveProvider = !activeProviderKnownBuiltIn && !providerSections.has(`model_providers.${activeProvider}`);
+  const highLoad =
+    activeMissingEnvKeyCount > 0 ||
+    authConflictCount > 0 ||
+    invalidBuiltInOverrideCount > 0 ||
+    activeRemoteNoAuth ||
+    unknownActiveProvider;
+  const mediumLoad =
+    highLoad ||
+    activeProviderCustom ||
+    openaiBaseUrlConfigured ||
+    authCommandCount > 0 ||
+    missingEnvKeyCount > 0 ||
+    missingEnvHeaderCount > 0 ||
+    slowAuthTimeoutCount > 0 ||
+    projectIgnoredKeys.length > 0 ||
+    providers.length >= 3;
+  const activeProviderLabel =
+    activeProvider === "openai" && openaiBaseUrlConfigured
+      ? "OpenAI proxy"
+      : activeProviderCustom
+        ? activeProvider
+        : activeProvider === "openai"
+          ? "OpenAI default"
+          : activeProvider;
+
+  summary.status = "ready";
+  summary.tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  summary.label = providers.length || openaiBaseUrlConfigured ? activeProviderLabel : "OpenAI default";
+  summary.action =
+    summary.tone === "high"
+      ? "Fix provider auth"
+      : summary.tone === "medium"
+        ? activeAuthCommand
+          ? "Check auth helper"
+          : projectIgnoredKeys.length
+            ? "Move user config"
+            : "Review provider"
+        : "Keep default";
+  summary.detail =
+    summary.tone === "low"
+      ? summary.detail
+      : [
+          `Active provider is ${activeProviderLabel}.`,
+          providers.length
+            ? `${providers.length.toLocaleString()} custom provider${providers.length === 1 ? "" : "s"} configured.`
+            : openaiBaseUrlConfigured
+              ? "openai_base_url is set for the built-in OpenAI provider."
+              : null,
+          activeMissingEnvKeyCount
+            ? `${activeMissingEnvKeyCount.toLocaleString()} active provider env key${activeMissingEnvKeyCount === 1 ? " is" : "s are"} missing from this Refit process.`
+            : missingEnvKeyCount
+              ? `${missingEnvKeyCount.toLocaleString()} configured provider env key${missingEnvKeyCount === 1 ? " is" : "s are"} missing from this Refit process.`
+              : null,
+          missingEnvHeaderCount
+            ? `${missingEnvHeaderCount.toLocaleString()} provider header env var${missingEnvHeaderCount === 1 ? " is" : "s are"} missing.`
+            : null,
+          authCommandCount
+            ? `${authCommandCount.toLocaleString()} provider auth command${authCommandCount === 1 ? "" : "s"} configured; command-backed auth can add request latency when tokens refresh.`
+            : null,
+          authConflictCount
+            ? `${authConflictCount.toLocaleString()} provider${authConflictCount === 1 ? " combines" : "s combine"} command auth with another auth mode; the Codex manual says not to combine these.`
+            : null,
+          slowAuthTimeoutCount
+            ? `${slowAuthTimeoutCount.toLocaleString()} auth command timeout${slowAuthTimeoutCount === 1 ? " is" : "s are"} above the documented 5s example.`
+            : null,
+          invalidBuiltInOverrideCount
+            ? `${invalidBuiltInOverrideCount.toLocaleString()} custom provider${invalidBuiltInOverrideCount === 1 ? " uses" : "s use"} a reserved built-in provider id.`
+            : null,
+          activeRemoteNoAuth
+            ? "The active remote provider has no env key, OpenAI auth, or auth command configured."
+            : remoteNoAuthCount
+              ? `${remoteNoAuthCount.toLocaleString()} remote provider${remoteNoAuthCount === 1 ? " has" : "s have"} no auth mode configured.`
+              : null,
+          unknownActiveProvider ? `model_provider is set to ${activeProvider}, but no matching provider section was found.` : null,
+          projectIgnoredKeys.length
+            ? `Project .codex/config.toml contains ${projectIgnoredKeys.join(", ")}; the Codex manual says provider/profile/telemetry keys are ignored in project config.`
+            : null,
+          "Refit reports provider metadata only, never token values.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+  summary.activeProvider = activeProvider;
+  summary.activeProviderCustom = activeProviderCustom;
+  summary.openaiBaseUrlConfigured = openaiBaseUrlConfigured;
+  summary.providerCount = providers.length;
+  summary.customProviderCount = providers.length;
+  summary.envKeyCount = providers.filter((provider) => provider.envKeyConfigured).length;
+  summary.missingEnvKeyCount = missingEnvKeyCount;
+  summary.activeMissingEnvKeyCount = activeMissingEnvKeyCount;
+  summary.envHeaderCount = envHeaderCount;
+  summary.missingEnvHeaderCount = missingEnvHeaderCount;
+  summary.authCommandCount = authCommandCount;
+  summary.activeAuthCommand = activeAuthCommand;
+  summary.authConflictCount = authConflictCount;
+  summary.slowAuthTimeoutCount = slowAuthTimeoutCount;
+  summary.invalidBuiltInOverrideCount = invalidBuiltInOverrideCount;
+  summary.remoteNoAuthCount = remoteNoAuthCount;
+  summary.activeRemoteNoAuth = activeRemoteNoAuth;
+  summary.projectIgnoredKeyCount = projectIgnoredKeys.length;
+  summary.projectIgnoredKeys = projectIgnoredKeys;
+  summary.unknownActiveProvider = unknownActiveProvider;
+  summary.providers = providers.map((provider) => ({
+    name: provider.name,
+    active: provider.active,
+    baseHost: provider.baseHost,
+    localBaseUrl: provider.localBaseUrl,
+    wireApi: provider.wireApi,
+    requiresOpenAiAuth: provider.requiresOpenAiAuth,
+    envKeyConfigured: provider.envKeyConfigured,
+    envKeyName: provider.envKeyName,
+    envKeyPresent: provider.envKeyPresent,
+    envHeaderCount: provider.envHeaderCount,
+    missingEnvHeaderCount: provider.missingEnvHeaderCount,
+    hasAuthCommand: provider.hasAuthCommand,
+    authTimeoutMs: provider.authTimeoutMs,
+    authRefreshIntervalMs: provider.authRefreshIntervalMs,
+    authConflict: provider.authConflict,
+    slowAuthTimeout: provider.slowAuthTimeout,
+    invalidBuiltInOverride: provider.invalidBuiltInOverride,
+    remoteNoAuth: provider.remoteNoAuth,
+  }));
+  return summary;
 }
 
 const managedSpeedKeys = new Set([
@@ -5354,6 +5641,7 @@ async function getCodexConfigSummary() {
     forcedLoginMethod: null,
     forcedWorkspaceConfigured: false,
     authCache: await getAuthCacheSummary({}),
+    modelProvider: emptyModelProviderSummary(),
     fastMode: false,
     fastModeFeature: true,
     shellSnapshot: true,
@@ -5481,6 +5769,7 @@ async function getCodexConfigSummary() {
     summary.forcedLoginMethod = values.forced_login_method || null;
     summary.forcedWorkspaceConfigured = Boolean(values.forced_chatgpt_workspace_id);
     summary.authCache = await getAuthCacheSummary(values);
+    summary.modelProvider = buildModelProviderSummary(values, sections);
     summary.fastModeFeature = values["features.fast_mode"] !== false;
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
@@ -5534,18 +5823,20 @@ async function getCodexConfigSummary() {
     summary.enabledPluginCount = sections.filter((section) => section.startsWith('plugins."') && values[`${section}.enabled`] === true).length;
     let mcpValues = values;
     let mcpSections = sections;
+    let currentProjectConfig = null;
     const currentProjectConfigPath = summary.projectReadiness.currentProject?.path
       ? path.join(summary.projectReadiness.currentProject.path, ".codex", "config.toml")
       : null;
     if (currentProjectConfigPath && (await exists(currentProjectConfigPath))) {
       try {
-        const projectMcpConfig = parseTomlSummary(await fs.readFile(currentProjectConfigPath, "utf8"));
-        mcpValues = { ...mcpValues, ...projectMcpConfig.values };
-        mcpSections = [...mcpSections, ...projectMcpConfig.sections];
+        currentProjectConfig = parseTomlSummary(await fs.readFile(currentProjectConfigPath, "utf8"));
+        mcpValues = { ...mcpValues, ...currentProjectConfig.values };
+        mcpSections = [...mcpSections, ...currentProjectConfig.sections];
       } catch {
         // Keep MCP diagnostics available from the user config even if project config is unreadable.
       }
     }
+    summary.modelProvider = buildModelProviderSummary(values, sections, currentProjectConfig);
     summary.instructionStack = await getInstructionStackSummary({
       values: mcpValues,
       currentProject: summary.projectReadiness.currentProject,
@@ -5697,6 +5988,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         (Object.keys(currentProject.scripts || {}).length && !currentLocalEnvironment?.hasActions)),
   );
   const authCache = codexConfig?.authCache || {};
+  const modelProvider = codexConfig?.modelProvider || emptyModelProviderSummary();
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const processSummary = context.processSummary || {};
@@ -6233,6 +6525,49 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (modelProvider.status === "ready" && modelProvider.tone !== "low") {
+    const missingNames = [
+      ...new Set(
+        (modelProvider.providers || [])
+          .filter((provider) => provider.envKeyConfigured && provider.envKeyPresent === false)
+          .map((provider) => provider.envKeyName)
+          .filter(Boolean),
+      ),
+    ];
+    addFix({
+      id: "model-provider-auth",
+      label: "Model Provider",
+      value: modelProvider.label,
+      tone: modelProvider.tone === "high" ? "high" : "medium",
+      action: modelProvider.action || "Review provider",
+      detail:
+        "Custom model providers can be useful, but missing env vars, command-backed auth, or project-local provider keys can make Codex feel slow or repeatedly unauthenticated.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# For OpenAI-compatible proxies, prefer the built-in provider when possible:",
+        '# openai_base_url = "https://proxy.example.com/v1"',
+        "",
+        "# For custom providers, choose exactly one auth style:",
+        '# env_key = "PROVIDER_API_KEY"',
+        "# or:",
+        "# [model_providers.proxy.auth]",
+        '# command = "/usr/local/bin/fetch-codex-token"',
+        "# timeout_ms = 5000",
+        "",
+        ...(missingNames.length
+          ? [
+              "# Missing provider env vars visible to this app process:",
+              ...missingNames.slice(0, 6).map((name) => `# - ${name}`),
+              "# Add them to your shell or ~/.codex/.env, then restart Codex/Refit.",
+            ]
+          : [
+              "# Project .codex/config.toml cannot set provider/profile/telemetry keys;",
+              "# move those settings to ~/.codex/config.toml.",
+            ]),
+      ].join("\n"),
+    });
+  }
+
   if (!hasFastTaskProfile) {
     addFix({
       id: "speed-profile-file",
@@ -6514,6 +6849,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     Number(projectReadiness.missingLocalEnvironmentCount || 0);
   const currentLocalEnvironment = currentProject?.localEnvironment || null;
   const authCache = codexConfig?.authCache || {};
+  const modelProvider = codexConfig?.modelProvider || emptyModelProviderSummary();
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const skillCatalog = scan?.skillCatalog || {};
@@ -6697,6 +7033,22 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail:
         authCache.detail ||
         "Codex Refit checks only credential-cache metadata. It does not inspect auth token contents.",
+    },
+    {
+      id: "model-provider",
+      label: "Model Provider",
+      value: modelProvider.label,
+      tone: modelProvider.tone,
+      action: modelProvider.action,
+      priority:
+        modelProvider.tone === "high"
+          ? 91
+          : modelProvider.tone === "medium"
+            ? modelProvider.activeAuthCommand || modelProvider.activeProviderCustom
+              ? 69
+              : 50
+            : 18,
+      detail: modelProvider.detail,
     },
     {
       id: "permission-flow",
@@ -7122,6 +7474,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       priority: 92,
       detail:
         "Codex should reuse cached login details. If the cache is missing or empty, repeated sign-in prompts can make every run feel slower.",
+    });
+  }
+
+  if (modelProvider.status === "ready" && modelProvider.tone !== "low") {
+    addRecommendation({
+      id: "model-provider-auth",
+      label: "Model Provider",
+      value: modelProvider.label,
+      action: modelProvider.action,
+      tone: modelProvider.tone === "high" ? "high" : "medium",
+      priority: modelProvider.tone === "high" ? 91 : 65,
+      detail: modelProvider.detail,
     });
   }
 
@@ -8183,6 +8547,12 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(8, Math.max(0, Number(metrics.hookTurnScopedCommandCount || 0) - 1) * 1.2);
   score -= Math.min(4, Math.max(0, Number(metrics.hookBroadMatcherCount || 0)) * 1.5);
   if (metrics.approvalAutoReview) score -= 4;
+  score -= Math.min(8, Number(metrics.modelProviderActiveMissingEnvKeyCount || 0) * 5);
+  score -= Math.min(6, Number(metrics.modelProviderAuthConflictCount || 0) * 4);
+  score -= Math.min(4, Number(metrics.modelProviderSlowAuthTimeoutCount || 0) * 2);
+  if (metrics.modelProviderActiveAuthCommand) score -= 2;
+  if (metrics.modelProviderActiveRemoteNoAuth) score -= 4;
+  score -= Math.min(4, Number(metrics.modelProviderProjectIgnoredKeyCount || 0) * 1.5);
   score -= Math.min(8, Math.max(0, Number(metrics.mcpEnabledCount || 0) - 6) * 0.7);
   score -= Math.min(5, Number(metrics.mcpRequiredCount || 0) * 1.5);
   score -= Math.min(5, Number(metrics.mcpMissingEnvVarCount || 0) * 2);
@@ -8286,6 +8656,19 @@ function benchmarkGuidance(metrics) {
     guidance.push("Your default reasoning is high. Keep it for deep work, but add a mini/low speed profile for quick scoped runs.");
   } else if (metrics.modelHighEffort) {
     guidance.push("Use your speed profile for quick tasks so high-reasoning defaults stay reserved for deep work.");
+  }
+  if (metrics.modelProviderActiveMissingEnvKeyCount > 0) {
+    guidance.push(
+      `Fix model provider auth: ${Number(metrics.modelProviderActiveMissingEnvKeyCount).toLocaleString()} active provider env key${metrics.modelProviderActiveMissingEnvKeyCount === 1 ? " is" : "s are"} missing from this app process.`,
+    );
+  } else if (metrics.modelProviderAuthConflictCount > 0) {
+    guidance.push("Fix custom model provider auth conflicts; command-backed auth should not be combined with env_key, bearer token, or requires_openai_auth.");
+  } else if (metrics.modelProviderActiveAuthCommand) {
+    guidance.push("Check the active model provider auth helper; command-backed token fetches can add latency when tokens refresh.");
+  } else if (metrics.modelProviderProjectIgnoredKeyCount > 0) {
+    guidance.push("Move provider/profile/telemetry keys out of project .codex/config.toml; Codex ignores those keys there.");
+  } else if (metrics.modelProviderActiveCustom) {
+    guidance.push("Custom model provider is active. If Codex feels slower than expected, compare provider latency against the built-in OpenAI provider.");
   }
   if (metrics.profileBrokenCount > 0) {
     guidance.push(`Fix ${Number(metrics.profileBrokenCount).toLocaleString()} unreadable profile file${metrics.profileBrokenCount === 1 ? "" : "s"} before trusting profile-based speed advice.`);
@@ -8486,7 +8869,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v10",
+    scoreModel: "local-state-v11",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -9172,6 +9555,23 @@ function benchmarkDeltas(current, previous) {
     "modelSpark",
     "modelDeepDefault",
     "fastModeEnabled",
+    "modelProviderActiveCustom",
+    "modelProviderOpenAiBaseUrlConfigured",
+    "modelProviderCustomCount",
+    "modelProviderEnvKeyCount",
+    "modelProviderMissingEnvKeyCount",
+    "modelProviderActiveMissingEnvKeyCount",
+    "modelProviderEnvHeaderCount",
+    "modelProviderMissingEnvHeaderCount",
+    "modelProviderAuthCommandCount",
+    "modelProviderActiveAuthCommand",
+    "modelProviderAuthConflictCount",
+    "modelProviderSlowAuthTimeoutCount",
+    "modelProviderInvalidBuiltInOverrideCount",
+    "modelProviderRemoteNoAuthCount",
+    "modelProviderActiveRemoteNoAuth",
+    "modelProviderProjectIgnoredKeyCount",
+    "modelProviderUnknownActive",
     "hasFastTaskProfile",
     "fastTaskProfileCount",
     "hasMiniProfile",
@@ -9301,6 +9701,25 @@ function summarizeBenchmarkEntry(entry) {
     modelDeepDefault: Boolean(entry.metrics.modelDeepDefault),
     fastModeEnabled: Boolean(entry.metrics.fastModeEnabled),
     fastModeFeature: entry.metrics.fastModeFeature !== false,
+    modelProviderTone: entry.metrics.modelProviderTone || "low",
+    modelProviderActive: entry.metrics.modelProviderActive || "openai",
+    modelProviderActiveCustom: Boolean(entry.metrics.modelProviderActiveCustom),
+    modelProviderOpenAiBaseUrlConfigured: Boolean(entry.metrics.modelProviderOpenAiBaseUrlConfigured),
+    modelProviderCustomCount: entry.metrics.modelProviderCustomCount || 0,
+    modelProviderEnvKeyCount: entry.metrics.modelProviderEnvKeyCount || 0,
+    modelProviderMissingEnvKeyCount: entry.metrics.modelProviderMissingEnvKeyCount || 0,
+    modelProviderActiveMissingEnvKeyCount: entry.metrics.modelProviderActiveMissingEnvKeyCount || 0,
+    modelProviderEnvHeaderCount: entry.metrics.modelProviderEnvHeaderCount || 0,
+    modelProviderMissingEnvHeaderCount: entry.metrics.modelProviderMissingEnvHeaderCount || 0,
+    modelProviderAuthCommandCount: entry.metrics.modelProviderAuthCommandCount || 0,
+    modelProviderActiveAuthCommand: Boolean(entry.metrics.modelProviderActiveAuthCommand),
+    modelProviderAuthConflictCount: entry.metrics.modelProviderAuthConflictCount || 0,
+    modelProviderSlowAuthTimeoutCount: entry.metrics.modelProviderSlowAuthTimeoutCount || 0,
+    modelProviderInvalidBuiltInOverrideCount: entry.metrics.modelProviderInvalidBuiltInOverrideCount || 0,
+    modelProviderRemoteNoAuthCount: entry.metrics.modelProviderRemoteNoAuthCount || 0,
+    modelProviderActiveRemoteNoAuth: Boolean(entry.metrics.modelProviderActiveRemoteNoAuth),
+    modelProviderProjectIgnoredKeyCount: entry.metrics.modelProviderProjectIgnoredKeyCount || 0,
+    modelProviderUnknownActive: Boolean(entry.metrics.modelProviderUnknownActive),
     hasFastTaskProfile: Boolean(entry.metrics.hasFastTaskProfile),
     fastTaskProfileCount: entry.metrics.fastTaskProfileCount || 0,
     hasMiniProfile: Boolean(entry.metrics.hasMiniProfile),
@@ -9505,6 +9924,17 @@ export async function benchmarkHistory(limit = 12) {
         modelSpark: Number(latest.modelSpark) - Number(oldest.modelSpark),
         modelDeepDefault: Number(latest.modelDeepDefault) - Number(oldest.modelDeepDefault),
         fastModeEnabled: Number(latest.fastModeEnabled) - Number(oldest.fastModeEnabled),
+        modelProviderActiveCustom: Number(latest.modelProviderActiveCustom) - Number(oldest.modelProviderActiveCustom),
+        modelProviderOpenAiBaseUrlConfigured: Number(latest.modelProviderOpenAiBaseUrlConfigured) - Number(oldest.modelProviderOpenAiBaseUrlConfigured),
+        modelProviderCustomCount: latest.modelProviderCustomCount - oldest.modelProviderCustomCount,
+        modelProviderMissingEnvKeyCount: latest.modelProviderMissingEnvKeyCount - oldest.modelProviderMissingEnvKeyCount,
+        modelProviderActiveMissingEnvKeyCount: latest.modelProviderActiveMissingEnvKeyCount - oldest.modelProviderActiveMissingEnvKeyCount,
+        modelProviderMissingEnvHeaderCount: latest.modelProviderMissingEnvHeaderCount - oldest.modelProviderMissingEnvHeaderCount,
+        modelProviderAuthCommandCount: latest.modelProviderAuthCommandCount - oldest.modelProviderAuthCommandCount,
+        modelProviderActiveAuthCommand: Number(latest.modelProviderActiveAuthCommand) - Number(oldest.modelProviderActiveAuthCommand),
+        modelProviderAuthConflictCount: latest.modelProviderAuthConflictCount - oldest.modelProviderAuthConflictCount,
+        modelProviderSlowAuthTimeoutCount: latest.modelProviderSlowAuthTimeoutCount - oldest.modelProviderSlowAuthTimeoutCount,
+        modelProviderProjectIgnoredKeyCount: latest.modelProviderProjectIgnoredKeyCount - oldest.modelProviderProjectIgnoredKeyCount,
         hasFastTaskProfile: Number(latest.hasFastTaskProfile) - Number(oldest.hasFastTaskProfile),
         fastTaskProfileCount: latest.fastTaskProfileCount - oldest.fastTaskProfileCount,
         hasMiniProfile: Number(latest.hasMiniProfile) - Number(oldest.hasMiniProfile),
@@ -9585,6 +10015,17 @@ export async function benchmarkHistory(limit = 12) {
         modelSpark: Number(latest.modelSpark) - Number(previous.modelSpark),
         modelDeepDefault: Number(latest.modelDeepDefault) - Number(previous.modelDeepDefault),
         fastModeEnabled: Number(latest.fastModeEnabled) - Number(previous.fastModeEnabled),
+        modelProviderActiveCustom: Number(latest.modelProviderActiveCustom) - Number(previous.modelProviderActiveCustom),
+        modelProviderOpenAiBaseUrlConfigured: Number(latest.modelProviderOpenAiBaseUrlConfigured) - Number(previous.modelProviderOpenAiBaseUrlConfigured),
+        modelProviderCustomCount: latest.modelProviderCustomCount - previous.modelProviderCustomCount,
+        modelProviderMissingEnvKeyCount: latest.modelProviderMissingEnvKeyCount - previous.modelProviderMissingEnvKeyCount,
+        modelProviderActiveMissingEnvKeyCount: latest.modelProviderActiveMissingEnvKeyCount - previous.modelProviderActiveMissingEnvKeyCount,
+        modelProviderMissingEnvHeaderCount: latest.modelProviderMissingEnvHeaderCount - previous.modelProviderMissingEnvHeaderCount,
+        modelProviderAuthCommandCount: latest.modelProviderAuthCommandCount - previous.modelProviderAuthCommandCount,
+        modelProviderActiveAuthCommand: Number(latest.modelProviderActiveAuthCommand) - Number(previous.modelProviderActiveAuthCommand),
+        modelProviderAuthConflictCount: latest.modelProviderAuthConflictCount - previous.modelProviderAuthConflictCount,
+        modelProviderSlowAuthTimeoutCount: latest.modelProviderSlowAuthTimeoutCount - previous.modelProviderSlowAuthTimeoutCount,
+        modelProviderProjectIgnoredKeyCount: latest.modelProviderProjectIgnoredKeyCount - previous.modelProviderProjectIgnoredKeyCount,
         hasFastTaskProfile: Number(latest.hasFastTaskProfile) - Number(previous.hasFastTaskProfile),
         fastTaskProfileCount: latest.fastTaskProfileCount - previous.fastTaskProfileCount,
         hasMiniProfile: Number(latest.hasMiniProfile) - Number(previous.hasMiniProfile),
@@ -9684,6 +10125,7 @@ export async function runBenchmark() {
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
+  const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
   const modelEffort = scan.codexConfig?.reasoningEffort || "default";
@@ -9696,7 +10138,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v10",
+    scoreModel: "local-state-v11",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -9745,6 +10187,25 @@ export async function runBenchmark() {
     modelDeepDefault: modelNameText === "gpt-5.5" && modelHighEffort,
     fastModeEnabled: Boolean(scan.codexConfig?.fastMode),
     fastModeFeature: scan.codexConfig?.fastModeFeature !== false,
+    modelProviderTone: modelProvider.tone || "low",
+    modelProviderActive: modelProvider.activeProvider || "openai",
+    modelProviderActiveCustom: Boolean(modelProvider.activeProviderCustom),
+    modelProviderOpenAiBaseUrlConfigured: Boolean(modelProvider.openaiBaseUrlConfigured),
+    modelProviderCustomCount: modelProvider.customProviderCount || 0,
+    modelProviderEnvKeyCount: modelProvider.envKeyCount || 0,
+    modelProviderMissingEnvKeyCount: modelProvider.missingEnvKeyCount || 0,
+    modelProviderActiveMissingEnvKeyCount: modelProvider.activeMissingEnvKeyCount || 0,
+    modelProviderEnvHeaderCount: modelProvider.envHeaderCount || 0,
+    modelProviderMissingEnvHeaderCount: modelProvider.missingEnvHeaderCount || 0,
+    modelProviderAuthCommandCount: modelProvider.authCommandCount || 0,
+    modelProviderActiveAuthCommand: Boolean(modelProvider.activeAuthCommand),
+    modelProviderAuthConflictCount: modelProvider.authConflictCount || 0,
+    modelProviderSlowAuthTimeoutCount: modelProvider.slowAuthTimeoutCount || 0,
+    modelProviderInvalidBuiltInOverrideCount: modelProvider.invalidBuiltInOverrideCount || 0,
+    modelProviderRemoteNoAuthCount: modelProvider.remoteNoAuthCount || 0,
+    modelProviderActiveRemoteNoAuth: Boolean(modelProvider.activeRemoteNoAuth),
+    modelProviderProjectIgnoredKeyCount: modelProvider.projectIgnoredKeyCount || 0,
+    modelProviderUnknownActive: Boolean(modelProvider.unknownActiveProvider),
     hasFastTaskProfile: Boolean(scan.codexConfig?.hasFastTaskProfile),
     fastTaskProfileCount,
     hasMiniProfile: Boolean(scan.codexConfig?.hasMiniProfile),
