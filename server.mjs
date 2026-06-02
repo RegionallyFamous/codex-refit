@@ -426,6 +426,88 @@ function buildShellEnvironmentSummary(values = {}) {
   };
 }
 
+function buildContextBudgetSummary(values = {}) {
+  const contextWindow = configNumber(values.model_context_window);
+  const autoCompactTokenLimit = configNumber(values.model_auto_compact_token_limit);
+  const toolOutputTokenLimit = configNumber(values.tool_output_token_limit);
+  const compactPromptConfigured = Boolean(values.compact_prompt || values.experimental_compact_prompt_file);
+  const modelCatalogConfigured = Boolean(values.model_catalog_json);
+  const contextWindowConfigured = contextWindow !== null;
+  const autoCompactConfigured = autoCompactTokenLimit !== null;
+  const toolOutputConfigured = toolOutputTokenLimit !== null;
+  const anyConfigured =
+    contextWindowConfigured || autoCompactConfigured || toolOutputConfigured || compactPromptConfigured || modelCatalogConfigured;
+  const toolOutputHeavy = toolOutputTokenLimit !== null && toolOutputTokenLimit > 24000;
+  const toolOutputWide = toolOutputTokenLimit !== null && toolOutputTokenLimit > 12000;
+  const compactRatio = contextWindow && autoCompactTokenLimit ? autoCompactTokenLimit / contextWindow : null;
+  const compactTooLate = compactRatio !== null && compactRatio >= 0.9;
+  const compactLate = compactRatio !== null && compactRatio >= 0.75;
+  const compactEarly = compactRatio !== null && compactRatio <= 0.25;
+  const smallWindow = contextWindow !== null && contextWindow < 64000;
+  const highLoad = toolOutputHeavy || compactTooLate;
+  const mediumLoad = highLoad || toolOutputWide || compactLate || compactEarly || smallWindow || compactPromptConfigured || modelCatalogConfigured;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = toolOutputTokenLimit
+    ? `${toolOutputTokenLimit.toLocaleString()} tool tokens`
+    : autoCompactTokenLimit
+      ? `${autoCompactTokenLimit.toLocaleString()} compact`
+      : contextWindow
+        ? `${contextWindow.toLocaleString()} context`
+        : "Model defaults";
+  const action =
+    tone === "low"
+      ? "Use defaults"
+      : toolOutputWide
+        ? "Lower tool output"
+        : compactTooLate || compactLate || compactEarly
+          ? "Review compact"
+          : "Review context";
+  const detail =
+    tone === "low"
+      ? anyConfigured
+        ? "Context budget settings are explicit and within the normal range Refit checks."
+        : "Context window, auto-compact threshold, and per-tool output storage are using Codex model defaults."
+      : [
+          toolOutputWide
+            ? `Per-tool output storage is set to ${toolOutputTokenLimit.toLocaleString()} tokens; large command output can crowd the thread context.`
+            : null,
+          compactRatio !== null
+            ? `Auto-compact starts around ${Math.round(compactRatio * 100)}% of the configured context window.`
+            : autoCompactConfigured
+              ? `Auto-compact limit is set to ${autoCompactTokenLimit.toLocaleString()} tokens.`
+              : null,
+          smallWindow ? `Configured context window is ${contextWindow.toLocaleString()} tokens, so long runs may compact sooner.` : null,
+          compactPromptConfigured ? "A custom compact prompt is configured; review it if compaction quality feels off." : null,
+          modelCatalogConfigured ? "A custom model catalog is configured at startup; keep it current when debugging model defaults." : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    contextWindow,
+    autoCompactTokenLimit,
+    toolOutputTokenLimit,
+    contextWindowConfigured,
+    autoCompactConfigured,
+    toolOutputConfigured,
+    compactPromptConfigured,
+    modelCatalogConfigured,
+    anyConfigured,
+    compactRatio,
+    toolOutputWide,
+    toolOutputHeavy,
+    compactLate,
+    compactTooLate,
+    compactEarly,
+    smallWindow,
+  };
+}
+
 function mcpEnvVarNames(values, section) {
   const names = [];
   const add = (value) => {
@@ -2163,6 +2245,7 @@ async function getCodexConfigSummary() {
     fastModeFeature: true,
     shellSnapshot: true,
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
+    contextBudgetSummary: buildContextBudgetSummary({}),
     goalsFeature: false,
     hooksFeature: true,
     hookSummary: {
@@ -2260,6 +2343,7 @@ async function getCodexConfigSummary() {
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.shellEnvironmentSummary = buildShellEnvironmentSummary(values);
+    summary.contextBudgetSummary = buildContextBudgetSummary(values);
     summary.goalsFeature = values["features.goals"] === true;
     summary.hooksFeature = (values["features.hooks"] ?? values["features.codex_hooks"]) !== false;
     summary.memoriesFeature = values["features.memories"] === true;
@@ -2404,6 +2488,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const fastMode = Boolean(codexConfig?.fastMode);
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
+  const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -2541,6 +2626,30 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         'include_only = ["PATH", "HOME", "SHELL", "TMPDIR"]',
         "",
         "# Add required build or MCP variables explicitly instead of inheriting everything.",
+      ].join("\n"),
+    });
+  }
+
+  if (contextBudgetSummary.status === "ready" && contextBudgetSummary.tone !== "low") {
+    addFix({
+      id: "context-budget",
+      label: "Context Budget",
+      value: contextBudgetSummary.label,
+      tone: contextBudgetSummary.tone === "high" ? "high" : "medium",
+      action: contextBudgetSummary.action,
+      detail:
+        "Codex stores file reads, command output, and the ongoing conversation in the model context. Large tool-output retention or awkward compaction thresholds can make long sessions noisier and slower.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# Prefer model defaults unless you have measured a specific need.",
+        "# model_context_window = 128000",
+        "# model_auto_compact_token_limit = 64000",
+        "",
+        "# Keep per-command output lean; use files for huge logs.",
+        "tool_output_token_limit = 12000",
+        "",
+        "# In long active threads, use:",
+        "/compact",
       ].join("\n"),
     });
   }
@@ -2801,6 +2910,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
+  const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -3017,6 +3127,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: shellEnvironmentSummary.action,
       priority: shellEnvironmentSummary.tone === "high" ? 86 : shellEnvironmentSummary.tone === "medium" ? 64 : 24,
       detail: shellEnvironmentSummary.detail,
+    },
+    {
+      id: "context-budget",
+      label: "Context Budget",
+      value: contextBudgetSummary.label,
+      tone: contextBudgetSummary.tone,
+      action: contextBudgetSummary.action,
+      priority: contextBudgetSummary.tone === "high" ? 85 : contextBudgetSummary.tone === "medium" ? 63 : 21,
+      detail: contextBudgetSummary.detail,
     },
     {
       id: "hooks",
@@ -3393,6 +3512,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (contextBudgetSummary.status === "ready" && contextBudgetSummary.tone !== "low") {
+    addRecommendation({
+      id: "context-budget",
+      label: "Context Budget",
+      value: contextBudgetSummary.label,
+      action: contextBudgetSummary.action,
+      tone: contextBudgetSummary.tone === "high" ? "high" : "medium",
+      priority: contextBudgetSummary.tone === "high" ? 80 : 56,
+      detail:
+        contextBudgetSummary.toolOutputWide
+          ? `${contextBudgetSummary.detail} Keep huge logs in files and ask Codex to inspect slices.`
+          : `${contextBudgetSummary.detail} Use /compact after long runs so key decisions survive without flooding context.`,
+    });
+  }
+
   if (currentProject && !currentProject.ready) {
     addRecommendation({
       id: "project-playbook",
@@ -3553,6 +3687,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     fastModeFeature,
     shellSnapshot,
     shellEnvironmentSummary,
+    contextBudgetSummary,
     goalsFeature,
     webSearchMode,
     hooksFeature,
@@ -4019,6 +4154,10 @@ function benchmarkLiveScore(metrics) {
   if (!metrics.shellEnvTightPolicy) score -= Math.min(5, Math.max(0, Number(metrics.shellEnvVarCount || 0) - 80) * 0.035);
   if (!metrics.shellEnvTightPolicy) score -= Math.min(4, Number(metrics.shellEnvSecretLikeNameCount || 0) * 0.35);
   if (metrics.shellEnvMissingPath) score -= 6;
+  score -= Math.min(6, Math.max(0, Number(metrics.toolOutputTokenLimit || 12000) - 12000) / 4000);
+  if (metrics.compactTooLate) score -= 4;
+  if (metrics.compactEarly) score -= 2;
+  if (metrics.smallContextWindow) score -= 3;
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   return Math.round(clampNumber(score, 0, 100));
 }
@@ -4104,6 +4243,13 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Trim shell_environment_policy for spawned commands; Refit sees ${Number(metrics.shellEnvVarCount).toLocaleString()} visible env var${metrics.shellEnvVarCount === 1 ? "" : "s"}.`,
     );
+  }
+  if (metrics.toolOutputTokenLimit > 24000) {
+    guidance.push(`Lower tool_output_token_limit from ${Number(metrics.toolOutputTokenLimit).toLocaleString()} or keep huge logs in files so context stays usable.`);
+  } else if (metrics.compactTooLate) {
+    guidance.push("Auto-compact is set very late relative to the context window. Review model_auto_compact_token_limit if long threads get noisy.");
+  } else if (metrics.smallContextWindow) {
+    guidance.push("Configured context window is small for long work. Expect more frequent compaction or use shorter threads.");
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -4756,6 +4902,9 @@ function benchmarkDeltas(current, previous) {
     "mcpLongStartupTimeoutCount",
     "shellEnvVarCount",
     "shellEnvSecretLikeNameCount",
+    "contextWindow",
+    "autoCompactTokenLimit",
+    "toolOutputTokenLimit",
     "hookCommandCount",
     "hookTurnScopedCommandCount",
     "hookBroadMatcherCount",
@@ -4802,6 +4951,12 @@ function summarizeBenchmarkEntry(entry) {
     shellEnvSecretLikeNameCount: entry.metrics.shellEnvSecretLikeNameCount || 0,
     shellEnvTightPolicy: Boolean(entry.metrics.shellEnvTightPolicy),
     shellEnvMissingPath: Boolean(entry.metrics.shellEnvMissingPath),
+    contextWindow: entry.metrics.contextWindow || 0,
+    autoCompactTokenLimit: entry.metrics.autoCompactTokenLimit || 0,
+    toolOutputTokenLimit: entry.metrics.toolOutputTokenLimit || 0,
+    compactTooLate: Boolean(entry.metrics.compactTooLate),
+    compactEarly: Boolean(entry.metrics.compactEarly),
+    smallContextWindow: Boolean(entry.metrics.smallContextWindow),
     hooksFeature: entry.metrics.hooksFeature !== false,
     hookCommandCount: entry.metrics.hookCommandCount || 0,
     hookTurnScopedCommandCount: entry.metrics.hookTurnScopedCommandCount || 0,
@@ -4843,6 +4998,7 @@ export async function benchmarkHistory(limit = 12) {
         mcpMissingEnvVarCount: latest.mcpMissingEnvVarCount - oldest.mcpMissingEnvVarCount,
         shellEnvVarCount: latest.shellEnvVarCount - oldest.shellEnvVarCount,
         shellEnvSecretLikeNameCount: latest.shellEnvSecretLikeNameCount - oldest.shellEnvSecretLikeNameCount,
+        toolOutputTokenLimit: latest.toolOutputTokenLimit - oldest.toolOutputTokenLimit,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
       }
     : null;
@@ -4858,6 +5014,7 @@ export async function benchmarkHistory(limit = 12) {
         mcpEnabledCount: latest.mcpEnabledCount - previous.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
         shellEnvVarCount: latest.shellEnvVarCount - previous.shellEnvVarCount,
+        toolOutputTokenLimit: latest.toolOutputTokenLimit - previous.toolOutputTokenLimit,
       }
     : null;
   const trend =
@@ -4955,6 +5112,12 @@ export async function runBenchmark() {
     shellEnvSecretLikeNameCount: scan.codexConfig?.shellEnvironmentSummary?.secretLikeNameCount || 0,
     shellEnvTightPolicy: Boolean(scan.codexConfig?.shellEnvironmentSummary?.tightPolicy),
     shellEnvMissingPath: scan.codexConfig?.shellEnvironmentSummary?.pathAvailable === false,
+    contextWindow: scan.codexConfig?.contextBudgetSummary?.contextWindow || 0,
+    autoCompactTokenLimit: scan.codexConfig?.contextBudgetSummary?.autoCompactTokenLimit || 0,
+    toolOutputTokenLimit: scan.codexConfig?.contextBudgetSummary?.toolOutputTokenLimit || 0,
+    compactTooLate: Boolean(scan.codexConfig?.contextBudgetSummary?.compactTooLate),
+    compactEarly: Boolean(scan.codexConfig?.contextBudgetSummary?.compactEarly),
+    smallContextWindow: Boolean(scan.codexConfig?.contextBudgetSummary?.smallWindow),
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
