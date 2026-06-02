@@ -691,6 +691,115 @@ function buildNotificationFlowSummary(values = {}, projectConfig = null) {
   };
 }
 
+function buildTelemetrySummary(values = {}, projectConfig = null) {
+  const projectIgnoredKeys = projectConfig ? projectIgnoredConfigKeys(projectConfig.values || {}, projectConfig.sections || []) : [];
+  const projectIgnoredTelemetry = projectIgnoredKeys.includes("otel");
+  const otelKeys = Object.keys(values).filter((key) => key === "otel" || key.startsWith("otel."));
+  const exporterRaw = values["otel.exporter"];
+  const exporterText = String(exporterRaw ?? "").trim();
+  const exporterConfigured = exporterRaw !== undefined || otelKeys.some((key) => key.startsWith("otel.exporter."));
+  const exporterNormalized = normalizeConfigKey(exporterText || "none");
+  const exporterNone = !exporterConfigured || exporterNormalized === "none" || exporterRaw === false;
+  const exporterHttp =
+    /otlp[-_]http/i.test(exporterText) ||
+    otelKeys.some((key) => /otel\.exporter\.(otlp[-_]?http|otlp_http)/i.test(key));
+  const exporterGrpc =
+    /otlp[-_]grpc/i.test(exporterText) ||
+    otelKeys.some((key) => /otel\.exporter\.(otlp[-_]?grpc|otlp_grpc)/i.test(key));
+  const remoteExporter = exporterConfigured && !exporterNone;
+  const logUserPrompt = values["otel.log_user_prompt"] === true;
+  const environment = values["otel.environment"] || null;
+  const endpoint =
+    values["otel.exporter.otlp-http.endpoint"] ||
+    values["otel.exporter.otlp_http.endpoint"] ||
+    values["otel.exporter.otlp-grpc.endpoint"] ||
+    values["otel.exporter.otlp_grpc.endpoint"] ||
+    (exporterText.match(/endpoint\s*=\s*["']([^"']+)["']/)?.[1] ?? null);
+  const endpointHost = endpoint ? hostLabelFromUrl(endpoint) : null;
+  const exporterKind = exporterNone
+    ? "none"
+    : exporterHttp
+      ? "otlp-http"
+      : exporterGrpc
+        ? "otlp-grpc"
+        : exporterText
+          ? exporterText.slice(0, 64)
+          : "custom";
+  const headerValueText = [
+    values["otel.exporter.otlp-http.headers"],
+    values["otel.exporter.otlp_http.headers"],
+    values["otel.exporter.otlp-grpc.headers"],
+    values["otel.exporter.otlp_grpc.headers"],
+    exporterText,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const headerKeys = tomlInlineTableKeys(headerValueText);
+  const headerSecretLike = /\b(token|secret|api[-_]?key|authorization|bearer)\b/i.test(headerValueText);
+  const highLoad = projectIgnoredTelemetry || logUserPrompt || (remoteExporter && headerSecretLike);
+  const mediumLoad = highLoad || remoteExporter || Boolean(environment);
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = projectIgnoredTelemetry
+    ? "Project ignored"
+    : logUserPrompt
+      ? "Prompt logging"
+      : remoteExporter
+        ? exporterKind
+        : environment
+          ? "Local events"
+          : "Off";
+  const action =
+    projectIgnoredTelemetry
+      ? "Move user config"
+      : logUserPrompt
+        ? "Redact prompts"
+        : remoteExporter
+          ? "Use only when tracing"
+          : environment
+            ? "Keep local"
+            : "Keep off";
+  const detail =
+    tone === "low"
+      ? "OpenTelemetry export is using the documented default: no remote exporter and redacted user prompts."
+      : [
+          remoteExporter
+            ? `OTel exporter is ${exporterKind}${endpointHost ? ` to ${endpointHost}` : ""}. The manual says exporters batch asynchronously and flush on shutdown.`
+            : "No remote OTel exporter is configured.",
+          environment ? `OTel environment is ${environment}.` : null,
+          logUserPrompt ? "otel.log_user_prompt is true, so user prompts are not redacted in telemetry events." : null,
+          headerKeys.length ? `Exporter headers include ${headerKeys.length.toLocaleString()} configured key${headerKeys.length === 1 ? "" : "s"}.` : null,
+          headerSecretLike ? "Header config appears to include token-like metadata; keep it in user config and environment variables, not project files." : null,
+          projectIgnoredTelemetry ? "A project .codex/config.toml contains otel settings, but Codex ignores telemetry keys in project config. Move them to ~/.codex/config.toml." : null,
+          "Refit only reads telemetry config; it does not emit or contact telemetry endpoints.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    configured: otelKeys.length > 0,
+    keyCount: otelKeys.length,
+    exporterConfigured,
+    exporterKind,
+    exporterNone,
+    remoteExporter,
+    exporterHttp,
+    exporterGrpc,
+    endpointHost,
+    environment,
+    environmentConfigured: Boolean(environment),
+    logUserPrompt,
+    headerKeyCount: headerKeys.length,
+    headerSecretLike,
+    projectIgnoredTelemetry,
+    projectIgnoredTelemetryCount: projectIgnoredTelemetry ? 1 : 0,
+  };
+}
+
 function emptyModelProviderSummary() {
   return {
     status: "ready",
@@ -6920,6 +7029,7 @@ async function getCodexConfigSummary() {
     shellSnapshot: true,
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
     notificationFlow: buildNotificationFlowSummary({}),
+    telemetry: buildTelemetrySummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
     historyRetention: buildHistoryRetentionSummary({}, historyMeta),
     storagePaths: null,
@@ -7015,6 +7125,7 @@ async function getCodexConfigSummary() {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
     summary.networkSandbox = buildNetworkSandboxSummary({}, []);
     summary.notificationFlow = buildNotificationFlowSummary({});
+    summary.telemetry = buildTelemetrySummary({});
     summary.historyRetention = buildHistoryRetentionSummary({}, historyMeta);
     summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
@@ -7056,6 +7167,7 @@ async function getCodexConfigSummary() {
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.shellEnvironmentSummary = buildShellEnvironmentSummary(values);
     summary.notificationFlow = buildNotificationFlowSummary(values);
+    summary.telemetry = buildTelemetrySummary(values);
     summary.contextBudgetSummary = buildContextBudgetSummary(values);
     summary.historyRetention = buildHistoryRetentionSummary(values, historyMeta);
     summary.storagePaths = await buildStoragePathSummary(values, { currentProject: null });
@@ -7122,6 +7234,7 @@ async function getCodexConfigSummary() {
       }
     }
     summary.notificationFlow = buildNotificationFlowSummary(values, currentProjectConfig);
+    summary.telemetry = buildTelemetrySummary(values, currentProjectConfig);
     summary.historyRetention = buildHistoryRetentionSummary(
       currentProjectConfig ? { ...values, ...currentProjectConfig.values } : values,
       { ...historyMeta, projectConfig: currentProjectConfig },
@@ -7266,6 +7379,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const webSearchLegacyKeyCount = Number(codexConfig?.webSearchLegacyKeyCount || webSearchLegacyKeys.length || 0);
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
+  const telemetry = codexConfig?.telemetry || buildTelemetrySummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = codexConfig?.storagePaths || {
@@ -7410,6 +7524,27 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Optional external notifier. Keep it lightweight and user-level, not project-level:",
         '# notify = ["terminal-notifier", "-title", "Codex", "-message", "Turn complete"]',
+      ].join("\n"),
+    });
+  }
+
+  if (telemetry.status === "ready" && telemetry.tone !== "low") {
+    addFix({
+      id: "telemetry",
+      label: "Telemetry",
+      value: telemetry.label,
+      tone: telemetry.tone === "high" ? "high" : "medium",
+      action: telemetry.action,
+      detail:
+        "OpenTelemetry export is useful when you are tracing Codex runs. Keep it off or local for everyday speed checks, and keep user prompts redacted.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "[otel]",
+        'exporter = "none"',
+        "log_user_prompt = false",
+        "",
+        "# Only enable a remote exporter during a deliberate tracing session:",
+        '# exporter = { otlp-http = { endpoint = "https://otel.example.com/v1/logs" } }',
       ].join("\n"),
     });
   }
@@ -8260,6 +8395,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
+  const telemetry = codexConfig?.telemetry || buildTelemetrySummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = codexConfig?.storagePaths || {
@@ -8577,6 +8713,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: notificationFlow.action,
       priority: notificationFlow.tone === "high" ? 82 : notificationFlow.tone === "medium" ? 58 : 19,
       detail: notificationFlow.detail,
+    },
+    {
+      id: "telemetry",
+      label: "Telemetry",
+      value: telemetry.label,
+      tone: telemetry.tone,
+      action: telemetry.action,
+      priority: telemetry.tone === "high" ? 82 : telemetry.tone === "medium" ? 56 : 18,
+      detail: telemetry.detail,
     },
     {
       id: "context-budget",
@@ -9526,6 +9671,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (telemetry.status === "ready" && telemetry.tone !== "low") {
+    addRecommendation({
+      id: "telemetry",
+      label: "Telemetry",
+      value: telemetry.label,
+      action: telemetry.action,
+      tone: telemetry.tone === "high" ? "high" : "medium",
+      priority: telemetry.tone === "high" ? 78 : 51,
+      detail:
+        telemetry.logUserPrompt || telemetry.projectIgnoredTelemetry
+          ? `${telemetry.detail} Keep telemetry settings user-level and prompt-redacted before chasing model latency.`
+          : telemetry.detail,
+    });
+  }
+
   if (hooksFeature && hookSummary.status === "ready" && hookTone !== "low") {
     addRecommendation({
       id: "hook-load",
@@ -9625,6 +9785,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellSnapshot,
     shellEnvironmentSummary,
     notificationFlow,
+    telemetry,
     contextBudgetSummary,
     historyRetention,
     storagePaths,
@@ -10110,6 +10271,19 @@ function localScoreBreakdown(metrics) {
       detail: "Custom log_dir, sqlite_home, CODEX_SQLITE_HOME, and opt-in plaintext TUI log pressure.",
     },
     {
+      id: "telemetry",
+      label: "Telemetry",
+      points: Math.min(
+        6,
+        (metrics.telemetryRemoteExporter ? 1.5 : 0) +
+          (metrics.telemetryLogUserPrompt ? 2.5 : 0) +
+          (metrics.telemetryHeaderSecretLike ? 1 : 0) +
+          (metrics.telemetryProjectIgnored ? 2 : 0),
+      ),
+      value: metrics.telemetryLabel || "Off",
+      detail: "OpenTelemetry export, prompt logging, secret-like headers, and ignored project telemetry config.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -10292,6 +10466,10 @@ function benchmarkLiveScore(metrics) {
   if (metrics.notificationDisabled && (metrics.backgroundProcessCount > 0 || metrics.turnTelemetrySlowTurnCount > 0)) score -= 2;
   if (metrics.notificationExternalSlowRisk) score -= 1;
   if (metrics.notificationAlways) score -= 1;
+  if (metrics.telemetryRemoteExporter) score -= 1;
+  if (metrics.telemetryLogUserPrompt) score -= 2;
+  if (metrics.telemetryHeaderSecretLike) score -= 1;
+  if (metrics.telemetryProjectIgnored) score -= 2;
   if (metrics.historyInvalidConfig) score -= 2;
   if (metrics.historyFileHuge) score -= 4;
   else if (metrics.historyFileLarge) score -= 2;
@@ -10535,6 +10713,15 @@ function benchmarkGuidance(metrics) {
   } else if (metrics.notificationMethodInvalid || metrics.notificationConditionInvalid || metrics.notificationExternalEmpty) {
     guidance.push("Fix notification config values; use notification_method auto/osc9/bel, notification_condition unfocused/always, and an argv array for notify.");
   }
+  if (metrics.telemetryProjectIgnored) {
+    guidance.push("Move otel settings out of project .codex/config.toml; Codex ignores telemetry keys there.");
+  } else if (metrics.telemetryLogUserPrompt) {
+    guidance.push("Set otel.log_user_prompt = false so telemetry stays redacted during speed checks.");
+  } else if (metrics.telemetryRemoteExporter) {
+    guidance.push('Set otel.exporter = "none" outside deliberate tracing sessions so Codex does not flush remote telemetry on shutdown.');
+  } else if (metrics.telemetryEnvironmentConfigured) {
+    guidance.push("OpenTelemetry is in local-events mode. Keep it that way unless you are actively tracing a Codex run.");
+  }
   if (metrics.historyInvalidConfig) {
     guidance.push('Fix history config; use history.persistence = "save-all" or "none" and a positive history.max_bytes value.');
   } else if (metrics.historyFileHuge || (metrics.historyUnbounded && metrics.historyFileLarge)) {
@@ -10666,8 +10853,9 @@ function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   const historyRetention = scan?.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = scan?.codexConfig?.storagePaths || {};
+  const telemetry = scan?.codexConfig?.telemetry || buildTelemetrySummary({});
   return {
-    scoreModel: "local-state-v17",
+    scoreModel: "local-state-v18",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -10722,6 +10910,16 @@ function scoreMetricsFromScan(scan) {
     storageSqliteSynced: Boolean(storagePaths.sqliteHomeSynced),
     storageSqliteInProject: Boolean(storagePaths.sqliteHomeInProject),
     storageUpdateCheckDisabled: Boolean(storagePaths.updateCheckDisabled),
+    telemetryTone: telemetry.tone || "low",
+    telemetryLabel: telemetry.label || "Off",
+    telemetryConfigured: Boolean(telemetry.configured),
+    telemetryRemoteExporter: Boolean(telemetry.remoteExporter),
+    telemetryLogUserPrompt: Boolean(telemetry.logUserPrompt),
+    telemetryHeaderSecretLike: Boolean(telemetry.headerSecretLike),
+    telemetryProjectIgnored: Boolean(telemetry.projectIgnoredTelemetry),
+    telemetryProjectIgnoredCount: telemetry.projectIgnoredTelemetryCount || 0,
+    telemetryHeaderKeyCount: telemetry.headerKeyCount || 0,
+    telemetryEnvironmentConfigured: Boolean(telemetry.environmentConfigured),
   };
 }
 
@@ -11537,6 +11735,14 @@ function benchmarkDeltas(current, previous) {
     "notificationExternalSlowRisk",
     "notificationProjectIgnoredNotify",
     "notificationProjectIgnoredNotifyCount",
+    "telemetryConfigured",
+    "telemetryRemoteExporter",
+    "telemetryLogUserPrompt",
+    "telemetryHeaderSecretLike",
+    "telemetryProjectIgnored",
+    "telemetryProjectIgnoredCount",
+    "telemetryHeaderKeyCount",
+    "telemetryEnvironmentConfigured",
     "historyPersistenceOff",
     "historyMaxBytesConfigured",
     "historyMaxBytes",
@@ -11879,6 +12085,17 @@ function summarizeBenchmarkEntry(entry) {
     notificationExternalSlowRisk: Boolean(entry.metrics.notificationExternalSlowRisk),
     notificationProjectIgnoredNotify: Boolean(entry.metrics.notificationProjectIgnoredNotify),
     notificationProjectIgnoredNotifyCount: entry.metrics.notificationProjectIgnoredNotifyCount || 0,
+    telemetryTone: entry.metrics.telemetryTone || "low",
+    telemetryLabel: entry.metrics.telemetryLabel || "Off",
+    telemetryConfigured: Boolean(entry.metrics.telemetryConfigured),
+    telemetryRemoteExporter: Boolean(entry.metrics.telemetryRemoteExporter),
+    telemetryExporterKind: entry.metrics.telemetryExporterKind || "none",
+    telemetryLogUserPrompt: Boolean(entry.metrics.telemetryLogUserPrompt),
+    telemetryHeaderSecretLike: Boolean(entry.metrics.telemetryHeaderSecretLike),
+    telemetryProjectIgnored: Boolean(entry.metrics.telemetryProjectIgnored),
+    telemetryProjectIgnoredCount: entry.metrics.telemetryProjectIgnoredCount || 0,
+    telemetryHeaderKeyCount: entry.metrics.telemetryHeaderKeyCount || 0,
+    telemetryEnvironmentConfigured: Boolean(entry.metrics.telemetryEnvironmentConfigured),
     historyTone: entry.metrics.historyTone || "low",
     historyLabel: entry.metrics.historyLabel || "Uncapped",
     historyPersistence: entry.metrics.historyPersistence || "save-all",
@@ -12074,6 +12291,14 @@ export async function benchmarkHistory(limit = 12) {
         notificationExternalArgCount: latest.notificationExternalArgCount - oldest.notificationExternalArgCount,
         notificationExternalSlowRisk: Number(latest.notificationExternalSlowRisk) - Number(oldest.notificationExternalSlowRisk),
         notificationProjectIgnoredNotify: Number(latest.notificationProjectIgnoredNotify) - Number(oldest.notificationProjectIgnoredNotify),
+        telemetryConfigured: Number(latest.telemetryConfigured) - Number(oldest.telemetryConfigured),
+        telemetryRemoteExporter: Number(latest.telemetryRemoteExporter) - Number(oldest.telemetryRemoteExporter),
+        telemetryLogUserPrompt: Number(latest.telemetryLogUserPrompt) - Number(oldest.telemetryLogUserPrompt),
+        telemetryHeaderSecretLike: Number(latest.telemetryHeaderSecretLike) - Number(oldest.telemetryHeaderSecretLike),
+        telemetryProjectIgnored: Number(latest.telemetryProjectIgnored) - Number(oldest.telemetryProjectIgnored),
+        telemetryProjectIgnoredCount: latest.telemetryProjectIgnoredCount - oldest.telemetryProjectIgnoredCount,
+        telemetryHeaderKeyCount: latest.telemetryHeaderKeyCount - oldest.telemetryHeaderKeyCount,
+        telemetryEnvironmentConfigured: Number(latest.telemetryEnvironmentConfigured) - Number(oldest.telemetryEnvironmentConfigured),
         historyPersistenceOff: Number(latest.historyPersistenceOff) - Number(oldest.historyPersistenceOff),
         historyMaxBytesConfigured: Number(latest.historyMaxBytesConfigured) - Number(oldest.historyMaxBytesConfigured),
         historyMaxBytes: latest.historyMaxBytes - oldest.historyMaxBytes,
@@ -12212,6 +12437,14 @@ export async function benchmarkHistory(limit = 12) {
         notificationExternalArgCount: latest.notificationExternalArgCount - previous.notificationExternalArgCount,
         notificationExternalSlowRisk: Number(latest.notificationExternalSlowRisk) - Number(previous.notificationExternalSlowRisk),
         notificationProjectIgnoredNotify: Number(latest.notificationProjectIgnoredNotify) - Number(previous.notificationProjectIgnoredNotify),
+        telemetryConfigured: Number(latest.telemetryConfigured) - Number(previous.telemetryConfigured),
+        telemetryRemoteExporter: Number(latest.telemetryRemoteExporter) - Number(previous.telemetryRemoteExporter),
+        telemetryLogUserPrompt: Number(latest.telemetryLogUserPrompt) - Number(previous.telemetryLogUserPrompt),
+        telemetryHeaderSecretLike: Number(latest.telemetryHeaderSecretLike) - Number(previous.telemetryHeaderSecretLike),
+        telemetryProjectIgnored: Number(latest.telemetryProjectIgnored) - Number(previous.telemetryProjectIgnored),
+        telemetryProjectIgnoredCount: latest.telemetryProjectIgnoredCount - previous.telemetryProjectIgnoredCount,
+        telemetryHeaderKeyCount: latest.telemetryHeaderKeyCount - previous.telemetryHeaderKeyCount,
+        telemetryEnvironmentConfigured: Number(latest.telemetryEnvironmentConfigured) - Number(previous.telemetryEnvironmentConfigured),
         historyPersistenceOff: Number(latest.historyPersistenceOff) - Number(previous.historyPersistenceOff),
         historyMaxBytesConfigured: Number(latest.historyMaxBytesConfigured) - Number(previous.historyMaxBytesConfigured),
         historyMaxBytes: latest.historyMaxBytes - previous.historyMaxBytes,
@@ -12299,6 +12532,7 @@ export async function runBenchmark() {
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const notificationFlow = scan.codexConfig?.notificationFlow || buildNotificationFlowSummary({});
+  const telemetry = scan.codexConfig?.telemetry || buildTelemetrySummary({});
   const historyRetention = scan.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = scan.codexConfig?.storagePaths || {};
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
@@ -12318,7 +12552,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v17",
+    scoreModel: "local-state-v18",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -12602,6 +12836,17 @@ export async function runBenchmark() {
     notificationExternalSlowRisk: Boolean(notificationFlow.externalNotifySlowRisk),
     notificationProjectIgnoredNotify: Boolean(notificationFlow.projectIgnoredNotify),
     notificationProjectIgnoredNotifyCount: notificationFlow.projectIgnoredNotifyCount || 0,
+    telemetryTone: telemetry.tone || "low",
+    telemetryLabel: telemetry.label || "Off",
+    telemetryConfigured: Boolean(telemetry.configured),
+    telemetryRemoteExporter: Boolean(telemetry.remoteExporter),
+    telemetryExporterKind: telemetry.exporterKind || "none",
+    telemetryLogUserPrompt: Boolean(telemetry.logUserPrompt),
+    telemetryHeaderSecretLike: Boolean(telemetry.headerSecretLike),
+    telemetryProjectIgnored: Boolean(telemetry.projectIgnoredTelemetry),
+    telemetryProjectIgnoredCount: telemetry.projectIgnoredTelemetryCount || 0,
+    telemetryHeaderKeyCount: telemetry.headerKeyCount || 0,
+    telemetryEnvironmentConfigured: Boolean(telemetry.environmentConfigured),
     historyTone: historyRetention.tone || "low",
     historyLabel: historyRetention.label || "Uncapped",
     historyPersistence: historyRetention.persistence || "save-all",
@@ -13277,11 +13522,13 @@ export async function startServer({ port = Number(process.env.PORT || 5173), hos
         server.listen(nextPort, host);
       });
 
+      const address = server.address();
+      const actualPort = address && typeof address === "object" ? address.port : nextPort;
       return {
         server,
         host,
-        port: nextPort,
-        url: `http://${host}:${nextPort}`,
+        port: actualPort,
+        url: `http://${host}:${actualPort}`,
       };
     } catch (error) {
       if (error.code !== "EADDRINUSE") throw error;
