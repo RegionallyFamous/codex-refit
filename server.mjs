@@ -23,6 +23,7 @@ const paths = {
   generatedImages: path.join(codexHome, "generated_images"),
   generatedImagesArchive: path.join(codexHome, "archived_generated_images"),
   configToml: path.join(codexHome, "config.toml"),
+  authJson: path.join(codexHome, "auth.json"),
   globalAgents: path.join(codexHome, "AGENTS.md"),
   stateDb: path.join(codexHome, "state_5.sqlite"),
   logsDb: path.join(codexHome, "logs_2.sqlite"),
@@ -1019,6 +1020,73 @@ async function getLogsSummary() {
   return summary;
 }
 
+async function getAuthCacheSummary(values = {}) {
+  const authStats = await statOrNull(paths.authJson);
+  const authFileExists = Boolean(authStats?.isFile());
+  const authFileBytes = authFileExists ? authStats.size : 0;
+  const authFileMode = authFileExists ? `0${(authStats.mode & 0o777).toString(8)}` : null;
+  const authFileModifiedAt = authFileExists ? authStats.mtime.toISOString() : null;
+  const configuredStore = values.cli_auth_credentials_store ? String(values.cli_auth_credentials_store) : null;
+  const credentialStore = configuredStore || "file";
+  const usesFileStore = credentialStore === "file";
+  const usesKeyringStore = credentialStore === "keyring";
+  const usesAutoStore = credentialStore === "auto";
+  const hasUsableFileCache = authFileBytes > 128;
+  const forcedLoginMethod = values.forced_login_method || null;
+  const forcedWorkspace = values.forced_chatgpt_workspace_id || null;
+
+  let status = "unknown";
+  let label = "Unknown";
+  let tone = "medium";
+  let detail = "Credential storage was not configured and no file cache state could be confirmed.";
+
+  if (usesKeyringStore) {
+    status = "keyring";
+    label = "Keyring";
+    tone = "low";
+    detail = "Codex is configured to use the operating system credential store. Codex Refit does not inspect keychain contents.";
+  } else if (usesAutoStore) {
+    status = hasUsableFileCache ? "file-cache" : "auto";
+    label = hasUsableFileCache ? "Auto + file" : "Auto";
+    tone = "low";
+    detail = hasUsableFileCache
+      ? "Auto credential storage has a local auth.json cache available."
+      : "Auto credential storage may use the OS keychain first and fall back to auth.json.";
+  } else if (usesFileStore && hasUsableFileCache) {
+    status = "file-cache";
+    label = "File cache";
+    tone = authFileMode && authFileMode !== "0600" ? "medium" : "low";
+    detail =
+      authFileMode && authFileMode !== "0600"
+        ? `auth.json exists but permissions are ${authFileMode}. Treat this file like a password.`
+        : "auth.json exists, so CLI/app login caching should be available without repeated browser login.";
+  } else if (usesFileStore) {
+    status = authFileExists ? "empty-file" : "missing-file";
+    label = authFileExists ? "Empty file" : "Missing file";
+    tone = "medium";
+    detail = authFileExists
+      ? "auth.json exists but is too small to look like a useful login cache."
+      : "File credential storage is selected, but auth.json was not found. Codex may need a fresh login.";
+  }
+
+  return {
+    path: paths.authJson,
+    credentialStore,
+    configuredStore,
+    status,
+    label,
+    tone,
+    detail,
+    authFileExists,
+    authFileBytes,
+    authFileMode,
+    authFileModifiedAt,
+    forcedLoginMethod,
+    forcedWorkspaceConfigured: Boolean(forcedWorkspace),
+    needsLoginCheck: ["missing-file", "empty-file", "unknown"].includes(status),
+  };
+}
+
 async function getCodexConfigSummary() {
   const globalAgentsBytes = await fileSize(paths.globalAgents);
   const summary = {
@@ -1030,6 +1098,10 @@ async function getCodexConfigSummary() {
     sandboxMode: null,
     serviceTier: null,
     desktopServiceTier: null,
+    cliAuthCredentialsStore: null,
+    forcedLoginMethod: null,
+    forcedWorkspaceConfigured: false,
+    authCache: await getAuthCacheSummary({}),
     fastMode: false,
     fastModeFeature: true,
     shellSnapshot: true,
@@ -1087,6 +1159,10 @@ async function getCodexConfigSummary() {
     summary.sandboxMode = values.sandbox_mode || null;
     summary.serviceTier = values.service_tier || null;
     summary.desktopServiceTier = values["desktop.default-service-tier"] || null;
+    summary.cliAuthCredentialsStore = values.cli_auth_credentials_store || null;
+    summary.forcedLoginMethod = values.forced_login_method || null;
+    summary.forcedWorkspaceConfigured = Boolean(values.forced_chatgpt_workspace_id);
+    summary.authCache = await getAuthCacheSummary(values);
     summary.fastModeFeature = values["features.fast_mode"] !== false;
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
@@ -1158,6 +1234,30 @@ function buildProjectPlaybookSnippet(project) {
   return lines.join("\n");
 }
 
+function buildAuthCacheSnippet(authCache = {}) {
+  const lines = [
+    "# Safe auth diagnostics. Do not paste auth.json contents anywhere.",
+    "codex doctor --summary",
+    "",
+    "# Refresh local login cache if Codex keeps asking you to sign in:",
+    "codex login",
+    "",
+    "# If browser login is unreliable or remote/headless:",
+    "codex login --device-auth",
+  ];
+
+  if (authCache.credentialStore !== "keyring") {
+    lines.push(
+      "",
+      "# Optional ~/.codex/config.toml on macOS:",
+      'cli_auth_credentials_store = "keyring"',
+      "# Use keyring for OS credential storage, or \"file\" if you intentionally want ~/.codex/auth.json.",
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const fixes = [];
   const addFix = (fix) => {
@@ -1177,6 +1277,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
+  const authCache = codexConfig?.authCache || {};
 
   if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
     addFix({
@@ -1203,6 +1304,19 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "codex --version",
         `${runtime.appCliPath || codexAppCli} --version`,
       ].join("\n"),
+    });
+  }
+
+  if (authCache.needsLoginCheck) {
+    addFix({
+      id: "auth-cache-check",
+      label: "Auth Cache",
+      value: authCache.label || "Check",
+      tone: "medium",
+      action: "Run codex doctor",
+      detail:
+        "Codex caches login in auth.json or the OS keychain. If it keeps asking you to sign in, refresh the login cache and inspect the redacted doctor report.",
+      snippet: buildAuthCacheSnippet(authCache),
     });
   }
 
@@ -1405,6 +1519,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   const existingProjectCount = Number(projectReadiness.existingCount || 0);
   const projectReadyCount = Number(projectReadiness.readyCount || 0);
   const projectGapCount = Number(projectReadiness.missingGuidanceCount || 0) + Number(projectReadiness.missingCodexDirCount || 0);
+  const authCache = codexConfig?.authCache || {};
   const globalGuidanceReady = Boolean(codexConfig?.globalAgentsExists);
   const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
@@ -1516,6 +1631,17 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   ];
 
   const configAdvice = [
+    {
+      id: "auth-cache",
+      label: "Auth Cache",
+      value: authCache.label || "Unknown",
+      tone: authCache.tone || "medium",
+      action: authCache.needsLoginCheck ? "Run codex doctor" : "Keep cached",
+      priority: authCache.needsLoginCheck ? 86 : 36,
+      detail:
+        authCache.detail ||
+        "Codex Refit checks only credential-cache metadata. It does not inspect auth token contents.",
+    },
     {
       id: "permission-flow",
       label: "Permission Flow",
@@ -1678,6 +1804,19 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
       tone: "medium",
       priority: 96,
       detail: "Your terminal Codex and bundled Codex app binary are different versions. Align them before chasing phantom slowness or missing features.",
+    });
+  }
+
+  if (authCache.needsLoginCheck) {
+    addRecommendation({
+      id: "auth-cache-check",
+      label: "Auth Cache",
+      value: authCache.label || "Check",
+      action: "Run codex doctor",
+      tone: "medium",
+      priority: 92,
+      detail:
+        "Codex should reuse cached login details. If the cache is missing or empty, repeated sign-in prompts can make every run feel slower.",
     });
   }
 
@@ -1881,6 +2020,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     goalsFeature,
     webSearchMode,
     maxConcurrentThreadsPerSession: codexConfig?.maxConcurrentThreadsPerSession || null,
+    authCache,
     projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
     hasFastTaskProfile,

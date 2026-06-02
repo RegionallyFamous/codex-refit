@@ -30,11 +30,11 @@
           </div>
         </div>
         <div class="topbar-actions">
-          <label class="mode-switch">
-            <input id="advancedMode" type="checkbox" />
-            <span>Easy</span>
-            <span>Hard</span>
-          </label>
+          <div id="modeSwitch" class="mode-switch" role="group" aria-label="Mode">
+            <input id="advancedMode" type="checkbox" hidden />
+            <button id="easyModeButton" type="button" aria-pressed="true">Easy</button>
+            <button id="hardModeButton" type="button" aria-pressed="false">Hard</button>
+          </div>
           <span id="lastScan" class="scan-stamp">Not scanned</span>
           <button id="refreshScan" class="primary" type="button">Rescan</button>
         </div>

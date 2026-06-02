@@ -79,6 +79,9 @@ const elements = {
   destructiveArm: $("#destructiveArm"),
   destructiveArmLabel: $("#destructiveArmLabel"),
   advancedMode: $("#advancedMode"),
+  modeSwitch: $("#modeSwitch"),
+  easyModeButton: $("#easyModeButton"),
+  hardModeButton: $("#hardModeButton"),
   advancedDeck: $("#advancedDeck"),
   modeStatus: $("#modeStatus"),
 };
@@ -140,6 +143,14 @@ function renderMode() {
   document.body.toggleAttribute("data-hard-mode", isHardMode);
   elements.advancedDeck.hidden = !isHardMode;
   elements.modeStatus.textContent = isHardMode ? "Hard Mode" : "Easy Mode";
+  elements.easyModeButton?.setAttribute("aria-pressed", String(!isHardMode));
+  elements.hardModeButton?.setAttribute("aria-pressed", String(isHardMode));
+}
+
+function setHardMode(nextMode) {
+  if (!elements.advancedMode || elements.advancedMode.checked === nextMode) return;
+  elements.advancedMode.checked = nextMode;
+  elements.advancedMode.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 function getPolicy() {
@@ -978,6 +989,8 @@ elements.archiveDeleteDays?.addEventListener("change", refreshScan);
 elements.clearLog.addEventListener("click", () => elements.operationLog.replaceChildren());
 elements.runBenchmark?.addEventListener("click", () => runBenchmark());
 elements.refreshRecovery?.addEventListener("click", () => refreshRecovery({ log: true }));
+elements.easyModeButton?.addEventListener("click", () => setHardMode(false));
+elements.hardModeButton?.addEventListener("click", () => setHardMode(true));
 elements.advancedMode?.addEventListener("change", () => {
   renderMode();
   if (elements.advancedMode.checked) refreshRecovery();

@@ -375,6 +375,14 @@ body[data-delete-armed] .arm-switch {
   -webkit-app-region: no-drag;
 }
 
+.topbar-actions *,
+button,
+input,
+label,
+select {
+  -webkit-app-region: no-drag;
+}
+
 .mode-switch {
   position: relative;
   display: grid;
@@ -409,27 +417,32 @@ body[data-delete-armed] .arm-switch {
 
 .mode-switch input {
   position: absolute;
-  opacity: 0;
-  pointer-events: none;
 }
 
-.mode-switch span {
+.mode-switch button {
   position: relative;
   z-index: 1;
   display: inline-flex;
+  align-items: center;
   justify-content: center;
+  min-height: 34px;
+  border: 0;
+  padding: 0 14px;
+  background: transparent;
   color: var(--muted);
+  cursor: pointer;
   font-size: 0.82rem;
   font-weight: 950;
+  font-family: inherit;
   text-transform: uppercase;
 }
 
-.mode-switch span:first-of-type,
-.mode-switch:has(input:checked) span:last-of-type {
+.mode-switch button:first-of-type,
+.mode-switch:has(input:checked) button:last-of-type {
   color: #050505;
 }
 
-.mode-switch:has(input:checked) span:first-of-type {
+.mode-switch:has(input:checked) button:first-of-type {
   color: var(--muted);
 }
 
