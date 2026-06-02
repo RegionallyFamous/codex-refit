@@ -22,6 +22,8 @@ const paths = {
   maintenanceArchive: path.join(codexHome, "maintenance-archive"),
   generatedImages: path.join(codexHome, "generated_images"),
   generatedImagesArchive: path.join(codexHome, "archived_generated_images"),
+  memories: path.join(codexHome, "memories"),
+  memoriesExtensions: path.join(codexHome, "memories_extensions"),
   configToml: path.join(codexHome, "config.toml"),
   authJson: path.join(codexHome, "auth.json"),
   globalAgents: path.join(codexHome, "AGENTS.md"),
@@ -68,6 +70,10 @@ function assertAllowed(targetPath) {
 
 function sqlString(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function normalizeDays(value, fallback, { min = 0, max = 3650 } = {}) {
@@ -1561,6 +1567,15 @@ async function getCodexConfigSummary() {
     fastModeFeature: true,
     shellSnapshot: true,
     goalsFeature: false,
+    memoriesFeature: false,
+    memoriesUseMemories: null,
+    memoriesUseMemoriesEffective: false,
+    memoriesGenerateMemories: null,
+    memoriesGenerateMemoriesEffective: false,
+    memoriesDisableOnExternalContext: null,
+    memoriesMinRateLimitRemainingPercent: null,
+    memoriesExtractModel: null,
+    memoriesConsolidationModel: null,
     webSearchMode: null,
     maxConcurrentThreadsPerSession: null,
     agentMaxThreads: null,
@@ -1627,6 +1642,16 @@ async function getCodexConfigSummary() {
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.goalsFeature = values["features.goals"] === true;
+    summary.memoriesFeature = values["features.memories"] === true;
+    summary.memoriesUseMemories = values["memories.use_memories"] ?? null;
+    summary.memoriesUseMemoriesEffective = summary.memoriesFeature && summary.memoriesUseMemories !== false;
+    summary.memoriesGenerateMemories = values["memories.generate_memories"] ?? null;
+    summary.memoriesGenerateMemoriesEffective = summary.memoriesFeature && summary.memoriesGenerateMemories !== false;
+    summary.memoriesDisableOnExternalContext =
+      values["memories.disable_on_external_context"] ?? values["memories.no_memories_if_mcp_or_web_search"] ?? null;
+    summary.memoriesMinRateLimitRemainingPercent = configNumber(values["memories.min_rate_limit_remaining_percent"]);
+    summary.memoriesExtractModel = values["memories.extract_model"] || null;
+    summary.memoriesConsolidationModel = values["memories.consolidation_model"] || null;
     summary.webSearchMode = values.web_search || null;
     summary.maxConcurrentThreadsPerSession = values.max_concurrent_threads_per_session || null;
     summary.agentMaxThreads = configNumber(values["agents.max_threads"]);
@@ -1747,6 +1772,11 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const agentMaxThreads = Number(codexConfig?.agentMaxThreadsEffective ?? 6);
   const agentMaxDepth = Number(codexConfig?.agentMaxDepthEffective ?? 1);
   const agentFanoutRisk = agentMaxDepth > 1 || agentMaxThreads >= 12;
+  const memoryBytes = scan?.categories?.memoryState?.bytes || 0;
+  const memoryFiles = scan?.categories?.memoryState?.fileCount || 0;
+  const memoryInjection = Boolean(codexConfig?.memoriesUseMemoriesEffective);
+  const memoryGeneration = Boolean(codexConfig?.memoriesGenerateMemoriesEffective);
+  const memoryReviewNeeded = memoryBytes > 2 * 1024 ** 2 || memoryFiles >= 50 || memoryInjection || memoryGeneration;
 
   if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
     addFix({
@@ -1790,6 +1820,26 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "max_depth = 1",
         "",
         "# Raise these only for deliberately parallel tasks.",
+      ].join("\n"),
+    });
+  }
+
+  if (memoryReviewNeeded) {
+    addFix({
+      id: "memory-context",
+      label: "Memory Context",
+      value: memoryBytes ? formatBytesServer(memoryBytes) : memoryInjection ? "Injecting" : "Enabled",
+      tone: memoryBytes > 10 * 1024 ** 2 || memoryFiles >= 200 ? "medium" : "low",
+      action: "Review memories",
+      detail:
+        "Memories can save repeated prompting, but they are hidden context. Review local memory files before sharing Codex home and keep required rules in AGENTS.md.",
+      snippet: [
+        "# Review memory behavior inside Codex:",
+        "/memories",
+        "",
+        "# Metadata-only local check:",
+        `find ${shellQuote(paths.memories)} ${shellQuote(paths.memoriesExtensions)} -type f 2>/dev/null | wc -l`,
+        `du -sh ${shellQuote(paths.memories)} ${shellQuote(paths.memoriesExtensions)} 2>/dev/null`,
       ].join("\n"),
     });
   }
@@ -2027,7 +2077,26 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const emptyGlobalGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const staleTrustedProjectCount = Number(codexConfig?.staleTrustedProjectCount || 0);
   const webSearchMode = codexConfig?.webSearchMode || "cached default";
-  const docsSource = "Official Codex manual: Speed, Models, Config, AGENTS, MCP, Troubleshooting";
+  const memoryBytes = categories.memoryState?.bytes || 0;
+  const memoryFiles = categories.memoryState?.fileCount || 0;
+  const memoriesFeature = Boolean(codexConfig?.memoriesFeature);
+  const memoriesUse = Boolean(codexConfig?.memoriesUseMemoriesEffective);
+  const memoriesGenerate = Boolean(codexConfig?.memoriesGenerateMemoriesEffective);
+  const memoryStateLabel = memoriesUse
+    ? "Injecting"
+    : memoriesGenerate
+      ? "Generating"
+      : memoriesFeature
+        ? "Enabled"
+        : "Off";
+  const memoryTone = memoryBytes > 10 * 1024 ** 2 || memoryFiles >= 200 ? "medium" : "low";
+  const memoryDetail =
+    memoriesUse || memoriesGenerate
+      ? `Memories are ${memoriesUse ? "available for future-session context" : "enabled for generation"} with ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}). Keep required rules in AGENTS.md and review memories before sharing Codex home.`
+      : memoriesFeature
+        ? `Memories are enabled, but Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`
+        : `Memories are off in config. Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`;
+  const docsSource = "Official Codex manual: Speed, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
   const processReady = processSummary?.status === "ready";
   const processLoaded = processReady && processSummary.tone !== "low";
   const processCount = Number(processSummary?.processCount || 0);
@@ -2201,6 +2270,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         codexConfig?.webSearchMode === "live"
           ? "Live web search is useful for current facts, but cached or disabled search can make local coding runs more predictable."
           : "Cached/default web search is a good baseline. Disable it only for fully local tasks that should never look outward.",
+    },
+    {
+      id: "memories",
+      label: "Memories",
+      value: memoryStateLabel,
+      tone: memoryTone,
+      action: memoriesUse || memoriesGenerate || memoryFiles ? "Review when needed" : "Optional",
+      priority: memoryTone === "medium" ? 68 : memoriesUse || memoriesGenerate ? 40 : 18,
+      detail: memoryDetail,
     },
     {
       id: "goal-mode",
@@ -2523,6 +2601,19 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (memoryTone === "medium") {
+    addRecommendation({
+      id: "memory-context",
+      label: "Memory Context",
+      value: formatBytesServer(memoryBytes),
+      action: "Review memories",
+      tone: "medium",
+      priority: 58,
+      detail:
+        "Local memories can be useful hidden context. If Codex starts carrying stale assumptions, review memory files and keep hard requirements in AGENTS.md instead.",
+    });
+  }
+
   if (!goalsFeature) {
     addRecommendation({
       id: "enable-goals",
@@ -2591,6 +2682,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellSnapshot,
     goalsFeature,
     webSearchMode,
+    memoriesFeature,
+    memoriesUseMemories: codexConfig?.memoriesUseMemories ?? null,
+    memoriesUseMemoriesEffective: memoriesUse,
+    memoriesGenerateMemories: codexConfig?.memoriesGenerateMemories ?? null,
+    memoriesGenerateMemoriesEffective: memoriesGenerate,
+    memoriesDisableOnExternalContext: codexConfig?.memoriesDisableOnExternalContext ?? null,
+    memoriesMinRateLimitRemainingPercent: codexConfig?.memoriesMinRateLimitRemainingPercent ?? null,
+    memoriesExtractModel: codexConfig?.memoriesExtractModel ?? null,
+    memoriesConsolidationModel: codexConfig?.memoriesConsolidationModel ?? null,
     maxConcurrentThreadsPerSession: codexConfig?.maxConcurrentThreadsPerSession || null,
     agentMaxThreads: codexConfig?.agentMaxThreads ?? null,
     agentMaxThreadsEffective: agentMaxThreads,
@@ -2654,6 +2754,12 @@ function addHotspots(scan) {
   categories.generatedImagesArchive.hotspots = [
     "Generated images that were moved out of the active cache.",
     "Kept on disk so you can recover or export them later.",
+  ];
+  categories.memoryState.hotspots = [
+    `${categories.memoryState.fileCount.toLocaleString()} memory file${categories.memoryState.fileCount === 1 ? "" : "s"}`,
+    categories.memoryState.bytes
+      ? `${formatBytesServer(categories.memoryState.bytes)} of local recall context to review before sharing.`
+      : "No local memory files found.",
   ];
   categories.logs.hotspots = [
     `${logs.fileCount.toLocaleString()} SQLite files`,
@@ -2808,6 +2914,7 @@ export async function scanCodex(options = {}) {
     maintenanceArchive,
     generatedImages,
     generatedImagesArchive,
+    memoryState,
     crashDumps,
     browserCaches,
     archivedStillInSessions,
@@ -2829,6 +2936,13 @@ export async function scanCodex(options = {}) {
     }),
     summarizeDirectory(paths.generatedImages, { label: "Generated Images", risk: "warn", largestLimit: 8 }),
     summarizeDirectory(paths.generatedImagesArchive, { label: "Moved Generated Images", risk: "scan", largestLimit: 8 }),
+    summarizeMany([paths.memories, paths.memoriesExtensions], {
+      label: "Memory State",
+      pathLabel: "memories + memories_extensions",
+      risk: "scan",
+      largestLimit: 8,
+      largestPredicate: (filePath) => /\.(md|json|jsonl|txt)$/i.test(filePath),
+    }),
     summarizeMany(crashDirs(), {
       label: "Crash Dumps",
       pathLabel: "Crashpad pending/completed",
@@ -2897,6 +3011,7 @@ export async function scanCodex(options = {}) {
     maintenanceArchive,
     generatedImages,
     generatedImagesArchive,
+    memoryState,
     logs,
     crashDumps,
     browserCaches,
@@ -3015,6 +3130,7 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(8, ((Number(metrics.processRssBytes || 0) / 1024 ** 3) || 0) * 1.2);
   score -= Math.min(8, Math.max(0, Number(metrics.agentMaxDepth || 1) - 1) * 4);
   score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
+  if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   return Math.round(clampNumber(score, 0, 100));
 }
 
@@ -3065,6 +3181,9 @@ function benchmarkGuidance(metrics) {
     );
   } else if (metrics.agentMaxThreads >= 12) {
     guidance.push(`Keep subagent fan-out scoped; agents.max_threads is ${Number(metrics.agentMaxThreads).toLocaleString()}.`);
+  }
+  if (metrics.memoriesUseMemories && metrics.memoryBytes > 10 * 1024 ** 2) {
+    guidance.push(`Review ${formatBytesServer(metrics.memoryBytes)} of local memories if Codex starts carrying stale assumptions.`);
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -3706,6 +3825,8 @@ function benchmarkDeltas(current, previous) {
     "processHelperCount",
     "agentMaxThreads",
     "agentMaxDepth",
+    "memoryBytes",
+    "memoryFiles",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -3731,6 +3852,10 @@ function summarizeBenchmarkEntry(entry) {
     processRssBytes: entry.metrics.processRssBytes || 0,
     agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
     agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
+    memoryBytes: entry.metrics.memoryBytes || 0,
+    memoryFiles: entry.metrics.memoryFiles || 0,
+    memoriesUseMemories: Boolean(entry.metrics.memoriesUseMemories),
+    memoriesGenerateMemories: Boolean(entry.metrics.memoriesGenerateMemories),
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -3757,6 +3882,7 @@ export async function benchmarkHistory(limit = 12) {
         staleThreads: latest.staleThreads - oldest.staleThreads,
         processCount: latest.processCount - oldest.processCount,
         processRssBytes: latest.processRssBytes - oldest.processRssBytes,
+        memoryBytes: latest.memoryBytes - oldest.memoryBytes,
       }
     : null;
   const previousDeltas = latest && previous
@@ -3848,6 +3974,10 @@ export async function runBenchmark() {
     processRssBytes: scan.processes?.rssBytes || 0,
     agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
     agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
+    memoryBytes: scan.categories.memoryState?.bytes || 0,
+    memoryFiles: scan.categories.memoryState?.fileCount || 0,
+    memoriesUseMemories: Boolean(scan.codexConfig?.memoriesUseMemoriesEffective),
+    memoriesGenerateMemories: Boolean(scan.codexConfig?.memoriesGenerateMemoriesEffective),
   };
   metrics.scoreBreakdown = localScoreBreakdown(metrics);
   metrics.score = metrics.scoreBreakdown.score;
