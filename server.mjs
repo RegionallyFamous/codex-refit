@@ -55,6 +55,7 @@ const paths = {
   generatedImagesArchive: path.join(codexHome, "archived_generated_images"),
   memories: path.join(codexHome, "memories"),
   memoriesExtensions: path.join(codexHome, "memories_extensions"),
+  customPrompts: path.join(codexHome, "prompts"),
   customAgents: path.join(codexHome, "agents"),
   codexSkills: path.join(codexHome, "skills"),
   codexSystemSkills: path.join(codexHome, "skills", ".system"),
@@ -1620,6 +1621,142 @@ async function getCustomAgentSummary(currentProject = null) {
         const bRisk = (!b.valid ? 6 : 0) + (b.builtInOverride ? 5 : 0) + (b.missingMcpEnvVarCount ? 4 : 0) + (b.highEffort ? 2 : 0) + b.developerInstructionBytes / 1024;
         return bRisk - aRisk;
       })
+      .slice(0, 12),
+  };
+}
+
+function emptyCustomPromptSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "None",
+    action: "Use skills",
+    detail: "No top-level custom prompt Markdown files were found.",
+    promptCount: 0,
+    totalBytes: 0,
+    missingDescriptionCount: 0,
+    argumentHintCount: 0,
+    placeholderCount: 0,
+    largePromptCount: 0,
+    nestedMarkdownCount: 0,
+    ignoredFileCount: 0,
+    prompts: [],
+  };
+}
+
+function promptPlaceholders(text) {
+  const matches = String(text || "").match(/\$(?:ARGUMENTS|[1-9]|[A-Z][A-Z0-9_]*)/g) || [];
+  return [...new Set(matches)];
+}
+
+async function readCustomPromptFile(filePath) {
+  const stats = await statOrNull(filePath);
+  let text = "";
+  try {
+    text = await fs.readFile(filePath, "utf8");
+  } catch {
+    text = "";
+  }
+  const frontMatter = text.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
+  const metadataText = frontMatter ? frontMatter[1] : "";
+  const description = yamlLikeField(metadataText, "description");
+  const argumentHint = yamlLikeField(metadataText, "argument-hint");
+  const placeholders = promptPlaceholders(text);
+
+  return {
+    name: path.basename(filePath, path.extname(filePath)),
+    path: displayPath(filePath),
+    bytes: stats?.isFile() ? stats.size : 0,
+    mtime: stats?.mtime?.toISOString?.() || null,
+    hasDescription: Boolean(description),
+    hasArgumentHint: Boolean(argumentHint),
+    placeholderCount: placeholders.length,
+    large: (stats?.size || 0) >= largeInstructionFileBytes,
+  };
+}
+
+async function getCustomPromptSummary() {
+  const rootStats = await statOrNull(paths.customPrompts);
+  if (!rootStats?.isDirectory()) return emptyCustomPromptSummary();
+
+  let entries = [];
+  try {
+    entries = await fs.readdir(paths.customPrompts, { withFileTypes: true });
+  } catch {
+    return emptyCustomPromptSummary();
+  }
+
+  const promptFiles = [];
+  let nestedMarkdownCount = 0;
+  let ignoredFileCount = 0;
+
+  for (const entry of entries) {
+    const fullPath = path.join(paths.customPrompts, entry.name);
+    if (entry.isFile() && /\.md$/i.test(entry.name)) {
+      promptFiles.push(fullPath);
+      continue;
+    }
+    if (entry.isDirectory()) {
+      try {
+        const nested = await fs.readdir(fullPath, { withFileTypes: true });
+        nestedMarkdownCount += nested.filter((nestedEntry) => nestedEntry.isFile() && /\.md$/i.test(nestedEntry.name)).length;
+      } catch {
+        // Ignore unreadable nested prompt folders; Codex ignores nested prompt files too.
+      }
+      continue;
+    }
+    if (entry.isFile()) ignoredFileCount += 1;
+  }
+
+  if (!promptFiles.length) {
+    return {
+      ...emptyCustomPromptSummary(),
+      nestedMarkdownCount,
+      ignoredFileCount,
+      detail:
+        nestedMarkdownCount || ignoredFileCount
+          ? `No top-level custom prompt Markdown files were found. Codex ignores nested prompt Markdown and non-Markdown files in ${displayPath(paths.customPrompts)}.`
+          : "No top-level custom prompt Markdown files were found.",
+    };
+  }
+
+  const prompts = await Promise.all(promptFiles.map(readCustomPromptFile));
+  const promptCount = prompts.length;
+  const totalBytes = prompts.reduce((total, prompt) => total + prompt.bytes, 0);
+  const missingDescriptionCount = prompts.filter((prompt) => !prompt.hasDescription).length;
+  const argumentHintCount = prompts.filter((prompt) => prompt.hasArgumentHint).length;
+  const placeholderCount = prompts.reduce((total, prompt) => total + prompt.placeholderCount, 0);
+  const largePromptCount = prompts.filter((prompt) => prompt.large).length;
+  const highLoad = promptCount >= 20 || totalBytes >= 64 * 1024 || largePromptCount >= 4;
+  const mediumLoad = highLoad || promptCount > 0;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = `${promptCount.toLocaleString()} prompt${promptCount === 1 ? "" : "s"}`;
+  const action = highLoad ? "Migrate to skills" : "Review or migrate";
+  const detail = [
+    "Custom prompts are deprecated; Codex recommends skills for reusable instructions that should be invoked explicitly or implicitly.",
+    `Refit found ${promptCount.toLocaleString()} top-level prompt Markdown file${promptCount === 1 ? "" : "s"} totaling ${formatBytesServer(totalBytes)}.`,
+    missingDescriptionCount ? `${missingDescriptionCount.toLocaleString()} prompt${missingDescriptionCount === 1 ? "" : "s"} ${pluralVerb(missingDescriptionCount)} missing description metadata.` : null,
+    nestedMarkdownCount ? `${nestedMarkdownCount.toLocaleString()} nested Markdown prompt${nestedMarkdownCount === 1 ? "" : "s"} will be ignored by Codex.` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    promptCount,
+    totalBytes,
+    missingDescriptionCount,
+    argumentHintCount,
+    placeholderCount,
+    largePromptCount,
+    nestedMarkdownCount,
+    ignoredFileCount,
+    prompts: prompts
+      .sort((a, b) => b.bytes - a.bytes)
       .slice(0, 12),
   };
 }
@@ -3371,6 +3508,7 @@ async function getCodexConfigSummary() {
     instructionStack: emptyInstructionStackSummary(),
     instructionOverrides: emptyInstructionOverrideSummary(),
     customAgents: emptyCustomAgentSummary(),
+    customPrompts: emptyCustomPromptSummary(),
     goalsFeature: false,
     hooksFeature: true,
     hookSummary: {
@@ -3449,6 +3587,7 @@ async function getCodexConfigSummary() {
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
     summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
     summary.customAgents = await getCustomAgentSummary(null);
+    summary.customPrompts = await getCustomPromptSummary();
     return summary;
   }
   summary.exists = true;
@@ -3533,6 +3672,7 @@ async function getCodexConfigSummary() {
       currentProject: summary.projectReadiness.currentProject,
     });
     summary.customAgents = await getCustomAgentSummary(summary.projectReadiness.currentProject);
+    summary.customPrompts = await getCustomPromptSummary();
     summary.mcpSummary = buildMcpConfigSummary(mcpValues, mcpSections);
     summary.enabledMcpCount = summary.mcpSummary.enabledCount;
     summary.disabledMcpCount = summary.mcpSummary.disabledCount;
@@ -3631,6 +3771,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
+  const customPrompts = codexConfig?.customPrompts || emptyCustomPromptSummary();
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -3756,6 +3897,30 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         '"""',
         "",
         "# For fast scans, prefer a lighter model/effort inside the agent file when appropriate.",
+      ].join("\n"),
+    });
+  }
+
+  if (customPrompts.status === "ready" && customPrompts.tone !== "low") {
+    addFix({
+      id: "custom-prompts",
+      label: "Custom Prompts",
+      value: customPrompts.label,
+      tone: customPrompts.tone === "high" ? "high" : "medium",
+      action: customPrompts.action || "Review prompts",
+      detail:
+        "Custom prompts still work as slash commands, but Codex documents them as deprecated. Move reusable workflows to skills when you touch them.",
+      snippet: [
+        `# ${displayPath(paths.customPrompts)}`,
+        "# Codex scans only top-level Markdown files here.",
+        "# Use /prompts:name for existing prompts, but prefer skills for reusable workflows:",
+        "$skill-creator",
+        "",
+        "# Keep prompt templates small and add front matter:",
+        "---",
+        "description: Short command summary",
+        "argument-hint: [FILES=]",
+        "---",
       ].join("\n"),
     });
   }
@@ -4155,6 +4320,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
+  const customPrompts = codexConfig?.customPrompts || emptyCustomPromptSummary();
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -4474,6 +4640,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         : emptyGlobalGuidance
           ? "The file exists but is empty, so Codex skips it. Add only repeated working preferences that save future prompting."
           : "Add ~/.codex/AGENTS.md so recurring preferences do not need to be repeated in every prompt.",
+    },
+    {
+      id: "custom-prompts",
+      label: "Custom Prompts",
+      value: customPrompts.label,
+      tone: customPrompts.tone,
+      action: customPrompts.action,
+      priority: customPrompts.tone === "high" ? 62 : customPrompts.tone === "medium" ? 44 : customPrompts.nestedMarkdownCount ? 24 : 10,
+      detail: customPrompts.detail,
     },
   ].sort((a, b) => b.priority - a.priority);
 
@@ -4930,6 +5105,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (customPrompts.status === "ready" && customPrompts.tone !== "low") {
+    addRecommendation({
+      id: "custom-prompts",
+      label: "Custom Prompts",
+      value: customPrompts.label,
+      action: customPrompts.action || "Review prompts",
+      tone: customPrompts.tone === "high" ? "high" : "medium",
+      priority: customPrompts.tone === "high" ? 53 : 43,
+      detail: customPrompts.detail,
+    });
+  }
+
   if (codexConfig?.webSearchMode === "live") {
     addRecommendation({
       id: "web-search-live",
@@ -5063,6 +5250,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     agentMaxDepthEffective: agentMaxDepth,
     agentJobMaxRuntimeSeconds: codexConfig?.agentJobMaxRuntimeSeconds ?? null,
     customAgents,
+    customPrompts,
     authCache,
     projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
@@ -5529,6 +5717,8 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(5, Math.max(0, Number(metrics.instructionOverrideBytes || 0) - 12 * 1024) / 8192);
   if (metrics.instructionOverrideMissingFileCount) score -= Math.min(6, Number(metrics.instructionOverrideMissingFileCount || 0) * 3);
   if (metrics.modelInstructionsFileConfigured) score -= 2;
+  score -= Math.min(3, Math.max(0, Number(metrics.customPromptCount || 0) - 5) * 0.35);
+  score -= Math.min(3, Math.max(0, Number(metrics.customPromptBytes || 0) - 24 * 1024) / 8192);
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   score -= Math.min(5, Math.max(0, Number(metrics.skillEstimatedCatalogChars || 0) - skillCatalogBudgetChars) / 4000);
   score -= Math.min(4, Math.max(0, Number(metrics.skillCount || 0) - 40) * 0.08);
@@ -5611,6 +5801,11 @@ function benchmarkGuidance(metrics) {
     );
   } else if (metrics.skillCount >= 40) {
     guidance.push(`Keep skill descriptions tight; ${Number(metrics.skillCount).toLocaleString()} skills are available to Codex.`);
+  }
+  if (metrics.customPromptCount > 0) {
+    guidance.push(
+      `Review ${Number(metrics.customPromptCount).toLocaleString()} deprecated custom prompt${metrics.customPromptCount === 1 ? "" : "s"}; use skills for reusable workflows as you update them.`,
+    );
   }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
     guidance.push(
@@ -6346,6 +6541,8 @@ function benchmarkDeltas(current, previous) {
     "skillEstimatedCatalogChars",
     "skillDescriptionChars",
     "skillLongDescriptionCount",
+    "customPromptCount",
+    "customPromptBytes",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -6447,6 +6644,11 @@ function summarizeBenchmarkEntry(entry) {
     skillLargeFileCount: entry.metrics.skillLargeFileCount || 0,
     skillCatalogOverBudget: Boolean(entry.metrics.skillCatalogOverBudget),
     skillCatalogTruncated: Boolean(entry.metrics.skillCatalogTruncated),
+    customPromptCount: entry.metrics.customPromptCount || 0,
+    customPromptBytes: entry.metrics.customPromptBytes || 0,
+    customPromptMissingDescriptionCount: entry.metrics.customPromptMissingDescriptionCount || 0,
+    customPromptPlaceholderCount: entry.metrics.customPromptPlaceholderCount || 0,
+    customPromptNestedMarkdownCount: entry.metrics.customPromptNestedMarkdownCount || 0,
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -6492,6 +6694,8 @@ export async function benchmarkHistory(limit = 12) {
         skillCount: latest.skillCount - oldest.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - oldest.skillEstimatedCatalogChars,
         skillLongDescriptionCount: latest.skillLongDescriptionCount - oldest.skillLongDescriptionCount,
+        customPromptCount: latest.customPromptCount - oldest.customPromptCount,
+        customPromptBytes: latest.customPromptBytes - oldest.customPromptBytes,
       }
     : null;
   const previousDeltas = latest && previous
@@ -6513,6 +6717,7 @@ export async function benchmarkHistory(limit = 12) {
         instructionOverrideBytes: latest.instructionOverrideBytes - previous.instructionOverrideBytes,
         skillCount: latest.skillCount - previous.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - previous.skillEstimatedCatalogChars,
+        customPromptCount: latest.customPromptCount - previous.customPromptCount,
       }
     : null;
   const trend =
@@ -6650,6 +6855,11 @@ export async function runBenchmark() {
     modelInstructionsFileConfigured: Boolean(scan.codexConfig?.instructionOverrides?.modelInstructionsFileConfigured),
     compactPromptConfigured: Boolean(scan.codexConfig?.instructionOverrides?.compactPromptConfigured),
     compactPromptFileConfigured: Boolean(scan.codexConfig?.instructionOverrides?.compactPromptFileConfigured),
+    customPromptCount: scan.codexConfig?.customPrompts?.promptCount || 0,
+    customPromptBytes: scan.codexConfig?.customPrompts?.totalBytes || 0,
+    customPromptMissingDescriptionCount: scan.codexConfig?.customPrompts?.missingDescriptionCount || 0,
+    customPromptPlaceholderCount: scan.codexConfig?.customPrompts?.placeholderCount || 0,
+    customPromptNestedMarkdownCount: scan.codexConfig?.customPrompts?.nestedMarkdownCount || 0,
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
