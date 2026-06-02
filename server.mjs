@@ -45,6 +45,9 @@ const maxSkillCatalogDirs = 4000;
 const maxSkillCatalogDepth = 10;
 const defaultProjectDocMaxBytes = 32 * 1024;
 const largeInstructionFileBytes = 12 * 1024;
+const recommendedHistoryMaxBytes = 5 * 1024 * 1024;
+const largeHistoryFileBytes = 20 * 1024 * 1024;
+const hugeHistoryFileBytes = 100 * 1024 * 1024;
 const builtInAgentNames = new Set(["default", "worker", "explorer"]);
 
 const paths = {
@@ -71,6 +74,7 @@ const paths = {
   pluginCache: path.join(codexHome, "plugins", "cache"),
   configToml: path.join(codexHome, "config.toml"),
   authJson: path.join(codexHome, "auth.json"),
+  historyJsonl: path.join(codexHome, "history.jsonl"),
   globalAgentsOverride: path.join(codexHome, "AGENTS.override.md"),
   globalAgents: path.join(codexHome, "AGENTS.md"),
   globalHooks: path.join(codexHome, "hooks.json"),
@@ -2069,6 +2073,109 @@ function buildContextBudgetSummary(values = {}) {
     compactTooLate,
     compactEarly,
     smallWindow,
+  };
+}
+
+function buildHistoryRetentionSummary(values = {}, meta = {}) {
+  const persistenceValue = values["history.persistence"];
+  const persistenceConfigured = persistenceValue !== undefined;
+  const persistenceKey = normalizeConfigKey(persistenceValue || "save-all");
+  const persistenceOff = persistenceKey === "none";
+  const persistenceSaveAll = persistenceKey === "save_all";
+  const invalidPersistence = persistenceConfigured && !persistenceSaveAll && !persistenceOff;
+  const maxValue = values["history.max_bytes"];
+  const maxBytesConfigured = maxValue !== undefined;
+  const maxBytes = configNumber(maxValue);
+  const invalidMaxBytes = maxBytesConfigured && (!Number.isFinite(maxBytes) || maxBytes <= 0);
+  const historyFileBytes = Number(meta.historyFileBytes || 0);
+  const historyFileExists = meta.historyFileExists ?? historyFileBytes > 0;
+  const projectConfig = meta.projectConfig || null;
+  const projectHistoryConfigured = Boolean(
+    projectConfig &&
+      Object.keys(projectConfig.values || {}).some((key) => key === "history.persistence" || key === "history.max_bytes"),
+  );
+  const unbounded = !persistenceOff && !maxBytesConfigured;
+  const tinyCap = maxBytesConfigured && !invalidMaxBytes && maxBytes < 1024 * 1024;
+  const largeCap = maxBytesConfigured && !invalidMaxBytes && maxBytes > 50 * 1024 * 1024;
+  const hugeCap = maxBytesConfigured && !invalidMaxBytes && maxBytes > 250 * 1024 * 1024;
+  const fileLarge = historyFileBytes >= largeHistoryFileBytes;
+  const fileHuge = historyFileBytes >= hugeHistoryFileBytes;
+  const overCap = maxBytesConfigured && !invalidMaxBytes && historyFileBytes > maxBytes * 1.25;
+  const highLoad = invalidPersistence || invalidMaxBytes || fileHuge || hugeCap || (overCap && historyFileBytes >= 50 * 1024 * 1024);
+  const mediumLoad = highLoad || persistenceOff || (unbounded && fileLarge) || overCap || largeCap || tinyCap;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = invalidPersistence
+    ? "Invalid"
+    : invalidMaxBytes
+      ? "Bad cap"
+      : persistenceOff
+        ? "Off"
+        : maxBytesConfigured
+          ? `${formatBytesServer(maxBytes)} cap`
+          : "Uncapped";
+  const action =
+    invalidPersistence || invalidMaxBytes
+      ? "Fix history config"
+      : persistenceOff
+        ? "Use bounded history"
+        : fileHuge || hugeCap || overCap || (unbounded && fileLarge)
+          ? "Set a cap"
+          : tinyCap
+            ? "Raise cap"
+            : unbounded
+              ? "Watch size"
+              : "Keep bounded";
+  const detail =
+    tone === "low"
+      ? maxBytesConfigured
+        ? `Codex history is saved with a ${formatBytesServer(maxBytes)} cap. The current history file is ${historyFileExists ? formatBytesServer(historyFileBytes) : "not present"}.`
+        : `Codex history uses the documented save-all default. The current history file is ${historyFileExists ? formatBytesServer(historyFileBytes) : "not present"}; add max_bytes if it starts growing.`
+      : [
+          invalidPersistence
+            ? `history.persistence is ${persistenceValue}; the documented values are save-all and none.`
+            : persistenceOff
+              ? "History persistence is off. That can make Codex feel cleaner, but you lose local transcript continuity and recovery value."
+              : "History persistence is saving transcripts.",
+          invalidMaxBytes
+            ? `history.max_bytes is ${maxValue}; use a positive byte count such as ${recommendedHistoryMaxBytes}.`
+            : maxBytesConfigured
+              ? `history.max_bytes is ${formatBytesServer(maxBytes)}.`
+              : "No history.max_bytes cap is configured.",
+          historyFileExists ? `The current history file is ${formatBytesServer(historyFileBytes)}.` : "No history.jsonl file was found.",
+          overCap ? "The file is already above the configured cap; Codex should trim older entries as history is written." : null,
+          tinyCap ? "The cap is under 1 MB, which may trim useful local history too aggressively." : null,
+          largeCap || hugeCap ? "A large cap can let history grow enough to become local-state pressure again." : null,
+          projectHistoryConfigured ? "The current project .codex/config.toml overrides history settings for this project." : null,
+          "Refit reports this only; it does not delete conversation history.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    persistence: persistenceOff ? "none" : "save-all",
+    persistenceConfigured,
+    persistenceOff,
+    persistenceSaveAll: !persistenceOff && !invalidPersistence,
+    invalidPersistence,
+    maxBytes,
+    maxBytesConfigured,
+    invalidMaxBytes,
+    unbounded,
+    tinyCap,
+    largeCap,
+    hugeCap,
+    overCap,
+    historyFilePath: paths.historyJsonl,
+    historyFileExists,
+    historyFileBytes,
+    fileLarge,
+    fileHuge,
+    projectHistoryConfigured,
   };
 }
 
@@ -6584,12 +6691,22 @@ async function getAuthCacheSummary(values = {}) {
 }
 
 async function getCodexConfigSummary() {
-  const [globalAgentsBaseBytes, globalAgentsOverrideBytes, globalAgentsFileExists, globalAgentsOverrideExists] = await Promise.all([
+  const [
+    globalAgentsBaseBytes,
+    globalAgentsOverrideBytes,
+    globalAgentsFileExists,
+    globalAgentsOverrideExists,
+    historyFileBytes,
+    historyFileExists,
+  ] = await Promise.all([
     fileSize(paths.globalAgents),
     fileSize(paths.globalAgentsOverride),
     exists(paths.globalAgents),
     exists(paths.globalAgentsOverride),
+    fileSize(paths.historyJsonl),
+    exists(paths.historyJsonl),
   ]);
+  const historyMeta = { historyFileBytes, historyFileExists };
   const globalAgentsBytes = globalAgentsOverrideBytes || globalAgentsBaseBytes;
   const summary = {
     path: paths.configToml,
@@ -6619,6 +6736,7 @@ async function getCodexConfigSummary() {
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
     notificationFlow: buildNotificationFlowSummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
+    historyRetention: buildHistoryRetentionSummary({}, historyMeta),
     networkSandbox: emptyNetworkSandboxSummary(),
     instructionStack: emptyInstructionStackSummary(),
     instructionOverrides: emptyInstructionOverrideSummary(),
@@ -6711,6 +6829,7 @@ async function getCodexConfigSummary() {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
     summary.networkSandbox = buildNetworkSandboxSummary({}, []);
     summary.notificationFlow = buildNotificationFlowSummary({});
+    summary.historyRetention = buildHistoryRetentionSummary({}, historyMeta);
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
     summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
     summary.customAgents = await getCustomAgentSummary(null);
@@ -6751,6 +6870,7 @@ async function getCodexConfigSummary() {
     summary.shellEnvironmentSummary = buildShellEnvironmentSummary(values);
     summary.notificationFlow = buildNotificationFlowSummary(values);
     summary.contextBudgetSummary = buildContextBudgetSummary(values);
+    summary.historyRetention = buildHistoryRetentionSummary(values, historyMeta);
     summary.goalsFeature = values["features.goals"] === true;
     summary.hooksFeature = (values["features.hooks"] ?? values["features.codex_hooks"]) !== false;
     summary.rulesFeature = values["features.rules"] !== false;
@@ -6814,6 +6934,10 @@ async function getCodexConfigSummary() {
       }
     }
     summary.notificationFlow = buildNotificationFlowSummary(values, currentProjectConfig);
+    summary.historyRetention = buildHistoryRetentionSummary(
+      currentProjectConfig ? { ...values, ...currentProjectConfig.values } : values,
+      { ...historyMeta, projectConfig: currentProjectConfig },
+    );
     summary.modelProvider = buildModelProviderSummary(values, sections, currentProjectConfig);
     summary.instructionStack = await getInstructionStackSummary({
       values: mcpValues,
@@ -6949,6 +7073,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
@@ -7083,6 +7208,27 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Optional external notifier. Keep it lightweight and user-level, not project-level:",
         '# notify = ["terminal-notifier", "-title", "Codex", "-message", "Turn complete"]',
+      ].join("\n"),
+    });
+  }
+
+  if (historyRetention.status === "ready" && historyRetention.tone !== "low") {
+    addFix({
+      id: "history-retention",
+      label: "History Retention",
+      value: historyRetention.label,
+      tone: historyRetention.tone === "high" ? "high" : "medium",
+      action: historyRetention.action,
+      detail:
+        "Codex can save local transcript history in history.jsonl. Keep the continuity, but add a byte cap when the file starts becoming local-state pressure.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "[history]",
+        'persistence = "save-all"',
+        `max_bytes = ${recommendedHistoryMaxBytes}`,
+        "",
+        "# Use this only if you intentionally want no local transcript history:",
+        '# persistence = "none"',
       ].join("\n"),
     });
   }
@@ -7890,6 +8036,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
@@ -8206,6 +8353,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: contextBudgetSummary.action,
       priority: contextBudgetSummary.tone === "high" ? 85 : contextBudgetSummary.tone === "medium" ? 63 : 21,
       detail: contextBudgetSummary.detail,
+    },
+    {
+      id: "history-retention",
+      label: "History Retention",
+      value: historyRetention.label,
+      tone: historyRetention.tone,
+      action: historyRetention.action,
+      priority: historyRetention.tone === "high" ? 84 : historyRetention.tone === "medium" ? 57 : 18,
+      detail: historyRetention.detail,
     },
     {
       id: "session-media-pressure",
@@ -8944,6 +9100,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (historyRetention.status === "ready" && historyRetention.tone !== "low") {
+    addRecommendation({
+      id: "history-retention",
+      label: "History Retention",
+      value: historyRetention.label,
+      action: historyRetention.action,
+      tone: historyRetention.tone === "high" ? "high" : "medium",
+      priority: historyRetention.tone === "high" ? 82 : 55,
+      detail:
+        historyRetention.unbounded && historyRetention.fileLarge
+          ? `${historyRetention.detail} Add history.max_bytes so useful history stays available without letting the file grow indefinitely.`
+          : historyRetention.detail,
+    });
+  }
+
   if (responseShapeSummary.status === "ready" && responseShapeSummary.tone !== "low") {
     addRecommendation({
       id: "response-shape",
@@ -9198,6 +9369,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellEnvironmentSummary,
     notificationFlow,
     contextBudgetSummary,
+    historyRetention,
     responseShapeSummary,
     networkSandbox,
     instructionStack,
@@ -9656,6 +9828,18 @@ function localScoreBreakdown(metrics) {
       detail: "Local log database size.",
     },
     {
+      id: "history-retention",
+      label: "History File",
+      points: Math.min(
+        8,
+        gb(metrics.historyFileBytes) * 4 +
+          (metrics.historyUnbounded && metrics.historyFileBytes >= largeHistoryFileBytes ? 2 : 0) +
+          (metrics.historyInvalidConfig ? 2 : 0),
+      ),
+      value: formatBytesServer(metrics.historyFileBytes),
+      detail: "Codex history.jsonl size and retention policy.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -9838,6 +10022,12 @@ function benchmarkLiveScore(metrics) {
   if (metrics.notificationDisabled && (metrics.backgroundProcessCount > 0 || metrics.turnTelemetrySlowTurnCount > 0)) score -= 2;
   if (metrics.notificationExternalSlowRisk) score -= 1;
   if (metrics.notificationAlways) score -= 1;
+  if (metrics.historyInvalidConfig) score -= 2;
+  if (metrics.historyFileHuge) score -= 4;
+  else if (metrics.historyFileLarge) score -= 2;
+  if (metrics.historyUnbounded && metrics.historyFileLarge) score -= 2;
+  if (metrics.historyOverCap) score -= 1;
+  if (metrics.historyPersistenceOff) score -= 1;
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasSetupScript) score -= 2;
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasActions) score -= 2;
   score -= Math.min(3, Number(metrics.localEnvironmentParseWarningCount || 0) * 1.5);
@@ -10068,6 +10258,19 @@ function benchmarkGuidance(metrics) {
   } else if (metrics.notificationMethodInvalid || metrics.notificationConditionInvalid || metrics.notificationExternalEmpty) {
     guidance.push("Fix notification config values; use notification_method auto/osc9/bel, notification_condition unfocused/always, and an argv array for notify.");
   }
+  if (metrics.historyInvalidConfig) {
+    guidance.push('Fix history config; use history.persistence = "save-all" or "none" and a positive history.max_bytes value.');
+  } else if (metrics.historyFileHuge || (metrics.historyUnbounded && metrics.historyFileLarge)) {
+    guidance.push(
+      `Cap Codex history retention; history.jsonl is ${formatBytesServer(metrics.historyFileBytes)}${metrics.historyUnbounded ? " with no max_bytes cap" : ""}.`,
+    );
+  } else if (metrics.historyOverCap) {
+    guidance.push("History file is above the configured cap; run Codex once after setting max_bytes so older entries can be trimmed.");
+  } else if (metrics.historyPersistenceOff) {
+    guidance.push('History persistence is off. Use bounded "save-all" history unless you intentionally want no local transcript continuity.');
+  } else if (metrics.historyLargeCap || metrics.historyHugeCap) {
+    guidance.push("History max_bytes is generous. Lower it if the history file becomes local-state pressure again.");
+  }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
     guidance.push(
       `Review ${Number(metrics.hookTurnScopedCommandCount).toLocaleString()} turn/tool-scope lifecycle hook command${metrics.hookTurnScopedCommandCount === 1 ? "" : "s"} with /hooks if Codex commands feel slow.`,
@@ -10171,8 +10374,9 @@ function scanProofMetrics(scan) {
 
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
+  const historyRetention = scan?.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   return {
-    scoreModel: "local-state-v15",
+    scoreModel: "local-state-v16",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -10202,6 +10406,16 @@ function scoreMetricsFromScan(scan) {
     codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
     codexWorktreeHugeCount: categories.codexWorktrees?.hugeWorktreeCount || 0,
     codexWorktreeOverDefaultKeepCount: categories.codexWorktrees?.overDefaultKeepCount || 0,
+    historyTone: historyRetention.tone || "low",
+    historyFileBytes: historyRetention.historyFileBytes || 0,
+    historyUnbounded: Boolean(historyRetention.unbounded),
+    historyPersistenceOff: Boolean(historyRetention.persistenceOff),
+    historyMaxBytesConfigured: Boolean(historyRetention.maxBytesConfigured),
+    historyMaxBytes: historyRetention.maxBytes || 0,
+    historyFileLarge: Boolean(historyRetention.fileLarge),
+    historyFileHuge: Boolean(historyRetention.fileHuge),
+    historyOverCap: Boolean(historyRetention.overCap),
+    historyInvalidConfig: Boolean(historyRetention.invalidPersistence || historyRetention.invalidMaxBytes),
   };
 }
 
@@ -11017,6 +11231,19 @@ function benchmarkDeltas(current, previous) {
     "notificationExternalSlowRisk",
     "notificationProjectIgnoredNotify",
     "notificationProjectIgnoredNotifyCount",
+    "historyPersistenceOff",
+    "historyMaxBytesConfigured",
+    "historyMaxBytes",
+    "historyUnbounded",
+    "historyTinyCap",
+    "historyLargeCap",
+    "historyHugeCap",
+    "historyOverCap",
+    "historyFileBytes",
+    "historyFileLarge",
+    "historyFileHuge",
+    "historyProjectConfigured",
+    "historyInvalidConfig",
     "localEnvironmentConfigCount",
     "localEnvironmentCandidateFileCount",
     "localEnvironmentSetupCount",
@@ -11327,6 +11554,26 @@ function summarizeBenchmarkEntry(entry) {
     notificationExternalSlowRisk: Boolean(entry.metrics.notificationExternalSlowRisk),
     notificationProjectIgnoredNotify: Boolean(entry.metrics.notificationProjectIgnoredNotify),
     notificationProjectIgnoredNotifyCount: entry.metrics.notificationProjectIgnoredNotifyCount || 0,
+    historyTone: entry.metrics.historyTone || "low",
+    historyLabel: entry.metrics.historyLabel || "Uncapped",
+    historyPersistence: entry.metrics.historyPersistence || "save-all",
+    historyPersistenceConfigured: Boolean(entry.metrics.historyPersistenceConfigured),
+    historyPersistenceOff: Boolean(entry.metrics.historyPersistenceOff),
+    historyMaxBytesConfigured: Boolean(entry.metrics.historyMaxBytesConfigured),
+    historyMaxBytes: entry.metrics.historyMaxBytes || 0,
+    historyInvalidPersistence: Boolean(entry.metrics.historyInvalidPersistence),
+    historyInvalidMaxBytes: Boolean(entry.metrics.historyInvalidMaxBytes),
+    historyUnbounded: Boolean(entry.metrics.historyUnbounded),
+    historyTinyCap: Boolean(entry.metrics.historyTinyCap),
+    historyLargeCap: Boolean(entry.metrics.historyLargeCap),
+    historyHugeCap: Boolean(entry.metrics.historyHugeCap),
+    historyOverCap: Boolean(entry.metrics.historyOverCap),
+    historyFileExists: Boolean(entry.metrics.historyFileExists),
+    historyFileBytes: entry.metrics.historyFileBytes || 0,
+    historyFileLarge: Boolean(entry.metrics.historyFileLarge),
+    historyFileHuge: Boolean(entry.metrics.historyFileHuge),
+    historyProjectConfigured: Boolean(entry.metrics.historyProjectConfigured),
+    historyInvalidConfig: Boolean(entry.metrics.historyInvalidConfig),
     projectHasPackageJson: Boolean(entry.metrics.projectHasPackageJson),
     projectHasUsefulScripts: Boolean(entry.metrics.projectHasUsefulScripts),
     localEnvironmentConfigCount: entry.metrics.localEnvironmentConfigCount || 0,
@@ -11479,6 +11726,16 @@ export async function benchmarkHistory(limit = 12) {
         notificationExternalArgCount: latest.notificationExternalArgCount - oldest.notificationExternalArgCount,
         notificationExternalSlowRisk: Number(latest.notificationExternalSlowRisk) - Number(oldest.notificationExternalSlowRisk),
         notificationProjectIgnoredNotify: Number(latest.notificationProjectIgnoredNotify) - Number(oldest.notificationProjectIgnoredNotify),
+        historyPersistenceOff: Number(latest.historyPersistenceOff) - Number(oldest.historyPersistenceOff),
+        historyMaxBytesConfigured: Number(latest.historyMaxBytesConfigured) - Number(oldest.historyMaxBytesConfigured),
+        historyMaxBytes: latest.historyMaxBytes - oldest.historyMaxBytes,
+        historyUnbounded: Number(latest.historyUnbounded) - Number(oldest.historyUnbounded),
+        historyOverCap: Number(latest.historyOverCap) - Number(oldest.historyOverCap),
+        historyFileBytes: latest.historyFileBytes - oldest.historyFileBytes,
+        historyFileLarge: Number(latest.historyFileLarge) - Number(oldest.historyFileLarge),
+        historyFileHuge: Number(latest.historyFileHuge) - Number(oldest.historyFileHuge),
+        historyProjectConfigured: Number(latest.historyProjectConfigured) - Number(oldest.historyProjectConfigured),
+        historyInvalidConfig: Number(latest.historyInvalidConfig) - Number(oldest.historyInvalidConfig),
         localEnvironmentConfigCount: latest.localEnvironmentConfigCount - oldest.localEnvironmentConfigCount,
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - oldest.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - oldest.localEnvironmentActionCount,
@@ -11595,6 +11852,16 @@ export async function benchmarkHistory(limit = 12) {
         notificationExternalArgCount: latest.notificationExternalArgCount - previous.notificationExternalArgCount,
         notificationExternalSlowRisk: Number(latest.notificationExternalSlowRisk) - Number(previous.notificationExternalSlowRisk),
         notificationProjectIgnoredNotify: Number(latest.notificationProjectIgnoredNotify) - Number(previous.notificationProjectIgnoredNotify),
+        historyPersistenceOff: Number(latest.historyPersistenceOff) - Number(previous.historyPersistenceOff),
+        historyMaxBytesConfigured: Number(latest.historyMaxBytesConfigured) - Number(previous.historyMaxBytesConfigured),
+        historyMaxBytes: latest.historyMaxBytes - previous.historyMaxBytes,
+        historyUnbounded: Number(latest.historyUnbounded) - Number(previous.historyUnbounded),
+        historyOverCap: Number(latest.historyOverCap) - Number(previous.historyOverCap),
+        historyFileBytes: latest.historyFileBytes - previous.historyFileBytes,
+        historyFileLarge: Number(latest.historyFileLarge) - Number(previous.historyFileLarge),
+        historyFileHuge: Number(latest.historyFileHuge) - Number(previous.historyFileHuge),
+        historyProjectConfigured: Number(latest.historyProjectConfigured) - Number(previous.historyProjectConfigured),
+        historyInvalidConfig: Number(latest.historyInvalidConfig) - Number(previous.historyInvalidConfig),
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - previous.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - previous.localEnvironmentActionCount,
         localEnvironmentParseWarningCount: latest.localEnvironmentParseWarningCount - previous.localEnvironmentParseWarningCount,
@@ -11660,6 +11927,7 @@ export async function runBenchmark() {
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const notificationFlow = scan.codexConfig?.notificationFlow || buildNotificationFlowSummary({});
+  const historyRetention = scan.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
@@ -11677,7 +11945,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v15",
+    scoreModel: "local-state-v16",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -11961,6 +12229,26 @@ export async function runBenchmark() {
     notificationExternalSlowRisk: Boolean(notificationFlow.externalNotifySlowRisk),
     notificationProjectIgnoredNotify: Boolean(notificationFlow.projectIgnoredNotify),
     notificationProjectIgnoredNotifyCount: notificationFlow.projectIgnoredNotifyCount || 0,
+    historyTone: historyRetention.tone || "low",
+    historyLabel: historyRetention.label || "Uncapped",
+    historyPersistence: historyRetention.persistence || "save-all",
+    historyPersistenceConfigured: Boolean(historyRetention.persistenceConfigured),
+    historyPersistenceOff: Boolean(historyRetention.persistenceOff),
+    historyMaxBytesConfigured: Boolean(historyRetention.maxBytesConfigured),
+    historyMaxBytes: historyRetention.maxBytes || 0,
+    historyInvalidPersistence: Boolean(historyRetention.invalidPersistence),
+    historyInvalidMaxBytes: Boolean(historyRetention.invalidMaxBytes),
+    historyUnbounded: Boolean(historyRetention.unbounded),
+    historyTinyCap: Boolean(historyRetention.tinyCap),
+    historyLargeCap: Boolean(historyRetention.largeCap),
+    historyHugeCap: Boolean(historyRetention.hugeCap),
+    historyOverCap: Boolean(historyRetention.overCap),
+    historyFileExists: Boolean(historyRetention.historyFileExists),
+    historyFileBytes: historyRetention.historyFileBytes || 0,
+    historyFileLarge: Boolean(historyRetention.fileLarge),
+    historyFileHuge: Boolean(historyRetention.fileHuge),
+    historyProjectConfigured: Boolean(historyRetention.projectHistoryConfigured),
+    historyInvalidConfig: Boolean(historyRetention.invalidPersistence || historyRetention.invalidMaxBytes),
     projectHasPackageJson: Boolean(currentProject?.hasPackageJson),
     projectHasUsefulScripts: Boolean(
       currentProject?.hasPackageJson &&
