@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { cp, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { cp, copyFile, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +11,8 @@ const version = "0.1.0";
 const electronApp = path.join(projectRoot, "node_modules", "electron", "dist", "Electron.app");
 const releaseDir = path.join(projectRoot, "release");
 const appPath = path.join(releaseDir, `${appName}.app`);
+const dmgRoot = path.join(releaseDir, "dmg-root");
+const dmgPath = path.join(releaseDir, `${appName.replaceAll(" ", "-")}-${version}-macOS-arm64.dmg`);
 const contentsDir = path.join(appPath, "Contents");
 const resourcesDir = path.join(contentsDir, "Resources");
 const appResourcesDir = path.join(resourcesDir, "app");
@@ -27,6 +29,21 @@ function deletePlist(key) {
   } catch {
     // Missing optional plist keys are fine.
   }
+}
+
+function commandOutput(command, args) {
+  try {
+    return execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch {
+    return "";
+  }
+}
+
+function findDeveloperIdIdentity() {
+  if (process.env.CODESIGN_IDENTITY) return process.env.CODESIGN_IDENTITY;
+  const output = commandOutput("security", ["find-identity", "-v", "-p", "codesigning"]);
+  const match = output.match(/"([^"]*Developer ID Application:[^"]+)"/);
+  return match?.[1] || null;
 }
 
 async function copyAppSources() {
@@ -53,6 +70,44 @@ async function copyAppSources() {
   );
 }
 
+function signApp(identity) {
+  if (identity) {
+    execFileSync(
+      "codesign",
+      ["--force", "--deep", "--options", "runtime", "--timestamp", "--sign", identity, appPath],
+      { stdio: "inherit" },
+    );
+    return;
+  }
+
+  execFileSync("codesign", ["--force", "--deep", "--sign", "-", appPath], { stdio: "inherit" });
+}
+
+function verifyAppSignature() {
+  execFileSync("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath], { stdio: "inherit" });
+}
+
+async function createDmg(identity) {
+  await rm(dmgRoot, { recursive: true, force: true });
+  await rm(dmgPath, { force: true });
+  await mkdir(dmgRoot, { recursive: true });
+  await cp(appPath, path.join(dmgRoot, `${appName}.app`), { recursive: true, verbatimSymlinks: true });
+  await symlink("/Applications", path.join(dmgRoot, "Applications"));
+
+  execFileSync(
+    "hdiutil",
+    ["create", "-volname", appName, "-srcfolder", dmgRoot, "-ov", "-format", "UDZO", dmgPath],
+    { stdio: "inherit" },
+  );
+
+  if (identity) {
+    execFileSync("codesign", ["--force", "--timestamp", "--sign", identity, dmgPath], { stdio: "inherit" });
+    execFileSync("codesign", ["--verify", "--verbose=2", dmgPath], { stdio: "inherit" });
+  }
+
+  await rm(dmgRoot, { recursive: true, force: true });
+}
+
 async function main() {
   await rm(appPath, { recursive: true, force: true });
   await mkdir(releaseDir, { recursive: true });
@@ -71,11 +126,9 @@ async function main() {
   setPlist("CFBundleVersion", version);
   deletePlist("ElectronAsarIntegrity");
 
-  try {
-    execFileSync("codesign", ["--force", "--deep", "--sign", "-", appPath], { stdio: "pipe" });
-  } catch (error) {
-    console.warn(`Codesign skipped: ${error.message}`);
-  }
+  const identity = findDeveloperIdIdentity();
+  signApp(identity);
+  verifyAppSignature();
 
   try {
     execFileSync("xattr", ["-dr", "com.apple.quarantine", appPath], { stdio: "pipe" });
@@ -84,6 +137,11 @@ async function main() {
   }
 
   console.log(appPath);
+  await createDmg(identity);
+  console.log(dmgPath);
+  if (!identity) {
+    console.warn("Developer ID signing identity not found; created an ad-hoc signed app and unsigned DMG.");
+  }
 }
 
 main().catch((error) => {
