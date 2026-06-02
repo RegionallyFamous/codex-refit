@@ -62,9 +62,9 @@ The happy path is simple: scan, understand, optimize, check the result.
 
 ## Download
 
-Grab the latest macOS build from the [Releases page](https://github.com/RegionallyFamous/codex-refit/releases) when a build is attached.
+Grab the signed macOS DMG from the [Releases page](https://github.com/RegionallyFamous/codex-refit/releases).
 
-Until the app is signed and notarized, macOS may warn that it is from an unidentified developer. That is expected for an early local utility.
+The current build is Developer ID signed, but not notarized yet. macOS may still show an Unnotarized Developer ID warning on first open. That is expected for this early local utility.
 
 ## Want The Technical Details?
 
