@@ -2972,6 +2972,253 @@ function emptyCloudHandoffSummary() {
   };
 }
 
+function emptyRemoteHostSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "No SSH hosts",
+    action: "Optional",
+    detail:
+      "No local SSH host config was found. Remote Codex projects are optional, but a concrete SSH host can help move heavy local work to another machine.",
+    configExists: false,
+    configBytes: 0,
+    hostBlockCount: 0,
+    concreteHostCount: 0,
+    patternHostCount: 0,
+    includeCount: 0,
+    identityFileCount: 0,
+    missingIdentityFileCount: 0,
+    unresolvedIdentityFileCount: 0,
+    missingHostNameCount: 0,
+    missingUserCount: 0,
+    proxyCount: 0,
+    candidateCount: 0,
+    hosts: [],
+  };
+}
+
+function sshConfigPath() {
+  return path.resolve(process.env.CODEX_REFIT_SSH_CONFIG_PATH || path.join(homeDir, ".ssh", "config"));
+}
+
+function stripSshInlineComment(value) {
+  return String(value || "").replace(/\s+#.*$/, "").trim();
+}
+
+function parseSshOptionLine(line) {
+  const trimmed = stripSshInlineComment(line);
+  if (!trimmed) return null;
+  const equalsMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$/);
+  if (equalsMatch) return { key: equalsMatch[1].toLowerCase(), value: equalsMatch[2].trim() };
+  const spaceMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9_-]*)\s+(.+)$/);
+  if (spaceMatch) return { key: spaceMatch[1].toLowerCase(), value: spaceMatch[2].trim() };
+  return null;
+}
+
+function sshHostAliasIsPattern(alias) {
+  return !alias || /[*?!]/.test(alias) || alias.includes(",");
+}
+
+function expandLocalSshPath(value) {
+  const text = String(value || "").trim().replace(/^"|"$/g, "").replace(/^'|'$/g, "");
+  if (!text || /^none$/i.test(text)) return null;
+  if (text.includes("%")) {
+    return {
+      path: text,
+      unresolved: true,
+    };
+  }
+  if (text === "~") {
+    return {
+      path: homeDir,
+      unresolved: false,
+    };
+  }
+  if (text.startsWith("~/")) {
+    return {
+      path: path.join(homeDir, text.slice(2)),
+      unresolved: false,
+    };
+  }
+  return {
+    path: path.resolve(text),
+    unresolved: false,
+  };
+}
+
+function parseSshConfigText(text) {
+  const blocks = [];
+  let current = null;
+  let includeCount = 0;
+
+  const finishBlock = () => {
+    if (current) blocks.push(current);
+    current = null;
+  };
+
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    if (/^\s*$/.test(rawLine) || /^\s*#/.test(rawLine)) continue;
+    const parsed = parseSshOptionLine(rawLine);
+    if (!parsed) continue;
+
+    if (parsed.key === "include") {
+      includeCount += parsed.value.split(/\s+/).filter(Boolean).length || 1;
+      continue;
+    }
+
+    if (parsed.key === "host") {
+      finishBlock();
+      current = {
+        aliases: parsed.value.split(/\s+/).filter(Boolean),
+        options: {},
+      };
+      continue;
+    }
+
+    if (!current) continue;
+    if (!current.options[parsed.key]) current.options[parsed.key] = [];
+    current.options[parsed.key].push(parsed.value);
+  }
+
+  finishBlock();
+  return { blocks, includeCount };
+}
+
+async function getRemoteHostSummary() {
+  const summary = emptyRemoteHostSummary();
+  const configPath = sshConfigPath();
+  const stats = await statOrNull(configPath);
+  if (!stats || !stats.isFile()) return summary;
+
+  summary.configExists = true;
+  summary.configBytes = stats.size;
+
+  let text = "";
+  try {
+    text = await fs.readFile(configPath, "utf8");
+  } catch (error) {
+    return {
+      ...summary,
+      tone: "medium",
+      label: "Unreadable config",
+      action: "Check ~/.ssh/config",
+      detail: `Refit found an SSH config but could not read it: ${error.message}. Remote Codex host discovery depends on concrete Host aliases in that file.`,
+    };
+  }
+
+  const parsed = parseSshConfigText(text);
+  summary.hostBlockCount = parsed.blocks.length;
+  summary.includeCount = parsed.includeCount;
+
+  const hosts = [];
+  for (const block of parsed.blocks) {
+    const options = block.options || {};
+    const hostNames = options.hostname || [];
+    const users = options.user || [];
+    const identityFiles = (options.identityfile || [])
+      .map(expandLocalSshPath)
+      .filter(Boolean);
+    const proxyConfigured = Boolean((options.proxyjump || []).length || (options.proxycommand || []).length);
+
+    for (const alias of block.aliases || []) {
+      const patternOnly = sshHostAliasIsPattern(alias);
+      if (patternOnly) {
+        summary.patternHostCount += 1;
+        continue;
+      }
+
+      const identityFileCount = identityFiles.length;
+      let missingIdentityFileCount = 0;
+      let unresolvedIdentityFileCount = 0;
+      for (const identity of identityFiles) {
+        if (identity.unresolved) {
+          unresolvedIdentityFileCount += 1;
+          continue;
+        }
+        if (!(await exists(identity.path))) missingIdentityFileCount += 1;
+      }
+
+      const host = {
+        alias,
+        hasHostName: Boolean(hostNames.length),
+        hasUser: Boolean(users.length),
+        identityFileCount,
+        missingIdentityFileCount,
+        unresolvedIdentityFileCount,
+        proxyConfigured,
+      };
+      hosts.push(host);
+      summary.concreteHostCount += 1;
+      summary.identityFileCount += identityFileCount;
+      summary.missingIdentityFileCount += missingIdentityFileCount;
+      summary.unresolvedIdentityFileCount += unresolvedIdentityFileCount;
+      summary.missingHostNameCount += host.hasHostName ? 0 : 1;
+      summary.missingUserCount += host.hasUser ? 0 : 1;
+      summary.proxyCount += proxyConfigured ? 1 : 0;
+      if (host.hasHostName && host.hasUser && !missingIdentityFileCount) summary.candidateCount += 1;
+    }
+  }
+
+  summary.hosts = hosts.slice(0, 12);
+
+  const highLoad = summary.missingIdentityFileCount > 0;
+  const mediumLoad =
+    highLoad ||
+    !summary.concreteHostCount ||
+    summary.missingHostNameCount > 0 ||
+    summary.missingUserCount > 0 ||
+    summary.includeCount > 0;
+
+  summary.tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  summary.label = highLoad
+    ? `${summary.missingIdentityFileCount.toLocaleString()} missing key${summary.missingIdentityFileCount === 1 ? "" : "s"}`
+    : !summary.concreteHostCount
+      ? "No concrete hosts"
+      : summary.missingHostNameCount || summary.missingUserCount
+        ? "Incomplete hosts"
+        : summary.includeCount
+          ? `${summary.candidateCount.toLocaleString()} ready, includes`
+          : `${summary.candidateCount.toLocaleString()} ready`;
+  summary.action = highLoad
+    ? "Fix SSH keys"
+    : !summary.concreteHostCount
+      ? "Add concrete Host"
+      : summary.missingHostNameCount || summary.missingUserCount
+        ? "Complete Host blocks"
+        : summary.includeCount
+          ? "Check included files"
+          : "Enable in Codex";
+  summary.detail = [
+    "Codex App can run remote project threads over SSH when a concrete Host alias exists in ~/.ssh/config.",
+    "Refit only parses local SSH config metadata; it does not connect to hosts, print hostnames, print usernames, or print key paths.",
+    summary.concreteHostCount
+      ? `${summary.concreteHostCount.toLocaleString()} concrete Host alias${summary.concreteHostCount === 1 ? "" : "es"} found; ${summary.candidateCount.toLocaleString()} look ready enough for Codex discovery.`
+      : summary.patternHostCount
+        ? `${summary.patternHostCount.toLocaleString()} pattern-only Host entr${summary.patternHostCount === 1 ? "y" : "ies"} found. Codex ignores pattern-only hosts, so add a concrete alias for remote projects.`
+        : "No Host blocks were found.",
+    summary.missingIdentityFileCount
+      ? `${summary.missingIdentityFileCount.toLocaleString()} IdentityFile reference${summary.missingIdentityFileCount === 1 ? "" : "s"} did not point to a local file; that can cause password prompts or failed remote startup.`
+      : null,
+    summary.missingHostNameCount
+      ? `${summary.missingHostNameCount.toLocaleString()} concrete alias${summary.missingHostNameCount === 1 ? "" : "es"} ${pluralVerb(summary.missingHostNameCount)} missing HostName.`
+      : null,
+    summary.missingUserCount
+      ? `${summary.missingUserCount.toLocaleString()} concrete alias${summary.missingUserCount === 1 ? "" : "es"} ${pluralVerb(summary.missingUserCount)} missing User.`
+      : null,
+    summary.includeCount
+      ? `${summary.includeCount.toLocaleString()} Include directive${summary.includeCount === 1 ? "" : "s"} found; Refit reports the main config file only.`
+      : null,
+    summary.proxyCount ? `${summary.proxyCount.toLocaleString()} concrete alias${summary.proxyCount === 1 ? "" : "es"} use ProxyJump or ProxyCommand.` : null,
+    summary.candidateCount
+      ? "In Codex App, use Settings > Connections to add or enable the SSH host, then choose a remote project folder."
+      : "Remote host setup is optional, but it is useful when local process load is high or the project already lives on a stronger machine.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return summary;
+}
+
 async function gitOutput(root, args, { timeout = 3500, maxBuffer = 1024 * 1024 } = {}) {
   try {
     const { stdout } = await execFileAsync("git", ["-C", root, ...args], {
@@ -7490,6 +7737,7 @@ async function getCodexConfigSummary() {
     },
     automation: emptyAutomationSummary(),
     cloudHandoff: emptyCloudHandoffSummary(),
+    remoteHosts: emptyRemoteHostSummary(),
     enabledPluginCount: 0,
     enabledMcpCount: 0,
     disabledMcpCount: 0,
@@ -7530,6 +7778,7 @@ async function getCodexConfigSummary() {
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
     summary.automation = await getAutomationSummary(null);
     summary.cloudHandoff = await getCloudHandoffSummary(null);
+    summary.remoteHosts = await getRemoteHostSummary();
     return summary;
   }
   summary.exists = true;
@@ -7608,6 +7857,7 @@ async function getCodexConfigSummary() {
     summary.projectReadiness = await getTrustedProjectReadiness(summary.trustedProjectStatuses);
     summary.automation = await getAutomationSummary(summary.projectReadiness.currentProject);
     summary.cloudHandoff = await getCloudHandoffSummary(summary.projectReadiness.currentProject);
+    summary.remoteHosts = await getRemoteHostSummary();
     summary.hookSummary = await getHookConfigSummary({
       hooksFeature: summary.hooksFeature,
       globalConfigText: text,
@@ -7665,6 +7915,7 @@ async function getCodexConfigSummary() {
     summary.error = error.message;
     summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.automation = await getAutomationSummary(null);
+    summary.remoteHosts = await getRemoteHostSummary();
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
   }
@@ -7802,6 +8053,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const currentLocalEnvironment = currentProject?.localEnvironment || null;
   const automation = codexConfig?.automation || emptyAutomationSummary(currentProject?.path || null);
   const cloudHandoff = codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
+  const remoteHosts = codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const localEnvironmentNeedsWork = Boolean(
     currentProject &&
       (currentLocalEnvironment?.tone !== "low" ||
@@ -7815,6 +8067,8 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const processSummary = context.processSummary || {};
   const backgroundSummary = processSummary.background || {};
   const appServerTransport = processSummary.appServerTransport || emptyAppServerTransportSummary();
+  const processLoaded = processSummary.status === "ready" && processSummary.tone !== "low";
+  const backgroundLoaded = backgroundSummary.status === "ready" && backgroundSummary.tone !== "low";
   const hookSummary = codexConfig?.hookSummary || {};
   const agentMaxThreads = Number(codexConfig?.agentMaxThreadsEffective ?? 6);
   const agentMaxDepth = Number(codexConfig?.agentMaxDepthEffective ?? 1);
@@ -8698,6 +8952,38 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (
+    remoteHosts.status === "ready" &&
+    (remoteHosts.tone !== "low" || ((processLoaded || backgroundLoaded) && !remoteHosts.concreteHostCount))
+  ) {
+    addFix({
+      id: "remote-hosts",
+      label: "Remote Hosts",
+      value: remoteHosts.label,
+      tone: remoteHosts.tone === "high" ? "high" : "medium",
+      action: remoteHosts.action,
+      detail:
+        "Remote Codex project threads can move filesystem and shell work onto an SSH host. Refit only checks local SSH config metadata and never connects to the host.",
+      snippet: [
+        "# ~/.ssh/config",
+        "Host devbox",
+        "  HostName devbox.example.com",
+        "  User you",
+        "  IdentityFile ~/.ssh/id_ed25519",
+        "",
+        "# Read-only local resolution check before enabling the host in Codex:",
+        "ssh -G devbox | sed -n '1,20p'",
+        "",
+        "# Then in Codex App:",
+        "# Settings > Connections > add or enable the SSH host.",
+        "# The remote login shell needs codex on PATH, and Codex must be authenticated on that host.",
+        remoteHosts.missingIdentityFileCount ? "# Fix missing IdentityFile paths first if Codex keeps asking for a password." : null,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    });
+  }
+
   if (!hasGuidance) {
     addFix({
       id: "agents-guidance",
@@ -8882,6 +9168,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const currentProject = projectReadiness.currentProject || null;
   const automation = codexConfig?.automation || emptyAutomationSummary(currentProject?.path || null);
   const cloudHandoff = codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
+  const remoteHosts = codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const existingProjectCount = Number(projectReadiness.existingCount || 0);
   const projectReadyCount = Number(projectReadiness.readyCount || 0);
   const projectGapCount =
@@ -8934,7 +9221,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       : memoriesFeature
         ? `Memories are enabled, but Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`
         : `Memories are off in config. Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`;
-  const docsSource = "Official Codex manual: Speed, /status, Cloud Threads, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
+  const docsSource = "Official Codex manual: Speed, /status, Cloud Threads, Remote Connections, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
   const processReady = processSummary?.status === "ready";
   const processLoaded = processReady && processSummary.tone !== "low";
   const processCount = Number(processSummary?.processCount || 0);
@@ -9460,6 +9747,26 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: cloudHandoff.detail,
     },
     {
+      id: "remote-hosts",
+      label: "Remote Hosts",
+      value: remoteHosts.label,
+      tone: remoteHosts.tone,
+      action: remoteHosts.action,
+      priority:
+        remoteHosts.tone === "high"
+          ? 85
+          : remoteHosts.tone === "medium"
+            ? processLoaded || backgroundLoaded
+              ? 72
+              : 48
+            : processLoaded || backgroundLoaded
+              ? remoteHosts.concreteHostCount
+                ? 35
+                : 36
+              : 14,
+      detail: remoteHosts.detail,
+    },
+    {
       id: "agent-fanout",
       label: "Agent Fan-out",
       value: `${agentMaxThreads.toLocaleString()} / depth ${agentMaxDepth.toLocaleString()}`,
@@ -9678,6 +9985,24 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         cloudHandoff.cloudReady && (cloudHandoff.dirtyCount || cloudHandoff.aheadCount)
           ? `${cloudHandoff.detail} Push the branch or use local-to-cloud handoff before starting another heavy local thread.`
           : cloudHandoff.detail,
+    });
+  }
+
+  if (
+    remoteHosts.status === "ready" &&
+    (remoteHosts.tone !== "low" || ((processLoaded || backgroundLoaded) && !remoteHosts.concreteHostCount))
+  ) {
+    addRecommendation({
+      id: "remote-hosts",
+      label: "Remote Hosts",
+      value: remoteHosts.label,
+      action: remoteHosts.action,
+      tone: remoteHosts.tone === "high" ? "high" : "medium",
+      priority: remoteHosts.tone === "high" ? 85 : processLoaded || backgroundLoaded ? 64 : 52,
+      detail:
+        remoteHosts.concreteHostCount
+          ? `${remoteHosts.detail} Remote Codex hosts need codex on PATH and an authenticated Codex login on the remote machine.`
+          : `${remoteHosts.detail} Add a concrete Host alias in ~/.ssh/config if you want SSH-host offload for heavy local work.`,
     });
   }
 
@@ -10324,6 +10649,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     projectReadiness,
     automation,
     cloudHandoff,
+    remoteHosts,
     profileCount: codexConfig?.profileCount || 0,
     profileHealth,
     hasFastTaskProfile,
@@ -10813,6 +11139,19 @@ function localScoreBreakdown(metrics) {
       detail: "Live Codex app-server listener transport, WebSocket auth, and extra rich-client process pressure.",
     },
     {
+      id: "remote-hosts",
+      label: "Remote Hosts",
+      points: Math.min(
+        4,
+        Number(metrics.remoteHostMissingIdentityFileCount || 0) * 1.5 +
+          Number(metrics.remoteHostMissingHostNameCount || 0) * 0.8 +
+          Number(metrics.remoteHostMissingUserCount || 0) * 0.6 +
+          ((Number(metrics.processCount || 0) >= 12 || Number(metrics.backgroundProcessCount || 0) > 0) && !metrics.remoteHostConcreteCount ? 1.5 : 0),
+      ),
+      value: metrics.remoteHostLabel || "No SSH hosts",
+      detail: "SSH host readiness for Codex remote project offload.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -11007,6 +11346,8 @@ function benchmarkLiveScore(metrics) {
   if (metrics.appServerNonLoopbackUnauthenticatedCount) score -= Math.min(5, Number(metrics.appServerNonLoopbackUnauthenticatedCount || 0) * 3);
   if (metrics.appServerUnknownTransportCount) score -= Math.min(3, Number(metrics.appServerUnknownTransportCount || 0) * 2);
   score -= Math.min(2, Number(metrics.appServerWebsocketCount || 0) * 0.5);
+  score -= Math.min(4, Number(metrics.remoteHostMissingIdentityFileCount || 0) * 2);
+  if ((metrics.processCount >= 12 || metrics.backgroundProcessCount > 0) && !metrics.remoteHostConcreteCount) score -= 2;
   if (metrics.historyInvalidConfig) score -= 2;
   if (metrics.historyFileHuge) score -= 4;
   else if (metrics.historyFileLarge) score -= 2;
@@ -11111,6 +11452,15 @@ function benchmarkGuidance(metrics) {
     } else {
       guidance.push("Cloud handoff looks ready. Use a cloud thread for independent heavy work instead of adding more local Codex load.");
     }
+  }
+  if (metrics.remoteHostMissingIdentityFileCount > 0) {
+    guidance.push(
+      `Fix ${Number(metrics.remoteHostMissingIdentityFileCount).toLocaleString()} missing SSH IdentityFile reference${metrics.remoteHostMissingIdentityFileCount === 1 ? "" : "s"} before using Codex remote projects; missing keys can cause password prompts or failed remote startup.`,
+    );
+  } else if (metrics.remoteHostConcreteCount === 0 && (metrics.processCount >= 12 || metrics.backgroundProcessCount > 0)) {
+    guidance.push("Add a concrete SSH Host alias in ~/.ssh/config if you want Codex remote project offload for heavy local work.");
+  } else if (metrics.remoteHostMissingHostNameCount > 0 || metrics.remoteHostMissingUserCount > 0) {
+    guidance.push("Complete SSH Host blocks with HostName and User before enabling them in Codex App Settings > Connections.");
   }
   if (metrics.processCount >= 24) {
     guidance.push(
@@ -11415,8 +11765,9 @@ function scoreMetricsFromScan(scan) {
   const telemetry = scan?.codexConfig?.telemetry || buildTelemetrySummary({});
   const automation = scan?.codexConfig?.automation || emptyAutomationSummary();
   const appServerTransport = scan?.processes?.appServerTransport || emptyAppServerTransportSummary();
+  const remoteHosts = scan?.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   return {
-    scoreModel: "local-state-v20",
+    scoreModel: "local-state-v21",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -11508,6 +11859,20 @@ function scoreMetricsFromScan(scan) {
     appServerUnauthenticatedWebsocketCount: appServerTransport.unauthenticatedWebsocketCount || 0,
     appServerNonLoopbackUnauthenticatedCount: appServerTransport.nonLoopbackUnauthenticatedCount || 0,
     appServerUnknownTransportCount: appServerTransport.unknownTransportCount || 0,
+    remoteHostTone: remoteHosts.tone || "low",
+    remoteHostLabel: remoteHosts.label || "No SSH hosts",
+    remoteHostConfigExists: Boolean(remoteHosts.configExists),
+    remoteHostBlockCount: remoteHosts.hostBlockCount || 0,
+    remoteHostConcreteCount: remoteHosts.concreteHostCount || 0,
+    remoteHostPatternCount: remoteHosts.patternHostCount || 0,
+    remoteHostIncludeCount: remoteHosts.includeCount || 0,
+    remoteHostIdentityFileCount: remoteHosts.identityFileCount || 0,
+    remoteHostMissingIdentityFileCount: remoteHosts.missingIdentityFileCount || 0,
+    remoteHostUnresolvedIdentityFileCount: remoteHosts.unresolvedIdentityFileCount || 0,
+    remoteHostMissingHostNameCount: remoteHosts.missingHostNameCount || 0,
+    remoteHostMissingUserCount: remoteHosts.missingUserCount || 0,
+    remoteHostProxyCount: remoteHosts.proxyCount || 0,
+    remoteHostCandidateCount: remoteHosts.candidateCount || 0,
   };
 }
 
@@ -12246,6 +12611,18 @@ function benchmarkDeltas(current, previous) {
     "cloudHandoffAheadCount",
     "cloudHandoffBehindCount",
     "cloudHandoffGithubRemoteCount",
+    "remoteHostConfigExists",
+    "remoteHostBlockCount",
+    "remoteHostConcreteCount",
+    "remoteHostPatternCount",
+    "remoteHostIncludeCount",
+    "remoteHostIdentityFileCount",
+    "remoteHostMissingIdentityFileCount",
+    "remoteHostUnresolvedIdentityFileCount",
+    "remoteHostMissingHostNameCount",
+    "remoteHostMissingUserCount",
+    "remoteHostProxyCount",
+    "remoteHostCandidateCount",
     "hasFastTaskProfile",
     "fastTaskProfileCount",
     "hasMiniProfile",
@@ -12493,6 +12870,20 @@ function summarizeBenchmarkEntry(entry) {
     cloudHandoffBehindCount: entry.metrics.cloudHandoffBehindCount || 0,
     cloudHandoffRemoteCount: entry.metrics.cloudHandoffRemoteCount || 0,
     cloudHandoffGithubRemoteCount: entry.metrics.cloudHandoffGithubRemoteCount || 0,
+    remoteHostTone: entry.metrics.remoteHostTone || "low",
+    remoteHostLabel: entry.metrics.remoteHostLabel || "No SSH hosts",
+    remoteHostConfigExists: Boolean(entry.metrics.remoteHostConfigExists),
+    remoteHostBlockCount: entry.metrics.remoteHostBlockCount || 0,
+    remoteHostConcreteCount: entry.metrics.remoteHostConcreteCount || 0,
+    remoteHostPatternCount: entry.metrics.remoteHostPatternCount || 0,
+    remoteHostIncludeCount: entry.metrics.remoteHostIncludeCount || 0,
+    remoteHostIdentityFileCount: entry.metrics.remoteHostIdentityFileCount || 0,
+    remoteHostMissingIdentityFileCount: entry.metrics.remoteHostMissingIdentityFileCount || 0,
+    remoteHostUnresolvedIdentityFileCount: entry.metrics.remoteHostUnresolvedIdentityFileCount || 0,
+    remoteHostMissingHostNameCount: entry.metrics.remoteHostMissingHostNameCount || 0,
+    remoteHostMissingUserCount: entry.metrics.remoteHostMissingUserCount || 0,
+    remoteHostProxyCount: entry.metrics.remoteHostProxyCount || 0,
+    remoteHostCandidateCount: entry.metrics.remoteHostCandidateCount || 0,
     codexWorktreeBytes: entry.metrics.codexWorktreeBytes || 0,
     codexWorktreeCount: entry.metrics.codexWorktreeCount || 0,
     codexWorktreeLargeCount: entry.metrics.codexWorktreeLargeCount || 0,
@@ -12862,6 +13253,12 @@ export async function benchmarkHistory(limit = 12) {
         cloudHandoffAheadCount: latest.cloudHandoffAheadCount - oldest.cloudHandoffAheadCount,
         cloudHandoffBehindCount: latest.cloudHandoffBehindCount - oldest.cloudHandoffBehindCount,
         cloudHandoffGithubRemoteCount: latest.cloudHandoffGithubRemoteCount - oldest.cloudHandoffGithubRemoteCount,
+        remoteHostConfigExists: Number(latest.remoteHostConfigExists) - Number(oldest.remoteHostConfigExists),
+        remoteHostConcreteCount: latest.remoteHostConcreteCount - oldest.remoteHostConcreteCount,
+        remoteHostMissingIdentityFileCount: latest.remoteHostMissingIdentityFileCount - oldest.remoteHostMissingIdentityFileCount,
+        remoteHostMissingHostNameCount: latest.remoteHostMissingHostNameCount - oldest.remoteHostMissingHostNameCount,
+        remoteHostMissingUserCount: latest.remoteHostMissingUserCount - oldest.remoteHostMissingUserCount,
+        remoteHostCandidateCount: latest.remoteHostCandidateCount - oldest.remoteHostCandidateCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - oldest.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - oldest.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - oldest.codexWorktreeLargeCount,
@@ -13048,6 +13445,12 @@ export async function benchmarkHistory(limit = 12) {
         cloudHandoffAheadCount: latest.cloudHandoffAheadCount - previous.cloudHandoffAheadCount,
         cloudHandoffBehindCount: latest.cloudHandoffBehindCount - previous.cloudHandoffBehindCount,
         cloudHandoffGithubRemoteCount: latest.cloudHandoffGithubRemoteCount - previous.cloudHandoffGithubRemoteCount,
+        remoteHostConfigExists: Number(latest.remoteHostConfigExists) - Number(previous.remoteHostConfigExists),
+        remoteHostConcreteCount: latest.remoteHostConcreteCount - previous.remoteHostConcreteCount,
+        remoteHostMissingIdentityFileCount: latest.remoteHostMissingIdentityFileCount - previous.remoteHostMissingIdentityFileCount,
+        remoteHostMissingHostNameCount: latest.remoteHostMissingHostNameCount - previous.remoteHostMissingHostNameCount,
+        remoteHostMissingUserCount: latest.remoteHostMissingUserCount - previous.remoteHostMissingUserCount,
+        remoteHostCandidateCount: latest.remoteHostCandidateCount - previous.remoteHostCandidateCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - previous.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - previous.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - previous.codexWorktreeLargeCount,
@@ -13243,6 +13646,7 @@ export async function runBenchmark() {
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
   const turnTelemetry = scan.categories?.turnTelemetry || emptyTurnTelemetrySummary(scan.categories?.activeSessions || {});
   const cloudHandoff = scan.codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
+  const remoteHosts = scan.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const appServerTransport = scan.processes?.appServerTransport || emptyAppServerTransportSummary();
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
@@ -13256,7 +13660,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v20",
+    scoreModel: "local-state-v21",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -13351,6 +13755,20 @@ export async function runBenchmark() {
     cloudHandoffBehindCount: cloudHandoff.behindCount || 0,
     cloudHandoffRemoteCount: cloudHandoff.remoteCount || 0,
     cloudHandoffGithubRemoteCount: cloudHandoff.githubRemoteCount || 0,
+    remoteHostTone: remoteHosts.tone || "low",
+    remoteHostLabel: remoteHosts.label || "No SSH hosts",
+    remoteHostConfigExists: Boolean(remoteHosts.configExists),
+    remoteHostBlockCount: remoteHosts.hostBlockCount || 0,
+    remoteHostConcreteCount: remoteHosts.concreteHostCount || 0,
+    remoteHostPatternCount: remoteHosts.patternHostCount || 0,
+    remoteHostIncludeCount: remoteHosts.includeCount || 0,
+    remoteHostIdentityFileCount: remoteHosts.identityFileCount || 0,
+    remoteHostMissingIdentityFileCount: remoteHosts.missingIdentityFileCount || 0,
+    remoteHostUnresolvedIdentityFileCount: remoteHosts.unresolvedIdentityFileCount || 0,
+    remoteHostMissingHostNameCount: remoteHosts.missingHostNameCount || 0,
+    remoteHostMissingUserCount: remoteHosts.missingUserCount || 0,
+    remoteHostProxyCount: remoteHosts.proxyCount || 0,
+    remoteHostCandidateCount: remoteHosts.candidateCount || 0,
     codexWorktreeBytes: scan.categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: scan.categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: scan.categories.codexWorktrees?.largeWorktreeCount || 0,
