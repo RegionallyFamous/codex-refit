@@ -48,6 +48,8 @@ const largeInstructionFileBytes = 12 * 1024;
 const recommendedHistoryMaxBytes = 5 * 1024 * 1024;
 const largeHistoryFileBytes = 20 * 1024 * 1024;
 const hugeHistoryFileBytes = 100 * 1024 * 1024;
+const largeTuiLogBytes = 50 * 1024 * 1024;
+const hugeTuiLogBytes = 500 * 1024 * 1024;
 const builtInAgentNames = new Set(["default", "worker", "explorer"]);
 
 const paths = {
@@ -2179,6 +2181,166 @@ function buildHistoryRetentionSummary(values = {}, meta = {}) {
   };
 }
 
+async function buildStoragePathSummary(values = {}, options = {}) {
+  const currentProject = options.currentProject || null;
+  const projectConfig = options.projectConfig || null;
+  const projectConfigPath = options.projectConfigPath || null;
+  const projectValues = projectConfig?.values || {};
+  const logDirConfigured = values.log_dir !== undefined;
+  const sqliteHomeConfigured = values.sqlite_home !== undefined;
+  const sqliteHomeEnvConfigured = Boolean(process.env.CODEX_SQLITE_HOME);
+  const logDirFromProject = projectValues.log_dir !== undefined;
+  const sqliteHomeFromProject = projectValues.sqlite_home !== undefined;
+  const logBaseDir = logDirFromProject && projectConfigPath ? path.dirname(projectConfigPath) : process.cwd();
+  const sqliteBaseDir = sqliteHomeFromProject && projectConfigPath ? path.dirname(projectConfigPath) : process.cwd();
+  const logDirPath = logDirConfigured ? resolveStoragePathValue(values.log_dir, logBaseDir) : path.join(codexHome, "log");
+  const sqliteRawValue = sqliteHomeConfigured ? values.sqlite_home : process.env.CODEX_SQLITE_HOME || "";
+  const sqliteHomePath =
+    sqliteHomeConfigured || sqliteHomeEnvConfigured ? resolveStoragePathValue(sqliteRawValue, sqliteBaseDir) : codexHome;
+  const logDirRelative = logDirConfigured && !path.isAbsolute(expandHomePath(values.log_dir));
+  const sqliteHomeRelative =
+    (sqliteHomeConfigured || sqliteHomeEnvConfigured) && !path.isAbsolute(expandHomePath(sqliteRawValue));
+  const tuiLogPath = logDirPath ? path.join(logDirPath, "codex-tui.log") : null;
+  const [logDirBytes, tuiLogBytes, logDirExists, sqliteHomeBytes, sqliteHomeExists] = await Promise.all([
+    logDirConfigured && logDirPath ? duBytes(logDirPath) : Promise.resolve(0),
+    tuiLogPath ? fileSize(tuiLogPath) : Promise.resolve(0),
+    logDirPath ? exists(logDirPath) : Promise.resolve(false),
+    (sqliteHomeConfigured || sqliteHomeEnvConfigured) && sqliteHomePath ? duBytes(sqliteHomePath) : Promise.resolve(0),
+    sqliteHomePath ? exists(sqliteHomePath) : Promise.resolve(false),
+  ]);
+  const projectPath = currentProject?.path || rootDir;
+  const logDirInProject = Boolean(logDirPath && (path.resolve(logDirPath) === path.resolve(projectPath) || pathIsInside(logDirPath, projectPath)));
+  const sqliteHomeInProject = Boolean(
+    sqliteHomePath && (path.resolve(sqliteHomePath) === path.resolve(projectPath) || pathIsInside(sqliteHomePath, projectPath)),
+  );
+  const logDirSynced = Boolean(logDirPath && pathLooksSynced(logDirPath));
+  const sqliteHomeSynced = Boolean(sqliteHomePath && pathLooksSynced(sqliteHomePath));
+  const customSqliteHome = sqliteHomeConfigured || sqliteHomeEnvConfigured;
+  const updateCheckDisabled = values.check_for_update_on_startup === false;
+  const tuiLogLarge = tuiLogBytes >= largeTuiLogBytes;
+  const tuiLogHuge = tuiLogBytes >= hugeTuiLogBytes;
+  const logDirLarge = logDirBytes >= 1024 ** 3;
+  const sqliteHomeLarge = customSqliteHome && sqliteHomeBytes >= 1024 ** 3;
+  const issueCount = [
+    logDirConfigured,
+    customSqliteHome,
+    logDirRelative,
+    sqliteHomeRelative,
+    logDirInProject,
+    sqliteHomeInProject,
+    logDirSynced,
+    sqliteHomeSynced,
+    tuiLogLarge,
+    logDirLarge,
+    sqliteHomeLarge,
+    updateCheckDisabled,
+    logDirConfigured && !logDirExists,
+    customSqliteHome && !sqliteHomeExists,
+  ].filter(Boolean).length;
+  const highLoad =
+    sqliteHomeSynced ||
+    sqliteHomeInProject ||
+    (customSqliteHome && !sqliteHomeExists) ||
+    tuiLogHuge ||
+    (logDirSynced && tuiLogLarge) ||
+    sqliteHomeBytes >= 5 * 1024 ** 3;
+  const mediumLoad =
+    highLoad ||
+    logDirConfigured ||
+    customSqliteHome ||
+    logDirRelative ||
+    sqliteHomeRelative ||
+    logDirInProject ||
+    logDirSynced ||
+    tuiLogLarge ||
+    logDirLarge ||
+    sqliteHomeLarge ||
+    updateCheckDisabled ||
+    (logDirConfigured && !logDirExists);
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = customSqliteHome
+    ? logDirConfigured
+      ? "Custom state/logs"
+      : "Custom state"
+    : logDirConfigured
+      ? "Plain logs"
+      : updateCheckDisabled
+        ? "Update off"
+        : "Defaults";
+  const action =
+    sqliteHomeSynced || sqliteHomeInProject
+      ? "Move SQLite local"
+      : tuiLogHuge || (logDirSynced && tuiLogLarge)
+        ? "Rotate TUI log"
+        : logDirConfigured
+          ? "Use only when needed"
+          : customSqliteHome
+            ? "Review state path"
+            : updateCheckDisabled
+              ? "Re-enable updates"
+              : "Keep defaults";
+  const detail =
+    tone === "low"
+      ? "Codex storage is using the documented defaults: state under CODEX_HOME, SQLite state in CODEX_HOME, no opt-in plaintext TUI log path, and startup update checks enabled."
+      : [
+          logDirConfigured
+            ? `log_dir is set to ${displayPath(logDirPath)}; the Codex manual says setting it explicitly enables the opt-in plaintext codex-tui.log file.`
+            : "log_dir is not set, so plaintext TUI logging is not explicitly enabled by config.",
+          logDirConfigured && !logDirExists ? "The configured log_dir does not exist yet." : null,
+          tuiLogBytes ? `codex-tui.log is ${formatBytesServer(tuiLogBytes)}.` : logDirConfigured ? "No codex-tui.log file was found in that directory." : null,
+          logDirBytes ? `The configured log directory is ${formatBytesServer(logDirBytes)}.` : null,
+          customSqliteHome
+            ? `${sqliteHomeConfigured ? "sqlite_home" : "CODEX_SQLITE_HOME"} points SQLite-backed Codex state at ${displayPath(sqliteHomePath)}.`
+            : "SQLite-backed Codex state is using CODEX_HOME.",
+          customSqliteHome && !sqliteHomeExists ? "The configured SQLite home does not exist yet." : null,
+          sqliteHomeBytes && customSqliteHome ? `The custom SQLite home is ${formatBytesServer(sqliteHomeBytes)}.` : null,
+          logDirRelative || sqliteHomeRelative ? "Relative storage paths resolve from the current working directory, which can make behavior change between launches." : null,
+          logDirSynced || sqliteHomeSynced
+            ? "Refit infers this is a synced-folder path; local SQLite and verbose logs are usually steadier on unsynced local disk."
+            : null,
+          logDirInProject || sqliteHomeInProject ? "This storage path is inside the current project, so logs or state can mix with repo work." : null,
+          updateCheckDisabled ? "Startup update checks are disabled; that can reduce startup chatter, but stale Codex builds can keep known issues around." : null,
+          "Refit reports storage path pressure only; it does not move logs or databases.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    issueCount,
+    logDirConfigured,
+    logDirPath,
+    logDirDisplay: displayPath(logDirPath),
+    logDirExists,
+    logDirBytes,
+    logDirRelative,
+    logDirFromProject,
+    logDirInProject,
+    logDirSynced,
+    tuiLogPath,
+    tuiLogBytes,
+    tuiLogLarge,
+    tuiLogHuge,
+    sqliteHomeConfigured,
+    sqliteHomeEnvConfigured,
+    customSqliteHome,
+    sqliteHomePath,
+    sqliteHomeDisplay: displayPath(sqliteHomePath),
+    sqliteHomeExists,
+    sqliteHomeBytes,
+    sqliteHomeRelative,
+    sqliteHomeFromProject,
+    sqliteHomeInProject,
+    sqliteHomeSynced,
+    checkForUpdateOnStartup: !updateCheckDisabled,
+    updateCheckDisabled,
+  };
+}
+
 function buildResponseShapeSummary(values = {}) {
   const verbosity = values.model_verbosity ? normalizeConfigKey(values.model_verbosity) : null;
   const reasoningSummary = values.model_reasoning_summary ? normalizeConfigKey(values.model_reasoning_summary) : null;
@@ -2262,6 +2424,29 @@ function buildResponseShapeSummary(values = {}) {
 function displayPath(filePath) {
   const resolved = path.resolve(filePath || "");
   return resolved === homeDir ? "~" : resolved.startsWith(`${homeDir}${path.sep}`) ? `~${resolved.slice(homeDir.length)}` : resolved;
+}
+
+function expandHomePath(value) {
+  const text = String(value || "").trim();
+  if (text === "~") return homeDir;
+  return text.startsWith(`~${path.sep}`) ? path.join(homeDir, text.slice(2)) : text;
+}
+
+function resolveStoragePathValue(value, baseDir = process.cwd()) {
+  if (value === undefined || value === null || value === "") return null;
+  const expanded = expandHomePath(value);
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(baseDir, expanded);
+}
+
+function pathIsInside(childPath, parentPath) {
+  if (!childPath || !parentPath) return false;
+  const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
+  return Boolean(relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function pathLooksSynced(filePath) {
+  const text = displayPath(filePath);
+  return /\b(Mobile Documents|CloudStorage|iCloud|Dropbox|Google Drive|OneDrive|Box|Creative Cloud Files)\b/i.test(text);
 }
 
 function repoSkillRootsFrom(startPath) {
@@ -6737,6 +6922,7 @@ async function getCodexConfigSummary() {
     notificationFlow: buildNotificationFlowSummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
     historyRetention: buildHistoryRetentionSummary({}, historyMeta),
+    storagePaths: null,
     networkSandbox: emptyNetworkSandboxSummary(),
     instructionStack: emptyInstructionStackSummary(),
     instructionOverrides: emptyInstructionOverrideSummary(),
@@ -6830,6 +7016,7 @@ async function getCodexConfigSummary() {
     summary.networkSandbox = buildNetworkSandboxSummary({}, []);
     summary.notificationFlow = buildNotificationFlowSummary({});
     summary.historyRetention = buildHistoryRetentionSummary({}, historyMeta);
+    summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
     summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
     summary.customAgents = await getCustomAgentSummary(null);
@@ -6871,6 +7058,7 @@ async function getCodexConfigSummary() {
     summary.notificationFlow = buildNotificationFlowSummary(values);
     summary.contextBudgetSummary = buildContextBudgetSummary(values);
     summary.historyRetention = buildHistoryRetentionSummary(values, historyMeta);
+    summary.storagePaths = await buildStoragePathSummary(values, { currentProject: null });
     summary.goalsFeature = values["features.goals"] === true;
     summary.hooksFeature = (values["features.hooks"] ?? values["features.codex_hooks"]) !== false;
     summary.rulesFeature = values["features.rules"] !== false;
@@ -6938,6 +7126,11 @@ async function getCodexConfigSummary() {
       currentProjectConfig ? { ...values, ...currentProjectConfig.values } : values,
       { ...historyMeta, projectConfig: currentProjectConfig },
     );
+    summary.storagePaths = await buildStoragePathSummary(currentProjectConfig ? { ...values, ...currentProjectConfig.values } : values, {
+      currentProject: summary.projectReadiness.currentProject,
+      projectConfig: currentProjectConfig,
+      projectConfigPath: currentProjectConfigPath,
+    });
     summary.modelProvider = buildModelProviderSummary(values, sections, currentProjectConfig);
     summary.instructionStack = await getInstructionStackSummary({
       values: mcpValues,
@@ -6961,6 +7154,7 @@ async function getCodexConfigSummary() {
     summary.managedConfig = await getManagedConfigSummary({ userValues: mcpValues, userSections: mcpSections });
   } catch (error) {
     summary.error = error.message;
+    summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
   }
@@ -7074,6 +7268,14 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
+  const storagePaths = codexConfig?.storagePaths || {
+    status: "ready",
+    tone: "low",
+    label: "Defaults",
+    action: "Keep defaults",
+    detail:
+      "Codex storage is using the documented defaults: state under CODEX_HOME, SQLite state in CODEX_HOME, no opt-in plaintext TUI log path, and startup update checks enabled.",
+  };
   const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
@@ -7229,6 +7431,29 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Use this only if you intentionally want no local transcript history:",
         '# persistence = "none"',
+      ].join("\n"),
+    });
+  }
+
+  if (storagePaths.status === "ready" && storagePaths.tone !== "low") {
+    addFix({
+      id: "storage-paths",
+      label: "Storage Paths",
+      value: storagePaths.label,
+      tone: storagePaths.tone === "high" ? "high" : "medium",
+      action: storagePaths.action,
+      detail:
+        "Codex stores state under CODEX_HOME by default. Custom log_dir and sqlite_home paths are useful for diagnostics, but they are easier to keep fast when they stay on local unsynced disk.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# Remove log_dir after a plaintext TUI-log debugging session unless you still need codex-tui.log.",
+        "# log_dir = \"/absolute/path/to/codex-logs\"",
+        "",
+        "# Prefer the default SQLite location unless you have a specific reason:",
+        "# sqlite_home = \"/absolute/path/to/codex-state\"",
+        "",
+        "# Keep update checks on so Codex can pick up fixes:",
+        "check_for_update_on_startup = true",
       ].join("\n"),
     });
   }
@@ -8037,6 +8262,14 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
+  const storagePaths = codexConfig?.storagePaths || {
+    status: "ready",
+    tone: "low",
+    label: "Defaults",
+    action: "Keep defaults",
+    detail:
+      "Codex storage is using the documented defaults: state under CODEX_HOME, SQLite state in CODEX_HOME, no opt-in plaintext TUI log path, and startup update checks enabled.",
+  };
   const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
@@ -8362,6 +8595,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: historyRetention.action,
       priority: historyRetention.tone === "high" ? 84 : historyRetention.tone === "medium" ? 57 : 18,
       detail: historyRetention.detail,
+    },
+    {
+      id: "storage-paths",
+      label: "Storage Paths",
+      value: storagePaths.label,
+      tone: storagePaths.tone,
+      action: storagePaths.action,
+      priority: storagePaths.tone === "high" ? 83 : storagePaths.tone === "medium" ? 56 : 18,
+      detail: storagePaths.detail,
     },
     {
       id: "session-media-pressure",
@@ -9115,6 +9357,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (storagePaths.status === "ready" && storagePaths.tone !== "low") {
+    addRecommendation({
+      id: "storage-paths",
+      label: "Storage Paths",
+      value: storagePaths.label,
+      action: storagePaths.action,
+      tone: storagePaths.tone === "high" ? "high" : "medium",
+      priority: storagePaths.tone === "high" ? 81 : 54,
+      detail:
+        storagePaths.sqliteHomeSynced || storagePaths.sqliteHomeInProject
+          ? `${storagePaths.detail} Keep SQLite-backed state on a local unsynced path before blaming model latency.`
+          : storagePaths.detail,
+    });
+  }
+
   if (responseShapeSummary.status === "ready" && responseShapeSummary.tone !== "low") {
     addRecommendation({
       id: "response-shape",
@@ -9370,6 +9627,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     notificationFlow,
     contextBudgetSummary,
     historyRetention,
+    storagePaths,
     responseShapeSummary,
     networkSandbox,
     instructionStack,
@@ -9840,6 +10098,18 @@ function localScoreBreakdown(metrics) {
       detail: "Codex history.jsonl size and retention policy.",
     },
     {
+      id: "storage-paths",
+      label: "Storage Paths",
+      points: Math.min(
+        8,
+        Number(metrics.storageIssueCount || 0) * 0.8 +
+          (metrics.storageSqliteSynced || metrics.storageSqliteInProject ? 3 : 0) +
+          (metrics.storageTuiLogHuge ? 3 : metrics.storageTuiLogLarge ? 1.5 : 0),
+      ),
+      value: metrics.storageLabel || "Defaults",
+      detail: "Custom log_dir, sqlite_home, CODEX_SQLITE_HOME, and opt-in plaintext TUI log pressure.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -10028,6 +10298,13 @@ function benchmarkLiveScore(metrics) {
   if (metrics.historyUnbounded && metrics.historyFileLarge) score -= 2;
   if (metrics.historyOverCap) score -= 1;
   if (metrics.historyPersistenceOff) score -= 1;
+  if (metrics.storageSqliteSynced || metrics.storageSqliteInProject) score -= 3;
+  if (metrics.storageSqliteCustom && metrics.storageSqliteExists === false) score -= 2;
+  if (metrics.storageLogDirSynced && metrics.storageTuiLogLarge) score -= 2;
+  if (metrics.storageTuiLogHuge) score -= 3;
+  else if (metrics.storageTuiLogLarge) score -= 1;
+  if (metrics.storageLogDirRelative || metrics.storageSqliteRelative) score -= 1;
+  if (metrics.storageUpdateCheckDisabled) score -= 1;
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasSetupScript) score -= 2;
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasActions) score -= 2;
   score -= Math.min(3, Number(metrics.localEnvironmentParseWarningCount || 0) * 1.5);
@@ -10271,6 +10548,19 @@ function benchmarkGuidance(metrics) {
   } else if (metrics.historyLargeCap || metrics.historyHugeCap) {
     guidance.push("History max_bytes is generous. Lower it if the history file becomes local-state pressure again.");
   }
+  if (metrics.storageSqliteSynced || metrics.storageSqliteInProject) {
+    guidance.push("Move sqlite_home or CODEX_SQLITE_HOME back to a local unsynced path; SQLite-backed Codex state should not live inside synced folders or the active repo.");
+  } else if (metrics.storageSqliteCustom && metrics.storageSqliteExists === false) {
+    guidance.push("Check sqlite_home/CODEX_SQLITE_HOME: the configured SQLite state directory does not exist yet.");
+  } else if (metrics.storageLogDirSynced && metrics.storageTuiLogLarge) {
+    guidance.push(`Move or rotate codex-tui.log; it is ${formatBytesServer(metrics.storageTuiLogBytes)} in a synced log_dir.`);
+  } else if (metrics.storageTuiLogHuge || metrics.storageTuiLogLarge) {
+    guidance.push(`Rotate codex-tui.log or remove log_dir after debugging; the plaintext TUI log is ${formatBytesServer(metrics.storageTuiLogBytes)}.`);
+  } else if (metrics.storageLogDirConfigured) {
+    guidance.push("log_dir is configured, which enables plaintext codex-tui.log. Remove it after the debugging session if you do not need ongoing TUI logs.");
+  } else if (metrics.storageUpdateCheckDisabled) {
+    guidance.push("Startup update checks are disabled. Re-enable them unless you intentionally pin Codex versions.");
+  }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
     guidance.push(
       `Review ${Number(metrics.hookTurnScopedCommandCount).toLocaleString()} turn/tool-scope lifecycle hook command${metrics.hookTurnScopedCommandCount === 1 ? "" : "s"} with /hooks if Codex commands feel slow.`,
@@ -10375,8 +10665,9 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   const historyRetention = scan?.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
+  const storagePaths = scan?.codexConfig?.storagePaths || {};
   return {
-    scoreModel: "local-state-v16",
+    scoreModel: "local-state-v17",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -10416,6 +10707,21 @@ function scoreMetricsFromScan(scan) {
     historyFileHuge: Boolean(historyRetention.fileHuge),
     historyOverCap: Boolean(historyRetention.overCap),
     historyInvalidConfig: Boolean(historyRetention.invalidPersistence || historyRetention.invalidMaxBytes),
+    storageTone: storagePaths.tone || "low",
+    storageLabel: storagePaths.label || "Defaults",
+    storageIssueCount: storagePaths.issueCount || 0,
+    storageLogDirConfigured: Boolean(storagePaths.logDirConfigured),
+    storageLogDirBytes: storagePaths.logDirBytes || 0,
+    storageTuiLogBytes: storagePaths.tuiLogBytes || 0,
+    storageTuiLogLarge: Boolean(storagePaths.tuiLogLarge),
+    storageTuiLogHuge: Boolean(storagePaths.tuiLogHuge),
+    storageLogDirSynced: Boolean(storagePaths.logDirSynced),
+    storageLogDirInProject: Boolean(storagePaths.logDirInProject),
+    storageSqliteCustom: Boolean(storagePaths.customSqliteHome),
+    storageSqliteHomeBytes: storagePaths.sqliteHomeBytes || 0,
+    storageSqliteSynced: Boolean(storagePaths.sqliteHomeSynced),
+    storageSqliteInProject: Boolean(storagePaths.sqliteHomeInProject),
+    storageUpdateCheckDisabled: Boolean(storagePaths.updateCheckDisabled),
   };
 }
 
@@ -11244,6 +11550,25 @@ function benchmarkDeltas(current, previous) {
     "historyFileHuge",
     "historyProjectConfigured",
     "historyInvalidConfig",
+    "storageIssueCount",
+    "storageLogDirConfigured",
+    "storageLogDirBytes",
+    "storageLogDirRelative",
+    "storageLogDirFromProject",
+    "storageLogDirInProject",
+    "storageLogDirSynced",
+    "storageTuiLogBytes",
+    "storageTuiLogLarge",
+    "storageTuiLogHuge",
+    "storageSqliteCustom",
+    "storageSqliteConfigured",
+    "storageSqliteEnvConfigured",
+    "storageSqliteHomeBytes",
+    "storageSqliteRelative",
+    "storageSqliteFromProject",
+    "storageSqliteInProject",
+    "storageSqliteSynced",
+    "storageUpdateCheckDisabled",
     "localEnvironmentConfigCount",
     "localEnvironmentCandidateFileCount",
     "localEnvironmentSetupCount",
@@ -11574,6 +11899,29 @@ function summarizeBenchmarkEntry(entry) {
     historyFileHuge: Boolean(entry.metrics.historyFileHuge),
     historyProjectConfigured: Boolean(entry.metrics.historyProjectConfigured),
     historyInvalidConfig: Boolean(entry.metrics.historyInvalidConfig),
+    storageTone: entry.metrics.storageTone || "low",
+    storageLabel: entry.metrics.storageLabel || "Defaults",
+    storageIssueCount: entry.metrics.storageIssueCount || 0,
+    storageLogDirConfigured: Boolean(entry.metrics.storageLogDirConfigured),
+    storageLogDirExists: entry.metrics.storageLogDirExists !== false,
+    storageLogDirBytes: entry.metrics.storageLogDirBytes || 0,
+    storageLogDirRelative: Boolean(entry.metrics.storageLogDirRelative),
+    storageLogDirFromProject: Boolean(entry.metrics.storageLogDirFromProject),
+    storageLogDirInProject: Boolean(entry.metrics.storageLogDirInProject),
+    storageLogDirSynced: Boolean(entry.metrics.storageLogDirSynced),
+    storageTuiLogBytes: entry.metrics.storageTuiLogBytes || 0,
+    storageTuiLogLarge: Boolean(entry.metrics.storageTuiLogLarge),
+    storageTuiLogHuge: Boolean(entry.metrics.storageTuiLogHuge),
+    storageSqliteCustom: Boolean(entry.metrics.storageSqliteCustom),
+    storageSqliteConfigured: Boolean(entry.metrics.storageSqliteConfigured),
+    storageSqliteEnvConfigured: Boolean(entry.metrics.storageSqliteEnvConfigured),
+    storageSqliteExists: entry.metrics.storageSqliteExists !== false,
+    storageSqliteHomeBytes: entry.metrics.storageSqliteHomeBytes || 0,
+    storageSqliteRelative: Boolean(entry.metrics.storageSqliteRelative),
+    storageSqliteFromProject: Boolean(entry.metrics.storageSqliteFromProject),
+    storageSqliteInProject: Boolean(entry.metrics.storageSqliteInProject),
+    storageSqliteSynced: Boolean(entry.metrics.storageSqliteSynced),
+    storageUpdateCheckDisabled: Boolean(entry.metrics.storageUpdateCheckDisabled),
     projectHasPackageJson: Boolean(entry.metrics.projectHasPackageJson),
     projectHasUsefulScripts: Boolean(entry.metrics.projectHasUsefulScripts),
     localEnvironmentConfigCount: entry.metrics.localEnvironmentConfigCount || 0,
@@ -11736,6 +12084,18 @@ export async function benchmarkHistory(limit = 12) {
         historyFileHuge: Number(latest.historyFileHuge) - Number(oldest.historyFileHuge),
         historyProjectConfigured: Number(latest.historyProjectConfigured) - Number(oldest.historyProjectConfigured),
         historyInvalidConfig: Number(latest.historyInvalidConfig) - Number(oldest.historyInvalidConfig),
+        storageIssueCount: latest.storageIssueCount - oldest.storageIssueCount,
+        storageLogDirConfigured: Number(latest.storageLogDirConfigured) - Number(oldest.storageLogDirConfigured),
+        storageLogDirBytes: latest.storageLogDirBytes - oldest.storageLogDirBytes,
+        storageLogDirSynced: Number(latest.storageLogDirSynced) - Number(oldest.storageLogDirSynced),
+        storageTuiLogBytes: latest.storageTuiLogBytes - oldest.storageTuiLogBytes,
+        storageTuiLogLarge: Number(latest.storageTuiLogLarge) - Number(oldest.storageTuiLogLarge),
+        storageTuiLogHuge: Number(latest.storageTuiLogHuge) - Number(oldest.storageTuiLogHuge),
+        storageSqliteCustom: Number(latest.storageSqliteCustom) - Number(oldest.storageSqliteCustom),
+        storageSqliteHomeBytes: latest.storageSqliteHomeBytes - oldest.storageSqliteHomeBytes,
+        storageSqliteInProject: Number(latest.storageSqliteInProject) - Number(oldest.storageSqliteInProject),
+        storageSqliteSynced: Number(latest.storageSqliteSynced) - Number(oldest.storageSqliteSynced),
+        storageUpdateCheckDisabled: Number(latest.storageUpdateCheckDisabled) - Number(oldest.storageUpdateCheckDisabled),
         localEnvironmentConfigCount: latest.localEnvironmentConfigCount - oldest.localEnvironmentConfigCount,
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - oldest.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - oldest.localEnvironmentActionCount,
@@ -11862,6 +12222,18 @@ export async function benchmarkHistory(limit = 12) {
         historyFileHuge: Number(latest.historyFileHuge) - Number(previous.historyFileHuge),
         historyProjectConfigured: Number(latest.historyProjectConfigured) - Number(previous.historyProjectConfigured),
         historyInvalidConfig: Number(latest.historyInvalidConfig) - Number(previous.historyInvalidConfig),
+        storageIssueCount: latest.storageIssueCount - previous.storageIssueCount,
+        storageLogDirConfigured: Number(latest.storageLogDirConfigured) - Number(previous.storageLogDirConfigured),
+        storageLogDirBytes: latest.storageLogDirBytes - previous.storageLogDirBytes,
+        storageLogDirSynced: Number(latest.storageLogDirSynced) - Number(previous.storageLogDirSynced),
+        storageTuiLogBytes: latest.storageTuiLogBytes - previous.storageTuiLogBytes,
+        storageTuiLogLarge: Number(latest.storageTuiLogLarge) - Number(previous.storageTuiLogLarge),
+        storageTuiLogHuge: Number(latest.storageTuiLogHuge) - Number(previous.storageTuiLogHuge),
+        storageSqliteCustom: Number(latest.storageSqliteCustom) - Number(previous.storageSqliteCustom),
+        storageSqliteHomeBytes: latest.storageSqliteHomeBytes - previous.storageSqliteHomeBytes,
+        storageSqliteInProject: Number(latest.storageSqliteInProject) - Number(previous.storageSqliteInProject),
+        storageSqliteSynced: Number(latest.storageSqliteSynced) - Number(previous.storageSqliteSynced),
+        storageUpdateCheckDisabled: Number(latest.storageUpdateCheckDisabled) - Number(previous.storageUpdateCheckDisabled),
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - previous.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - previous.localEnvironmentActionCount,
         localEnvironmentParseWarningCount: latest.localEnvironmentParseWarningCount - previous.localEnvironmentParseWarningCount,
@@ -11928,6 +12300,7 @@ export async function runBenchmark() {
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const notificationFlow = scan.codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const historyRetention = scan.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
+  const storagePaths = scan.codexConfig?.storagePaths || {};
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
@@ -11945,7 +12318,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v16",
+    scoreModel: "local-state-v17",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -12249,6 +12622,29 @@ export async function runBenchmark() {
     historyFileHuge: Boolean(historyRetention.fileHuge),
     historyProjectConfigured: Boolean(historyRetention.projectHistoryConfigured),
     historyInvalidConfig: Boolean(historyRetention.invalidPersistence || historyRetention.invalidMaxBytes),
+    storageTone: storagePaths.tone || "low",
+    storageLabel: storagePaths.label || "Defaults",
+    storageIssueCount: storagePaths.issueCount || 0,
+    storageLogDirConfigured: Boolean(storagePaths.logDirConfigured),
+    storageLogDirExists: storagePaths.logDirExists !== false,
+    storageLogDirBytes: storagePaths.logDirBytes || 0,
+    storageLogDirRelative: Boolean(storagePaths.logDirRelative),
+    storageLogDirFromProject: Boolean(storagePaths.logDirFromProject),
+    storageLogDirInProject: Boolean(storagePaths.logDirInProject),
+    storageLogDirSynced: Boolean(storagePaths.logDirSynced),
+    storageTuiLogBytes: storagePaths.tuiLogBytes || 0,
+    storageTuiLogLarge: Boolean(storagePaths.tuiLogLarge),
+    storageTuiLogHuge: Boolean(storagePaths.tuiLogHuge),
+    storageSqliteCustom: Boolean(storagePaths.customSqliteHome),
+    storageSqliteConfigured: Boolean(storagePaths.sqliteHomeConfigured),
+    storageSqliteEnvConfigured: Boolean(storagePaths.sqliteHomeEnvConfigured),
+    storageSqliteExists: storagePaths.sqliteHomeExists !== false,
+    storageSqliteHomeBytes: storagePaths.sqliteHomeBytes || 0,
+    storageSqliteRelative: Boolean(storagePaths.sqliteHomeRelative),
+    storageSqliteFromProject: Boolean(storagePaths.sqliteHomeFromProject),
+    storageSqliteInProject: Boolean(storagePaths.sqliteHomeInProject),
+    storageSqliteSynced: Boolean(storagePaths.sqliteHomeSynced),
+    storageUpdateCheckDisabled: Boolean(storagePaths.updateCheckDisabled),
     projectHasPackageJson: Boolean(currentProject?.hasPackageJson),
     projectHasUsefulScripts: Boolean(
       currentProject?.hasPackageJson &&
