@@ -15,6 +15,9 @@ const appSupport = path.join(homeDir, "Library", "Application Support");
 const codexHome = path.resolve(process.env.CODEX_HOME || path.join(homeDir, ".codex"));
 const codexAppCli = "/Applications/Codex.app/Contents/Resources/codex";
 const adminConfigRoot = path.resolve(process.env.CODEX_REFIT_ADMIN_CONFIG_DIR || "/etc/codex");
+const openAiDocsCacheDir = path.resolve(process.env.CODEX_REFIT_OPENAI_DOCS_CACHE_DIR || path.join(os.tmpdir(), "openai-docs-cache"));
+const codexManualCachePath = path.join(openAiDocsCacheDir, "codex-manual.md");
+const codexManualOutlinePath = path.join(openAiDocsCacheDir, "codex-manual.outline.md");
 const hookEvents = [
   "PreToolUse",
   "PermissionRequest",
@@ -53,7 +56,32 @@ const hugeTuiLogBytes = 500 * 1024 * 1024;
 const shellStartupMediumMs = 350;
 const shellStartupHighMs = 900;
 const shellStartupTimeoutMs = 2500;
+const codexLaunchMediumMs = 800;
+const codexLaunchHighMs = 1800;
+const codexLaunchTimeoutMs = 2500;
+const codexManualFreshDays = 14;
+const codexManualVeryStaleDays = 45;
+const codexManualTopicChecks = [
+  { id: "best-practices", label: "Best Practices", pattern: /\bBest practices\b/i },
+  { id: "prompting", label: "Prompting", pattern: /\bPrompting\b/i },
+  { id: "speed", label: "Speed", pattern: /\bSpeed\b/i },
+  { id: "approvals", label: "Approvals", pattern: /\bApprovals\b|\bAgent approvals\b/i },
+  { id: "sandbox", label: "Sandbox", pattern: /\bSandbox\b/i },
+  { id: "config", label: "Config", pattern: /\bConfig(?:uration)?\b/i },
+  { id: "models", label: "Models", pattern: /\bModel selection\b|\bModels\b/i },
+  { id: "local-environments", label: "Local Environments", pattern: /\bLocal environments\b/i },
+  { id: "worktrees", label: "Worktrees", pattern: /\bWorktrees\b/i },
+  { id: "review", label: "Review", pattern: /\bReview\b/i },
+  { id: "agents", label: "AGENTS", pattern: /\bAGENTS\.md\b|\bCustom instructions\b/i },
+  { id: "mcp", label: "MCP", pattern: /\bModel Context Protocol\b|\bMCP\b/i },
+  { id: "rules", label: "Rules", pattern: /\bRules\b/i },
+  { id: "hooks", label: "Hooks", pattern: /\bHooks\b/i },
+  { id: "managed-config", label: "Managed Config", pattern: /\bManaged configuration\b/i },
+  { id: "subagents", label: "Subagents", pattern: /\bSubagents\b/i },
+  { id: "chronicle", label: "Chronicle", pattern: /\bChronicle\b/i },
+];
 const builtInAgentNames = new Set(["default", "worker", "explorer"]);
+const chronicleScreenRecordingPath = path.join(os.tmpdir(), "chronicle", "screen_recording");
 
 const paths = {
   codexHome,
@@ -65,6 +93,8 @@ const paths = {
   worktrees: path.join(codexHome, "worktrees"),
   memories: path.join(codexHome, "memories"),
   memoriesExtensions: path.join(codexHome, "memories_extensions"),
+  chronicleMemories: path.join(codexHome, "memories_extensions", "chronicle"),
+  chronicleScreenRecording: chronicleScreenRecordingPath,
   customPrompts: path.join(codexHome, "prompts"),
   customAgents: path.join(codexHome, "agents"),
   userRules: path.join(codexHome, "rules"),
@@ -2599,6 +2629,497 @@ function buildContextBudgetSummary(values = {}) {
   };
 }
 
+function buildStatusLineSummary(values = {}) {
+  const rawStatusLine = values.status_line;
+  const configured = rawStatusLine !== undefined;
+  const rawText = configured ? String(rawStatusLine || "").trim() : "";
+  const statusFields = configured
+    ? tomlArrayStringNames(rawStatusLine)
+        .map(normalizeConfigKey)
+        .filter(Boolean)
+    : ["model_with_reasoning", "context_remaining", "current_dir"];
+  const hidden = configured && (/^\[\s*\]$/.test(rawText) || statusFields.length === 0);
+  const hasModel = statusFields.some((field) => field === "model" || field === "model_with_reasoning");
+  const hasContext = statusFields.some((field) => field === "context" || field === "context_remaining");
+  const hasLocation = statusFields.some((field) => field === "current_dir" || field === "project" || field === "git_branch");
+  const dense = statusFields.length > 6;
+  const missingModel = !hidden && !hasModel;
+  const missingContext = !hidden && !hasContext;
+  const highLoad = hidden;
+  const mediumLoad = highLoad || missingContext || missingModel || dense;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = hidden ? "Hidden" : configured ? `${statusFields.length.toLocaleString()} field${statusFields.length === 1 ? "" : "s"}` : "Default";
+  const action = hidden
+    ? "Restore footer"
+    : missingContext
+      ? "Show context"
+      : missingModel
+        ? "Show model"
+        : dense
+          ? "Trim footer"
+          : "Keep visible";
+  const detail =
+    tone === "low"
+      ? configured
+        ? "The Codex footer keeps model and context visibility available while staying compact."
+        : "Codex is using the documented default footer with model, remaining context, and current directory."
+      : [
+          hidden ? "status_line is configured as an empty footer, so Codex hides quick model and context visibility." : null,
+          missingContext ? "The footer does not include context-remaining, so context pressure is easier to miss until a thread slows down." : null,
+          missingModel ? "The footer does not include a model field, so task/model mismatch is less visible during quick work." : null,
+          dense ? `${statusFields.length.toLocaleString()} footer fields are configured; keep the line compact enough to scan.` : null,
+          hasLocation ? null : "Add project, current-dir, or git-branch if you switch between repos often.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    configured,
+    hidden,
+    fields: statusFields,
+    fieldCount: statusFields.length,
+    hasModel,
+    hasContext,
+    hasLocation,
+    missingModel,
+    missingContext,
+    dense,
+  };
+}
+
+function emptyCliCompletionSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "Not checked",
+    action: "Optional",
+    detail: "Codex shell completion setup was not checked.",
+    shellPath: process.env.SHELL || null,
+    shellName: process.env.SHELL ? path.basename(process.env.SHELL) : null,
+    cliPath: null,
+    cliFound: false,
+    completionFound: false,
+    configMatchCount: 0,
+    completionFileCount: 0,
+    configFilesChecked: 0,
+    zshCompinitMissing: false,
+    files: [],
+  };
+}
+
+function activeShellKind(shellPath = process.env.SHELL || "") {
+  const shellName = path.basename(String(shellPath || "")).toLowerCase();
+  if (shellName.includes("zsh")) return "zsh";
+  if (shellName.includes("bash")) return "bash";
+  if (shellName.includes("fish")) return "fish";
+  if (shellName.includes("pwsh") || shellName.includes("powershell")) return "power-shell";
+  return shellName || "unknown";
+}
+
+function cliCompletionConfigCandidates(shellKind) {
+  const common = [
+    path.join(homeDir, ".profile"),
+  ];
+  const byShell = {
+    zsh: [
+      path.join(homeDir, ".zshrc"),
+      path.join(homeDir, ".zprofile"),
+      path.join(homeDir, ".zshenv"),
+      path.join(homeDir, ".config", "zsh", ".zshrc"),
+      path.join(homeDir, ".config", "zsh", "zshrc"),
+    ],
+    bash: [
+      path.join(homeDir, ".bashrc"),
+      path.join(homeDir, ".bash_profile"),
+      path.join(homeDir, ".bash_login"),
+      path.join(homeDir, ".bash_completion"),
+    ],
+    fish: [path.join(homeDir, ".config", "fish", "config.fish")],
+  };
+  return [...new Set([...(byShell[shellKind] || []), ...common])];
+}
+
+function cliCompletionFileCandidates(shellKind) {
+  const byShell = {
+    zsh: [
+      path.join(homeDir, ".zsh", "completions", "_codex"),
+      path.join(homeDir, ".config", "zsh", "completions", "_codex"),
+      path.join(homeDir, ".oh-my-zsh", "completions", "_codex"),
+      "/opt/homebrew/share/zsh/site-functions/_codex",
+      "/usr/local/share/zsh/site-functions/_codex",
+      "/usr/share/zsh/site-functions/_codex",
+    ],
+    bash: [
+      path.join(homeDir, ".local", "share", "bash-completion", "completions", "codex"),
+      path.join(homeDir, ".bash_completion.d", "codex"),
+      "/opt/homebrew/etc/bash_completion.d/codex",
+      "/usr/local/etc/bash_completion.d/codex",
+      "/usr/share/bash-completion/completions/codex",
+    ],
+    fish: [
+      path.join(homeDir, ".config", "fish", "completions", "codex.fish"),
+      "/opt/homebrew/share/fish/vendor_completions.d/codex.fish",
+      "/usr/local/share/fish/vendor_completions.d/codex.fish",
+    ],
+  };
+  return [...new Set(byShell[shellKind] || Object.values(byShell).flat())];
+}
+
+async function shellConfigCompletionInfo(filePath, shellKind) {
+  const stats = await statOrNull(filePath);
+  if (!stats?.isFile()) return null;
+  let text = "";
+  let unreadable = false;
+  try {
+    const buffer = await fs.readFile(filePath);
+    text = buffer.subarray(0, 256 * 1024).toString("utf8");
+  } catch {
+    unreadable = true;
+  }
+  const mentionsCodexCompletion = /\bcodex\s+completion\s+(bash|zsh|fish|power-shell|powershell|elvish)\b/i.test(text);
+  const mentionsEvalCompletion = /eval\s+["']?\$\(codex\s+completion\b/i.test(text);
+  const mentionsCompletionFile = /\b_codex\b|\bcodex\.fish\b|bash[-_]completion[\s\S]{0,80}\bcodex\b/i.test(text);
+  const match = mentionsCodexCompletion || mentionsEvalCompletion || mentionsCompletionFile;
+  const zshCompinitPresent = shellKind === "zsh" ? /\bcompinit\b/.test(text) : true;
+  return {
+    path: displayPath(filePath),
+    bytes: stats.size,
+    mtime: stats.mtime.toISOString(),
+    kind: "shell-config",
+    match,
+    unreadable,
+    zshCompinitPresent,
+  };
+}
+
+async function completionFileInfo(filePath) {
+  const stats = await statOrNull(filePath);
+  if (!stats?.isFile()) return null;
+  return {
+    path: displayPath(filePath),
+    bytes: stats.size,
+    mtime: stats.mtime.toISOString(),
+    kind: "completion-file",
+    match: true,
+    unreadable: false,
+  };
+}
+
+async function getCliCompletionSummary() {
+  const shellPath = process.env.SHELL || null;
+  const shellKind = activeShellKind(shellPath);
+  const shellName = shellPath ? path.basename(shellPath) : shellKind;
+  const cliPath = await whichCommand("codex");
+  const configCandidates = cliCompletionConfigCandidates(shellKind);
+  const completionCandidates = cliCompletionFileCandidates(shellKind);
+  const [configResults, completionResults] = await Promise.all([
+    Promise.all(configCandidates.map((candidate) => shellConfigCompletionInfo(candidate, shellKind))),
+    Promise.all(completionCandidates.map(completionFileInfo)),
+  ]);
+  const configFiles = configResults.filter(Boolean);
+  const completionFiles = completionResults.filter(Boolean);
+  const configMatches = configFiles.filter((file) => file.match);
+  const completionFound = configMatches.length > 0 || completionFiles.length > 0;
+  const zshCompinitMissing =
+    shellKind === "zsh" && configMatches.some((file) => file.path.endsWith(".zshrc") && !file.zshCompinitPresent);
+  const cliFound = Boolean(cliPath);
+  const tone = !cliFound
+    ? "low"
+    : completionFound && !zshCompinitMissing
+      ? "low"
+      : completionFound && zshCompinitMissing
+        ? "medium"
+        : "medium";
+  const label = !cliFound
+    ? "No CLI"
+    : completionFound
+      ? zshCompinitMissing
+        ? "Check compinit"
+        : "Installed"
+      : "Not found";
+  const action = !cliFound
+    ? "Install CLI"
+    : completionFound && !zshCompinitMissing
+      ? "Keep"
+      : zshCompinitMissing
+        ? "Add compinit"
+        : "Add completion";
+  const detail = !cliFound
+    ? "The codex command was not found on PATH, so shell completion setup is not useful yet."
+    : completionFound
+      ? [
+          `Refit found Codex completion setup for ${shellName || shellKind}.`,
+          configMatches.length
+            ? `${configMatches.length.toLocaleString()} shell config file${configMatches.length === 1 ? "" : "s"} mention Codex completion.`
+            : null,
+          completionFiles.length
+            ? `${completionFiles.length.toLocaleString()} installed completion file${completionFiles.length === 1 ? "" : "s"} found.`
+            : null,
+          zshCompinitMissing
+            ? "The Codex manual says zsh completion may need compinit before eval \"$(codex completion zsh)\" if compdef is missing."
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" ")
+      : `No Codex completion setup was found for ${shellName || shellKind}. The Codex manual says generated shell completions speed everyday CLI usage.`;
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    shellPath,
+    shellName,
+    shellKind,
+    cliPath,
+    cliFound,
+    completionFound,
+    configMatchCount: configMatches.length,
+    completionFileCount: completionFiles.length,
+    configFilesChecked: configFiles.length,
+    zshCompinitMissing,
+    files: [...configMatches, ...completionFiles].slice(0, 12),
+  };
+}
+
+function emptyStrictConfigSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "Not checked",
+    action: "Optional",
+    detail: "Codex strict config validation was not checked.",
+    cliPath: null,
+    cliFound: false,
+    ok: null,
+    failed: false,
+    timedOut: false,
+    warningCount: 0,
+    durationMs: 0,
+    exitCode: null,
+    signal: null,
+    rawLine: null,
+  };
+}
+
+function sanitizeStrictConfigLine(value) {
+  const line = readFirstLine(value);
+  if (!line) return null;
+  const redacted = line
+    .replaceAll(codexHome, "$CODEX_HOME")
+    .replaceAll(homeDir, "~")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "<redacted>")
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "<email>")
+    .replace(/\b(api[_-]?key|token|authorization|bearer)(\s*[=:]\s*)("[^"]+"|'[^']+'|\S+)/gi, "$1$2<redacted>");
+  return redacted.length > 180 ? `${redacted.slice(0, 177)}...` : redacted;
+}
+
+function strictConfigWarningCount(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .filter((line) => /^\s*warning\b/i.test(line))
+    .length;
+}
+
+async function getStrictConfigSummary(cliPath = null) {
+  const summary = emptyStrictConfigSummary();
+  const resolvedCliPath = cliPath || (await whichCommand("codex"));
+  summary.cliPath = resolvedCliPath;
+  summary.cliFound = Boolean(resolvedCliPath);
+
+  if (!resolvedCliPath) {
+    summary.label = "No CLI";
+    summary.action = "Install CLI";
+    summary.detail = "The codex command was not found on PATH, so strict config validation could not run.";
+    return summary;
+  }
+
+  const startedAt = performance.now();
+  try {
+    const { stdout, stderr } = await execFileAsync(resolvedCliPath, ["--strict-config", "--version"], {
+      timeout: 3500,
+      maxBuffer: 128 * 1024,
+    });
+    const durationMs = Math.round(performance.now() - startedAt);
+    const warningCount = strictConfigWarningCount(`${stderr || ""}\n${stdout || ""}`);
+    return {
+      ...summary,
+      label: "Clean",
+      action: "Keep",
+      detail: warningCount
+        ? `Codex accepted config under --strict-config. ${warningCount.toLocaleString()} nonfatal warning${warningCount === 1 ? "" : "s"} appeared, but no unsupported config key stopped startup.`
+        : "Codex accepted config under --strict-config, so this version recognizes the active config keys.",
+      ok: true,
+      failed: false,
+      timedOut: false,
+      warningCount,
+      durationMs,
+      exitCode: 0,
+      rawLine: sanitizeStrictConfigLine(stdout || stderr),
+    };
+  } catch (error) {
+    const durationMs = Math.round(performance.now() - startedAt);
+    const output = `${error.stderr || ""}\n${error.stdout || ""}\n${error.message || ""}`;
+    const warningCount = strictConfigWarningCount(output);
+    const timedOut = error.signal === "SIGTERM" || /timed out|timeout/i.test(String(error.message || ""));
+    const rawLine = sanitizeStrictConfigLine(output);
+    return {
+      ...summary,
+      tone: timedOut ? "medium" : "high",
+      label: timedOut ? "Timed out" : "Failed",
+      action: timedOut ? "Check CLI" : "Fix config",
+      detail: timedOut
+        ? "codex --strict-config --version did not finish quickly. Check the Codex CLI path and config layers before judging speed settings."
+        : `codex --strict-config --version failed${rawLine ? `: ${rawLine}` : ""}. Fix unsupported or misspelled keys in user or trusted project config before tuning speed.`,
+      ok: false,
+      failed: true,
+      timedOut,
+      warningCount,
+      durationMs,
+      exitCode: Number.isFinite(error.code) ? error.code : null,
+      signal: error.signal || null,
+      rawLine,
+    };
+  }
+}
+
+function emptyChronicleLoadSummary() {
+  return {
+    label: "Chronicle Load",
+    path: "Chronicle screen cache + generated memories",
+    exists: false,
+    bytes: 0,
+    fileCount: 0,
+    dirCount: 0,
+    oversized50mb: 0,
+    oversized500mb: 0,
+    largest: [],
+    risk: "scan",
+    hotspots: [],
+    status: "ready",
+    tone: "low",
+    value: "Quiet",
+    action: "Optional",
+    detail:
+      "No Chronicle screen-capture cache or generated Chronicle memories were found. Chronicle remains optional for recovering recent screen context.",
+    screenCaptureExists: false,
+    screenCaptureBytes: 0,
+    screenCaptureFiles: 0,
+    memoryExists: false,
+    memoryBytes: 0,
+    memoryFiles: 0,
+    memoriesFeature: false,
+    memoriesUse: false,
+    memoriesGenerate: false,
+    minRateLimitRemainingPercent: null,
+    rateLimitGuardConfigured: false,
+    rateLimitGuardLow: false,
+    likelyRunning: false,
+  };
+}
+
+function buildChronicleLoadSummary({ screenCapture = {}, memory = {}, codexConfig = {} } = {}) {
+  const screenCaptureBytes = Number(screenCapture.bytes || 0);
+  const screenCaptureFiles = Number(screenCapture.fileCount || 0);
+  const memoryBytes = Number(memory.bytes || 0);
+  const memoryFiles = Number(memory.fileCount || 0);
+  const bytes = screenCaptureBytes + memoryBytes;
+  const fileCount = screenCaptureFiles + memoryFiles;
+  const minRateLimitRemainingPercent = codexConfig?.memoriesMinRateLimitRemainingPercent ?? null;
+  const rateLimitGuardConfigured = Number.isFinite(Number(minRateLimitRemainingPercent));
+  const rateLimitGuardLow = rateLimitGuardConfigured && Number(minRateLimitRemainingPercent) < 20;
+  const memoriesFeature = Boolean(codexConfig?.memoriesFeature);
+  const memoriesUse = Boolean(codexConfig?.memoriesUseMemoriesEffective);
+  const memoriesGenerate = Boolean(codexConfig?.memoriesGenerateMemoriesEffective);
+  const likelyRunning = Boolean(screenCapture.exists && (screenCaptureFiles > 0 || screenCaptureBytes > 0));
+  const exists = Boolean(screenCapture.exists || memory.exists);
+  const highLoad = screenCaptureBytes >= 1024 ** 3 || screenCaptureFiles >= 500 || memoryBytes >= 50 * 1024 ** 2 || memoryFiles >= 400;
+  const mediumLoad =
+    highLoad ||
+    likelyRunning ||
+    screenCaptureBytes >= 128 * 1024 ** 2 ||
+    screenCaptureFiles >= 100 ||
+    memoryBytes >= 10 * 1024 ** 2 ||
+    memoryFiles >= 100 ||
+    (memoriesGenerate && rateLimitGuardLow);
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const value = likelyRunning
+    ? "Screen cache"
+    : memoryFiles
+      ? `${memoryFiles.toLocaleString()} memories`
+      : memoriesFeature
+        ? "Memories on"
+        : "Quiet";
+  const action = highLoad
+    ? "Pause and review"
+    : likelyRunning
+      ? "Watch rate limits"
+      : memoryFiles >= 100 || memoryBytes >= 10 * 1024 ** 2
+        ? "Review memories"
+        : memoriesGenerate && !rateLimitGuardConfigured
+          ? "Set guard"
+          : "Optional";
+  const detail =
+    tone === "low"
+      ? exists
+        ? `Chronicle state is light: ${formatBytesServer(screenCaptureBytes)} of temporary screen captures and ${formatBytesServer(memoryBytes)} of generated Chronicle memories.`
+        : "No Chronicle screen-capture cache or generated Chronicle memories were found. Chronicle remains optional for recovering recent screen context."
+      : [
+          "Chronicle can reduce repeated context by generating memories from recent screen context, but the Codex manual says its background agents can use rate limits quickly.",
+          screenCaptureBytes || screenCaptureFiles
+            ? `Refit found ${screenCaptureFiles.toLocaleString()} temporary screen-capture file${screenCaptureFiles === 1 ? "" : "s"} using ${formatBytesServer(screenCaptureBytes)}.`
+            : null,
+          memoryBytes || memoryFiles
+            ? `Generated Chronicle memories account for ${memoryFiles.toLocaleString()} file${memoryFiles === 1 ? "" : "s"} and ${formatBytesServer(memoryBytes)}.`
+            : null,
+          likelyRunning ? "Chronicle appears active because the temporary screen-recording cache exists." : null,
+          memoriesGenerate && !rateLimitGuardConfigured
+            ? "Set memories.min_rate_limit_remaining_percent if memory generation should stop before Codex gets close to a rate limit."
+            : null,
+          rateLimitGuardLow
+            ? `The configured memory-generation rate-limit guard is ${Number(minRateLimitRemainingPercent).toLocaleString()}%, which may still allow background memory work near a limit.`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  const largest = [...(screenCapture.largest || []), ...(memory.largest || [])].sort((a, b) => b.bytes - a.bytes).slice(0, 8);
+  return {
+    ...emptyChronicleLoadSummary(),
+    exists,
+    bytes,
+    fileCount,
+    dirCount: Number(screenCapture.dirCount || 0) + Number(memory.dirCount || 0),
+    oversized50mb: Number(screenCapture.oversized50mb || 0) + Number(memory.oversized50mb || 0),
+    oversized500mb: Number(screenCapture.oversized500mb || 0) + Number(memory.oversized500mb || 0),
+    largest,
+    tone,
+    risk: tone === "high" ? "warn" : "scan",
+    value,
+    action,
+    detail,
+    screenCaptureExists: Boolean(screenCapture.exists),
+    screenCaptureBytes,
+    screenCaptureFiles,
+    memoryExists: Boolean(memory.exists),
+    memoryBytes,
+    memoryFiles,
+    memoriesFeature,
+    memoriesUse,
+    memoriesGenerate,
+    minRateLimitRemainingPercent,
+    rateLimitGuardConfigured,
+    rateLimitGuardLow,
+    likelyRunning,
+  };
+}
+
 function buildHistoryRetentionSummary(values = {}, meta = {}) {
   const persistenceValue = values["history.persistence"];
   const persistenceConfigured = persistenceValue !== undefined;
@@ -2939,6 +3460,113 @@ function buildResponseShapeSummary(values = {}) {
     conciseSummary,
     noSummary,
     configuredCount,
+  };
+}
+
+function effortRank(value) {
+  const effort = normalizedEffort(value);
+  if (["none", "minimal"].includes(effort)) return 0;
+  if (effort === "low") return 1;
+  if (!effort || effort === "medium" || effort === "default") return 2;
+  if (effort === "high") return 3;
+  if (["xhigh", "extra-high"].includes(effort)) return 4;
+  return 2;
+}
+
+function buildPlanEffortSummary(values = {}, profileInfo = {}) {
+  const defaultEffortRaw = values.model_reasoning_effort || values.reasoning_effort || null;
+  const planEffortRaw = values.plan_mode_reasoning_effort || null;
+  const defaultEffort = normalizedEffort(defaultEffortRaw) || null;
+  const planModeReasoningEffort = normalizedEffort(planEffortRaw) || null;
+  const defaultRank = effortRank(defaultEffort);
+  const planRank = planModeReasoningEffort ? effortRank(planModeReasoningEffort) : null;
+  const defaultHighEffort = ["high", "xhigh", "extra-high"].includes(defaultEffort);
+  const defaultXHighEffort = ["xhigh", "extra-high"].includes(defaultEffort);
+  const defaultLowEffort = ["low", "minimal", "none"].includes(defaultEffort);
+  const planHighEffort = ["high", "xhigh", "extra-high"].includes(planModeReasoningEffort);
+  const planXHighEffort = ["xhigh", "extra-high"].includes(planModeReasoningEffort);
+  const planLowEffort = ["low", "minimal", "none"].includes(planModeReasoningEffort);
+  const planEffortConfigured = Boolean(planModeReasoningEffort);
+  const fastProfileBackstop = Boolean(profileInfo.hasFastTaskProfile || profileInfo.hasMiniProfile || profileInfo.hasSparkProfile);
+  const splitPlanningEffort = planEffortConfigured && planRank !== defaultRank;
+  const flatHighReasoning = defaultHighEffort && !planEffortConfigured;
+  const flatLowPlanning = defaultLowEffort && !planEffortConfigured;
+  const smallTaskDragRisk = defaultHighEffort && !fastProfileBackstop;
+  const planEffortOverkill = planXHighEffort;
+  const planEffortUndercooked = planLowEffort;
+  const healthySplit = splitPlanningEffort && planHighEffort && !planXHighEffort;
+
+  const tone =
+    defaultXHighEffort && !fastProfileBackstop
+      ? "high"
+      : flatHighReasoning || smallTaskDragRisk || planEffortOverkill || flatLowPlanning || planEffortUndercooked
+        ? "medium"
+        : "low";
+  const label = planEffortOverkill
+    ? "Plan xhigh"
+    : flatHighReasoning
+      ? "High default"
+      : flatLowPlanning
+        ? "Plan not split"
+        : healthySplit
+          ? "Split"
+          : planEffortConfigured
+            ? "Configured"
+            : defaultHighEffort
+              ? "Deep default"
+              : "Default";
+  const action =
+    planEffortOverkill
+      ? "Review xhigh"
+      : flatLowPlanning || planEffortUndercooked
+        ? "Raise plan mode"
+        : flatHighReasoning || smallTaskDragRisk
+          ? "Split plan effort"
+          : healthySplit
+            ? "Keep split"
+            : planEffortConfigured
+              ? "Keep configured"
+              : "Use as needed";
+  const defaultLabel = defaultEffort || "default";
+  const planLabel = planModeReasoningEffort || "Codex default";
+  const detail =
+    tone === "low"
+      ? healthySplit
+        ? `Plan mode is separated from normal turns: default reasoning is ${defaultLabel}, plan mode is ${planLabel}. That keeps hard planning smart without making every quick turn deep.`
+        : planEffortConfigured
+          ? `Plan-mode reasoning is configured as ${planLabel}. Keep matching it to the kind of work you use /plan for.`
+          : "Plan-mode reasoning is using Codex defaults, and the current model/profile setup does not show obvious small-task drag."
+      : flatLowPlanning || planEffortUndercooked
+        ? `Normal reasoning is ${defaultLabel} and plan mode is ${planLabel}. Use plan_mode_reasoning_effort = "high" so fuzzy work gets enough thinking before implementation.`
+        : planEffortOverkill
+          ? "Plan mode is set to xhigh. That can be useful rarely, but high is usually a better default for planning without adding unnecessary latency."
+          : smallTaskDragRisk
+            ? `Default reasoning is ${defaultLabel} and no fast mini/Spark profile was found. Split plan mode from normal turns or add a speed profile so small tasks do not inherit deep-work settings.`
+            : `Default reasoning is ${defaultLabel} with no separate plan-mode override. Set plan_mode_reasoning_effort when you want planning to stay deep while normal turns stay lighter.`;
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    defaultEffort: defaultEffort || null,
+    planModeReasoningEffort: planModeReasoningEffort || null,
+    planEffortConfigured,
+    defaultHighEffort,
+    defaultXHighEffort,
+    defaultLowEffort,
+    planHighEffort,
+    planXHighEffort,
+    planLowEffort,
+    splitPlanningEffort,
+    flatHighReasoning,
+    flatLowPlanning,
+    smallTaskDragRisk,
+    fastProfileBackstop,
+    planEffortOverkill,
+    planEffortUndercooked,
+    healthySplit,
   };
 }
 
@@ -3673,6 +4301,16 @@ function parseGitRemotes(output) {
     });
   }
   return remotes;
+}
+
+function parseGitShortStat(output) {
+  const text = String(output || "").trim();
+  return {
+    raw: text || null,
+    filesChanged: Number(text.match(/(\d+)\s+files?\s+changed/)?.[1] || 0),
+    insertions: Number(text.match(/(\d+)\s+insertions?\(\+\)/)?.[1] || 0),
+    deletions: Number(text.match(/(\d+)\s+deletions?\(-\)/)?.[1] || 0),
+  };
 }
 
 function parseGitStatus(output) {
@@ -4803,24 +5441,115 @@ function normalizeCodexVersion(value) {
 }
 
 async function execVersion(command, args = []) {
+  const startedAt = performance.now();
   try {
     const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: 2500,
+      timeout: codexLaunchTimeoutMs,
       maxBuffer: 128 * 1024,
     });
     return {
       ok: true,
       raw: readFirstLine(stdout) || readFirstLine(stderr),
       version: normalizeCodexVersion(stdout || stderr),
+      durationMs: Math.round(performance.now() - startedAt),
+      timedOut: false,
     };
   } catch (error) {
+    const durationMs = Math.round(performance.now() - startedAt);
+    const timedOut =
+      error.killed === true ||
+      error.signal === "SIGTERM" ||
+      /timeout|timed out|ETIMEDOUT/i.test(String(error.message || ""));
     return {
       ok: false,
       error: error.message,
       raw: readFirstLine(error.stdout) || readFirstLine(error.stderr),
       version: normalizeCodexVersion(error.stdout || error.stderr),
+      durationMs,
+      timedOut,
     };
   }
+}
+
+function buildCodexLaunchSummary(runtime = {}) {
+  const probes = [
+    {
+      id: "cli",
+      label: "Terminal",
+      path: runtime.cliPath || null,
+      version: runtime.cliVersion || null,
+      durationMs: runtime.cliDurationMs || 0,
+      ok: runtime.cliOk !== undefined ? Boolean(runtime.cliOk) : Boolean(runtime.cliVersion),
+      error: runtime.cliError || null,
+      timedOut: Boolean(runtime.cliTimedOut),
+    },
+    {
+      id: "app",
+      label: "App",
+      path: runtime.appCliPath || null,
+      version: runtime.appVersion || null,
+      durationMs: runtime.appDurationMs || 0,
+      ok: runtime.appOk !== undefined ? Boolean(runtime.appOk) : Boolean(runtime.appVersion),
+      error: runtime.appError || null,
+      timedOut: Boolean(runtime.appTimedOut),
+    },
+  ].filter((probe) => probe.path);
+  const maxDurationMs = Math.max(0, ...probes.map((probe) => Number(probe.durationMs || 0)));
+  const timedOut = probes.some((probe) => probe.timedOut);
+  const failed = probes.some((probe) => !probe.ok);
+  const missing = probes.length === 0;
+  const slow = maxDurationMs >= codexLaunchHighMs;
+  const noticeable = maxDurationMs >= codexLaunchMediumMs;
+  const tone = timedOut || slow || missing ? "high" : failed || noticeable ? "medium" : "low";
+  const label = missing
+    ? "Missing"
+    : timedOut
+      ? "Timed out"
+      : maxDurationMs
+        ? `${maxDurationMs.toLocaleString()} ms`
+        : "Ready";
+  const action = missing
+    ? "Install Codex"
+    : timedOut || slow
+      ? "Fix launch"
+      : failed
+        ? "Compare binaries"
+        : noticeable
+          ? "Watch launch"
+          : "Fast launch";
+  const detail = missing
+    ? "No terminal Codex binary or bundled app binary was available for a launch probe."
+    : timedOut
+      ? `At least one Codex binary did not answer --version within ${codexLaunchTimeoutMs.toLocaleString()} ms. Fix this before chasing deeper app-state tuning.`
+      : failed
+        ? "At least one Codex binary failed the --version probe. Compare terminal and app binaries before changing speed settings."
+        : slow
+          ? `Codex binary launch took ${maxDurationMs.toLocaleString()} ms, which can make Doctor, strict-config, and everyday CLI checks feel slow.`
+          : noticeable
+            ? `Codex binary launch took ${maxDurationMs.toLocaleString()} ms. It is not broken, but shell shims, version managers, or stale installs may be worth checking.`
+            : `Codex binary launch is quick; the slow path is likely elsewhere.`;
+
+  return {
+    status: missing ? "missing" : failed || timedOut ? "issue" : "ready",
+    tone,
+    label,
+    action,
+    detail,
+    maxDurationMs,
+    timedOut,
+    failed,
+    missing,
+    probes: probes.map((probe) => ({
+      id: probe.id,
+      label: probe.label,
+      path: probe.path,
+      version: probe.version,
+      durationMs: probe.durationMs,
+      ok: probe.ok,
+      timedOut: probe.timedOut,
+      error: probe.error ? readFirstLine(probe.error) : null,
+    })),
+  };
 }
 
 async function whichCommand(command) {
@@ -4846,18 +5575,26 @@ async function getCodexRuntimeSummary() {
   const appVersion = appResult?.version || null;
   const versionMismatch = Boolean(cliVersion && appVersion && cliVersion !== appVersion);
 
-  return {
+  const summary = {
     cliPath,
+    cliOk: Boolean(cliResult?.ok),
     cliVersion,
     cliRaw: cliResult?.raw || null,
     cliError: cliResult?.ok === false ? cliResult.error : null,
+    cliDurationMs: cliResult?.durationMs || 0,
+    cliTimedOut: Boolean(cliResult?.timedOut),
     appCliPath: appCliExists ? codexAppCli : null,
+    appOk: Boolean(appResult?.ok),
     appVersion,
     appRaw: appResult?.raw || null,
     appError: appResult?.ok === false ? appResult.error : null,
+    appDurationMs: appResult?.durationMs || 0,
+    appTimedOut: Boolean(appResult?.timedOut),
     versionMismatch,
     status: versionMismatch ? "mismatch" : cliVersion || appVersion ? "ready" : "missing",
   };
+  summary.launch = buildCodexLaunchSummary(summary);
+  return summary;
 }
 
 function parsePsElapsedSeconds(value) {
@@ -5609,6 +6346,103 @@ async function readJsonOrNull(targetPath) {
   }
 }
 
+function emptyCodexManualFreshnessSummary() {
+  return {
+    status: "missing",
+    tone: "medium",
+    label: "No manual",
+    action: "Refresh docs",
+    detail:
+      "No local Codex manual cache was found. Refresh the OpenAI Codex manual when network access is available so Refit advice stays current.",
+    cacheDir: openAiDocsCacheDir,
+    manualPath: codexManualCachePath,
+    outlinePath: codexManualOutlinePath,
+    hasManual: false,
+    hasOutline: false,
+    manualBytes: 0,
+    outlineBytes: 0,
+    manualMtime: null,
+    outlineMtime: null,
+    manualAgeDays: null,
+    stale: true,
+    veryStale: false,
+    topicCount: codexManualTopicChecks.length,
+    coveredTopicCount: 0,
+    missingTopicCount: codexManualTopicChecks.length,
+    missingTopics: codexManualTopicChecks.map((topic) => topic.label),
+    topics: codexManualTopicChecks.map((topic) => ({
+      id: topic.id,
+      label: topic.label,
+      covered: false,
+    })),
+  };
+}
+
+async function getCodexManualFreshnessSummary() {
+  const [manualStats, outlineStats] = await Promise.all([statOrNull(codexManualCachePath), statOrNull(codexManualOutlinePath)]);
+  if (!manualStats?.isFile()) return emptyCodexManualFreshnessSummary();
+
+  let outlineText = "";
+  if (outlineStats?.isFile() && outlineStats.size <= 256 * 1024) {
+    try {
+      outlineText = await fs.readFile(codexManualOutlinePath, "utf8");
+    } catch {
+      outlineText = "";
+    }
+  }
+
+  const topics = codexManualTopicChecks.map((topic) => ({
+    id: topic.id,
+    label: topic.label,
+    covered: Boolean(outlineText && topic.pattern.test(outlineText)),
+  }));
+  const missingTopics = topics.filter((topic) => !topic.covered).map((topic) => topic.label);
+  const manualAgeMs = Math.max(0, Date.now() - manualStats.mtimeMs);
+  const manualAgeDays = manualAgeMs / (24 * 60 * 60 * 1000);
+  const stale = manualAgeDays > codexManualFreshDays;
+  const veryStale = manualAgeDays > codexManualVeryStaleDays;
+  const missingTopicCount = missingTopics.length;
+  const hasOutline = Boolean(outlineStats?.isFile());
+  const ageLabel = formatAgeServer(manualAgeMs / 1000);
+  const coverageLabel = `${(topics.length - missingTopicCount).toLocaleString()}/${topics.length.toLocaleString()} sections`;
+  const tone = veryStale || !hasOutline || missingTopicCount >= 6 ? "medium" : stale || missingTopicCount ? "medium" : "low";
+  const label = stale ? `${Math.floor(manualAgeDays).toLocaleString()}d old` : "Fresh";
+  const action = veryStale || !hasOutline || missingTopicCount >= 6 ? "Refresh manual" : stale ? "Refresh soon" : "Keep current";
+  const detail = [
+    `Refit found a local Codex manual cache updated ${ageLabel} ago with ${coverageLabel} of the sections this Doctor uses.`,
+    hasOutline ? null : "The outline file is missing, so Refit cannot confirm section coverage without reading more of the manual.",
+    stale ? "Refresh the cache when network access is available so speed advice tracks the current Codex manual." : null,
+    missingTopicCount ? `Missing outline coverage: ${missingTopics.slice(0, 5).join(", ")}${missingTopicCount > 5 ? ", ..." : ""}.` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    cacheDir: openAiDocsCacheDir,
+    manualPath: codexManualCachePath,
+    outlinePath: codexManualOutlinePath,
+    hasManual: true,
+    hasOutline,
+    manualBytes: manualStats.size,
+    outlineBytes: outlineStats?.isFile() ? outlineStats.size : 0,
+    manualMtime: manualStats.mtime.toISOString(),
+    outlineMtime: outlineStats?.isFile() ? outlineStats.mtime.toISOString() : null,
+    manualAgeDays: Number(manualAgeDays.toFixed(2)),
+    stale,
+    veryStale,
+    topicCount: topics.length,
+    coveredTopicCount: topics.length - missingTopicCount,
+    missingTopicCount,
+    missingTopics,
+    topics,
+  };
+}
+
 function emptyLocalEnvironmentSummary({ hasCodexDir = false, hasUsefulPackageScripts = false } = {}) {
   return {
     status: hasCodexDir ? "empty" : "missing",
@@ -6246,6 +7080,321 @@ async function getTrustedProjectReadiness(trustedProjectStatuses) {
   };
 }
 
+function emptyValidationReadinessSummary(currentProject = null) {
+  return {
+    status: currentProject ? "ready" : "missing",
+    tone: "low",
+    label: currentProject ? "Optional" : "No project",
+    action: currentProject ? "Document checks" : "Open project",
+    detail: currentProject
+      ? "Validation loop readiness was not checked."
+      : "Open a trusted project so Refit can check how quickly Codex can prove changes.",
+    currentProjectPath: currentProject?.path ? displayPath(currentProject.path) : null,
+    hasValidationScript: false,
+    hasTestScript: false,
+    hasBuildScript: false,
+    hasLintScript: false,
+    hasTypecheckScript: false,
+    validationScriptCount: 0,
+    reviewFileCount: 0,
+    guidanceFileCount: 0,
+    hasVerificationGuidance: false,
+    hasReviewGuidance: false,
+    missingValidationCommand: false,
+    missingVerificationGuidance: false,
+    missingReviewGuidance: false,
+    files: [],
+  };
+}
+
+function validationScriptKind(name, value) {
+  const key = String(name || "").toLowerCase();
+  const script = String(value || "").toLowerCase();
+  if (!scriptLooksUseful(value)) return null;
+  if (/\b(typecheck|type-check|tsc)\b/.test(key) || /\btsc\b|typecheck|type-check/.test(script)) return "typecheck";
+  if (/\b(lint|eslint|biome|ruff|clippy|rubocop)\b/.test(key) || /\b(eslint|biome|ruff|clippy|rubocop)\b/.test(script)) return "lint";
+  if (/\b(test|spec|vitest|jest|playwright|pytest|cargo test|go test)\b/.test(key) || /\b(vitest|jest|playwright|pytest|cargo\s+test|go\s+test|npm\s+test|pnpm\s+test|yarn\s+test)\b/.test(script)) {
+    return "test";
+  }
+  if (/\b(build|package|compile|verify|check|ci)\b/.test(key) || /\b(vite\s+build|next\s+build|tsc|cargo\s+build|go\s+build|xcodebuild|gradle\s+build|mvn\s+test|make\s+(build|check|test))\b/.test(script)) {
+    return "build";
+  }
+  return null;
+}
+
+async function validationGuidanceFileInfo(filePath, kind = "guidance") {
+  const stats = await statOrNull(filePath);
+  if (!stats?.isFile() || stats.size > 256 * 1024) return null;
+  let text = "";
+  try {
+    text = await fs.readFile(filePath, "utf8");
+  } catch {
+    return {
+      path: displayPath(filePath),
+      name: path.basename(filePath),
+      bytes: stats.size,
+      kind,
+      verificationMention: false,
+      reviewMention: false,
+      unreadable: true,
+    };
+  }
+  const verificationMention =
+    /\b(done when|verification|verify|test|tests|lint|typecheck|type check|build|npm run|pnpm|yarn|pytest|vitest|jest|playwright)\b/i.test(text);
+  const reviewMention = /\b(review|code review|\/review|diff|pull request|pr expectations|regression|risky pattern)\b/i.test(text);
+  return {
+    path: displayPath(filePath),
+    name: path.basename(filePath),
+    bytes: stats.size,
+    kind,
+    verificationMention,
+    reviewMention,
+    unreadable: false,
+  };
+}
+
+async function getValidationReadinessSummary(currentProject = null) {
+  if (!currentProject?.exists || !currentProject.path) return emptyValidationReadinessSummary(currentProject);
+
+  const packageJson = await readJsonOrNull(path.join(currentProject.path, "package.json"));
+  const scripts =
+    packageJson?.scripts && typeof packageJson.scripts === "object"
+      ? packageJson.scripts
+      : currentProject.scripts || {};
+  const scriptKinds = Object.entries(scripts)
+    .map(([name, value]) => ({ name, kind: validationScriptKind(name, value) }))
+    .filter((entry) => entry.kind);
+  const hasTestScript = scriptKinds.some((entry) => entry.kind === "test") || Boolean(currentProject.hasTestScript);
+  const hasBuildScript = scriptKinds.some((entry) => entry.kind === "build") || Boolean(currentProject.hasBuildScript);
+  const hasLintScript = scriptKinds.some((entry) => entry.kind === "lint");
+  const hasTypecheckScript = scriptKinds.some((entry) => entry.kind === "typecheck");
+  const hasValidationScript = hasTestScript || hasBuildScript || hasLintScript || hasTypecheckScript;
+  const projectPath = currentProject.path;
+  const candidateFiles = [
+    { path: path.join(projectPath, "AGENTS.md"), kind: "agents" },
+    { path: path.join(projectPath, "AGENTS.override.md"), kind: "agents" },
+    { path: path.join(projectPath, "code_review.md"), kind: "review" },
+    { path: path.join(projectPath, ".codex", "code_review.md"), kind: "review" },
+    { path: path.join(projectPath, ".github", "pull_request_template.md"), kind: "review" },
+    { path: path.join(projectPath, ".github", "PULL_REQUEST_TEMPLATE.md"), kind: "review" },
+    { path: path.join(projectPath, "CONTRIBUTING.md"), kind: "guidance" },
+  ];
+  const files = (await Promise.all(candidateFiles.map((candidate) => validationGuidanceFileInfo(candidate.path, candidate.kind)))).filter(Boolean);
+  const hasVerificationGuidance = files.some((file) => file.verificationMention);
+  const hasReviewGuidance = files.some((file) => file.reviewMention);
+  const reviewFileCount = files.filter((file) => file.kind === "review" || file.reviewMention).length;
+  const guidanceFileCount = files.length;
+  const missingValidationCommand = !hasValidationScript;
+  const missingVerificationGuidance = !hasVerificationGuidance;
+  const missingReviewGuidance = !hasReviewGuidance && !reviewFileCount;
+  const highLoad = missingValidationCommand && missingVerificationGuidance;
+  const mediumLoad = highLoad || missingValidationCommand || missingVerificationGuidance || missingReviewGuidance;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = hasValidationScript
+    ? [
+        hasTestScript ? "test" : null,
+        hasBuildScript ? "build" : null,
+        hasLintScript ? "lint" : null,
+        hasTypecheckScript ? "types" : null,
+      ]
+        .filter(Boolean)
+        .join(" + ")
+    : "No checks";
+  const action = missingValidationCommand
+    ? "Add checks"
+    : missingVerificationGuidance
+      ? "Document checks"
+      : missingReviewGuidance
+        ? "Add review notes"
+        : "Keep loop clear";
+  const detail =
+    tone === "low"
+      ? "Validation loop looks ready: Codex has discoverable check scripts plus guidance for verifying and reviewing changes."
+      : [
+          "The Codex manual recommends telling Codex how to test, check, confirm behavior, and review diffs so work finishes with less rediscovery.",
+          hasValidationScript
+            ? `Refit found ${scriptKinds.length.toLocaleString()} validation script${scriptKinds.length === 1 ? "" : "s"} across package scripts.`
+            : "Refit did not find a useful test, build, lint, typecheck, check, or verify script in sampled package scripts.",
+          hasVerificationGuidance
+            ? "Guidance mentions verification."
+            : "AGENTS/CONTRIBUTING guidance does not clearly say how to verify work.",
+          hasReviewGuidance || reviewFileCount
+            ? "Review guidance was found."
+            : "No code_review.md, PR template, or review instructions were found.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    currentProjectPath: displayPath(projectPath),
+    hasValidationScript,
+    hasTestScript,
+    hasBuildScript,
+    hasLintScript,
+    hasTypecheckScript,
+    validationScriptCount: scriptKinds.length,
+    validationScriptKinds: [...new Set(scriptKinds.map((entry) => entry.kind))],
+    reviewFileCount,
+    guidanceFileCount,
+    hasVerificationGuidance,
+    hasReviewGuidance,
+    missingValidationCommand,
+    missingVerificationGuidance,
+    missingReviewGuidance,
+    files: files.map((file) => ({
+      name: file.name,
+      bytes: file.bytes,
+      kind: file.kind,
+      verificationMention: file.verificationMention,
+      reviewMention: file.reviewMention,
+      unreadable: file.unreadable,
+    })),
+  };
+}
+
+function emptyReviewLaneSummary(currentProject = null) {
+  return {
+    status: currentProject?.path ? "no-git" : "no-project",
+    tone: "low",
+    label: currentProject?.path ? "No Git repo" : "No project",
+    action: currentProject?.path ? "Open Git project" : "Open project",
+    detail: currentProject?.path
+      ? "No Git repository was available for Review Lane checks."
+      : "Open a trusted project so Refit can check whether local changes are ready for Codex /review.",
+    currentProjectPath: currentProject?.path ? displayPath(currentProject.path) : null,
+    gitRoot: null,
+    hasGitRepo: false,
+    branch: null,
+    upstream: null,
+    hasUpstream: false,
+    detachedHead: false,
+    dirtyCount: 0,
+    stagedCount: 0,
+    unstagedCount: 0,
+    untrackedCount: 0,
+    conflictedCount: 0,
+    aheadCount: 0,
+    behindCount: 0,
+    diffFileCount: 0,
+    diffInsertions: 0,
+    diffDeletions: 0,
+    diffLineChangeCount: 0,
+    stagedDiffFileCount: 0,
+    unstagedDiffFileCount: 0,
+    hasReviewGuidance: false,
+    reviewFileCount: 0,
+    reviewModel: null,
+    hasReviewModel: false,
+    largeChangeSet: false,
+    unreviewedDirtyWork: false,
+    missingBaseForReview: false,
+    reviewRecommended: false,
+  };
+}
+
+async function getReviewLaneSummary(currentProject = null, { values = {}, validationReadiness = null } = {}) {
+  const candidateRoot =
+    currentProject?.exists && currentProject.path
+      ? await gitRootFor(currentProject.path)
+      : (await gitRootFor(process.cwd())) || (await gitRootFor(rootDir));
+  if (!candidateRoot) return emptyReviewLaneSummary(currentProject);
+
+  const [statusOutput, diffOutput, stagedDiffOutput, unstagedDiffOutput, branchOutput, upstreamOutput] = await Promise.all([
+    gitOutput(candidateRoot, ["status", "--porcelain=v1", "--branch", "--ahead-behind"]),
+    gitOutput(candidateRoot, ["diff", "--shortstat", "HEAD"], { timeout: 3500, maxBuffer: 256 * 1024 }),
+    gitOutput(candidateRoot, ["diff", "--cached", "--shortstat"], { timeout: 3500, maxBuffer: 256 * 1024 }),
+    gitOutput(candidateRoot, ["diff", "--shortstat"], { timeout: 3500, maxBuffer: 256 * 1024 }),
+    gitOutput(candidateRoot, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    gitOutput(candidateRoot, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]),
+  ]);
+  const parsedStatus = parseGitStatus(statusOutput);
+  const diffStat = parseGitShortStat(diffOutput);
+  const stagedDiffStat = parseGitShortStat(stagedDiffOutput);
+  const unstagedDiffStat = parseGitShortStat(unstagedDiffOutput);
+  const reviewModel = values.review_model ? String(values.review_model) : null;
+  const hasReviewGuidance = Boolean(validationReadiness?.hasReviewGuidance || validationReadiness?.reviewFileCount);
+  const reviewFileCount = Number(validationReadiness?.reviewFileCount || 0);
+  const dirtyCount = parsedStatus.dirtyCount || 0;
+  const diffLineChangeCount = diffStat.insertions + diffStat.deletions;
+  const largeChangeSet = dirtyCount >= 10 || diffLineChangeCount >= 800 || diffStat.filesChanged >= 10;
+  const missingBaseForReview = dirtyCount > 0 && !parsedStatus.upstream && !upstreamOutput;
+  const unreviewedDirtyWork = dirtyCount > 0 && !hasReviewGuidance;
+  const reviewRecommended = dirtyCount > 0 && (largeChangeSet || hasReviewGuidance || parsedStatus.stagedCount || parsedStatus.unstagedCount);
+  const highLoad = parsedStatus.conflictedCount > 0 || (largeChangeSet && unreviewedDirtyWork);
+  const mediumLoad = highLoad || unreviewedDirtyWork || largeChangeSet || missingBaseForReview || (dirtyCount > 0 && !reviewModel);
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = parsedStatus.conflictedCount
+    ? `${parsedStatus.conflictedCount.toLocaleString()} conflicts`
+    : dirtyCount
+      ? `${dirtyCount.toLocaleString()} change${dirtyCount === 1 ? "" : "s"}`
+      : "Clean";
+  const action = parsedStatus.conflictedCount
+    ? "Resolve first"
+    : dirtyCount
+      ? unreviewedDirtyWork
+        ? "Add review notes"
+        : reviewRecommended
+          ? "Run /review"
+          : "Review before commit"
+      : "Review before PR";
+  const detail =
+    dirtyCount === 0
+      ? "Review Lane is quiet: no local Git changes were detected. Use /review before opening a PR or after the next meaningful diff."
+      : [
+          "The Codex manual says /review reads a selected diff and reports prioritized findings without touching the working tree.",
+          `${dirtyCount.toLocaleString()} local Git change${dirtyCount === 1 ? "" : "s"} detected: ${parsedStatus.stagedCount.toLocaleString()} staged, ${parsedStatus.unstagedCount.toLocaleString()} unstaged, ${parsedStatus.untrackedCount.toLocaleString()} untracked.`,
+          diffStat.raw ? `Diff shortstat: ${diffStat.raw}.` : "No tracked diff shortstat was available; untracked files may still need review.",
+          parsedStatus.upstream || upstreamOutput ? `Base branch hint: ${parsedStatus.upstream || upstreamOutput}.` : "No upstream branch was detected for base-branch review.",
+          hasReviewGuidance
+            ? `${reviewFileCount.toLocaleString()} review guidance source${reviewFileCount === 1 ? "" : "s"} found.`
+            : "No code_review.md, PR template, or AGENTS review instructions were found.",
+          reviewModel ? `review_model is set to ${reviewModel}.` : "No review_model override is configured; /review will use the current session model.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    currentProjectPath: currentProject?.path ? displayPath(currentProject.path) : null,
+    gitRoot: displayPath(candidateRoot),
+    hasGitRepo: true,
+    branch: parsedStatus.branch || (branchOutput && branchOutput !== "HEAD" ? branchOutput : null),
+    upstream: parsedStatus.upstream || upstreamOutput || null,
+    hasUpstream: Boolean(parsedStatus.upstream || upstreamOutput),
+    detachedHead: parsedStatus.detachedHead || branchOutput === "HEAD",
+    dirtyCount,
+    stagedCount: parsedStatus.stagedCount,
+    unstagedCount: parsedStatus.unstagedCount,
+    untrackedCount: parsedStatus.untrackedCount,
+    conflictedCount: parsedStatus.conflictedCount,
+    aheadCount: parsedStatus.aheadCount,
+    behindCount: parsedStatus.behindCount,
+    diffFileCount: diffStat.filesChanged,
+    diffInsertions: diffStat.insertions,
+    diffDeletions: diffStat.deletions,
+    diffLineChangeCount,
+    stagedDiffFileCount: stagedDiffStat.filesChanged,
+    unstagedDiffFileCount: unstagedDiffStat.filesChanged,
+    hasReviewGuidance,
+    reviewFileCount,
+    reviewModel,
+    hasReviewModel: Boolean(reviewModel),
+    largeChangeSet,
+    unreviewedDirtyWork,
+    missingBaseForReview,
+    reviewRecommended,
+  };
+}
+
 function emptyAutomationSummary(projectRoot = null) {
   return {
     status: "ready",
@@ -6791,12 +7940,15 @@ function emptyTaskClaritySummary(activeSessions = {}) {
     toolCallCount: 0,
     toolOutputCount: 0,
     compactMarkerCount: 0,
+    goalModeMarkerCount: 0,
+    slashGoalCommandCount: 0,
     goalMarkerCount: 0,
     contextMarkerCount: 0,
     constraintMarkerCount: 0,
     doneMarkerCount: 0,
     verificationMarkerCount: 0,
     structuredPromptFileCount: 0,
+    goalModeFileCount: 0,
     missingDoneMarkerFileCount: 0,
     missingVerificationMarkerFileCount: 0,
     highChurnFileCount: 0,
@@ -6834,12 +7986,33 @@ function payloadText(payload) {
 
 function taskMarkerCounts(text) {
   return {
+    slashGoal: countMatches(text, /^\s*\/goal\b/gim),
     goal: countMatches(text, /\b(goal|objective|trying to|i want|we need|need to|make|build|fix|debug|implement|create)\b/gi),
     context: countMatches(text, /\b(context|file|folder|repo|repository|screenshot|error|stack trace|log|current behavior|existing|see attached)\b/gi),
     constraint: countMatches(text, /\b(constraint|must|do not|don't|avoid|only|never|keep|preserve|without|requirement|safe|guard|scope)\b/gi),
     done: countMatches(text, /\b(done when|success criteria|acceptance criteria|complete when|finish when|ready when|definition of done)\b/gi),
     verification: countMatches(text, /\b(verify|verification|test|tests pass|build passes|lint|typecheck|benchmark|proof|reproduce|regression|screenshot)\b/gi),
   };
+}
+
+function goalModeSignal(record = {}, payload = {}, payloadType = "") {
+  const signalText = [
+    payloadType,
+    record?.type,
+    payload?.event,
+    payload?.name,
+    payload?.kind,
+    payload?.subtype,
+    payload?.status,
+    payload?.goal_status,
+    payload?.goalStatus,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return Boolean(
+    /\b(goal_mode|task_goal|set_goal|goal_set|goal_updated|goal_completed|goal_paused|goal_resumed|goal_cleared|goal_status)\b/i.test(signalText) ||
+      (payload && typeof payload === "object" && (payload.goal || payload.active_goal || payload.goal_text || payload.goalText)),
+  );
 }
 
 async function scanTaskClarityMarkers(file) {
@@ -6860,12 +8033,15 @@ async function scanTaskClarityMarkers(file) {
     toolCallCount: 0,
     toolOutputCount: 0,
     compactMarkerCount: 0,
+    goalModeMarkerCount: 0,
+    slashGoalCommandCount: 0,
     goalMarkerCount: 0,
     contextMarkerCount: 0,
     constraintMarkerCount: 0,
     doneMarkerCount: 0,
     verificationMarkerCount: 0,
     structuredPrompt: false,
+    goalModeSignal: false,
     missingDoneMarker: false,
     missingVerificationMarker: false,
     highChurn: false,
@@ -6887,6 +8063,9 @@ async function scanTaskClarityMarkers(file) {
     if (payloadType === "compact" || payloadType === "agent_reasoning_compacted" || /compact/i.test(String(payloadType))) {
       result.compactMarkerCount += 1;
     }
+    if (goalModeSignal(record, payload, payloadType)) {
+      result.goalModeMarkerCount += 1;
+    }
     if (payloadType === "function_call" || payload.name || payload.call_id && payload.arguments !== undefined) {
       result.toolCallCount += 1;
     }
@@ -6898,6 +8077,7 @@ async function scanTaskClarityMarkers(file) {
     if (payloadType === "message" && role === "user") {
       result.userTurnCount += 1;
       const markers = taskMarkerCounts(payloadText(payload));
+      result.slashGoalCommandCount += markers.slashGoal;
       result.goalMarkerCount += markers.goal;
       result.contextMarkerCount += markers.context;
       result.constraintMarkerCount += markers.constraint;
@@ -6911,6 +8091,7 @@ async function scanTaskClarityMarkers(file) {
     result.contextMarkerCount > 0 &&
     result.constraintMarkerCount > 0 &&
     (result.doneMarkerCount > 0 || result.verificationMarkerCount > 0);
+  result.goalModeSignal = result.goalModeMarkerCount > 0 || result.slashGoalCommandCount > 0;
   result.missingDoneMarker = result.userTurnCount > 0 && result.doneMarkerCount === 0;
   result.missingVerificationMarker = result.userTurnCount > 0 && result.verificationMarkerCount === 0;
   result.highChurn =
@@ -6951,12 +8132,15 @@ async function summarizeTaskClarity(activeSessions = {}) {
   summary.toolCallCount = summary.largest.reduce((total, file) => total + file.toolCallCount, 0);
   summary.toolOutputCount = summary.largest.reduce((total, file) => total + file.toolOutputCount, 0);
   summary.compactMarkerCount = summary.largest.reduce((total, file) => total + file.compactMarkerCount, 0);
+  summary.goalModeMarkerCount = summary.largest.reduce((total, file) => total + file.goalModeMarkerCount, 0);
+  summary.slashGoalCommandCount = summary.largest.reduce((total, file) => total + file.slashGoalCommandCount, 0);
   summary.goalMarkerCount = summary.largest.reduce((total, file) => total + file.goalMarkerCount, 0);
   summary.contextMarkerCount = summary.largest.reduce((total, file) => total + file.contextMarkerCount, 0);
   summary.constraintMarkerCount = summary.largest.reduce((total, file) => total + file.constraintMarkerCount, 0);
   summary.doneMarkerCount = summary.largest.reduce((total, file) => total + file.doneMarkerCount, 0);
   summary.verificationMarkerCount = summary.largest.reduce((total, file) => total + file.verificationMarkerCount, 0);
   summary.structuredPromptFileCount = summary.largest.filter((file) => file.structuredPrompt).length;
+  summary.goalModeFileCount = summary.largest.filter((file) => file.goalModeSignal).length;
   summary.missingDoneMarkerFileCount = summary.largest.filter((file) => file.missingDoneMarker).length;
   summary.missingVerificationMarkerFileCount = summary.largest.filter((file) => file.missingVerificationMarker).length;
   summary.highChurnFileCount = summary.largest.filter((file) => file.highChurn).length;
@@ -6991,6 +8175,9 @@ async function summarizeTaskClarity(activeSessions = {}) {
           summary.structuredPromptFileCount
             ? `${summary.structuredPromptFileCount.toLocaleString()} sampled thread${summary.structuredPromptFileCount === 1 ? " has" : "s have"} goal, context, constraints, and done/verification markers.`
             : "No sampled thread showed the full goal/context/constraints/done-when shape from the Codex best-practices guide.",
+          summary.goalModeFileCount
+            ? `${summary.goalModeFileCount.toLocaleString()} sampled thread${summary.goalModeFileCount === 1 ? " shows" : "s show"} explicit /goal or goal-mode signals.`
+            : null,
           summary.highChurnFileCount
             ? `${summary.highChurnFileCount.toLocaleString()} sampled thread${summary.highChurnFileCount === 1 ? " looks" : "s look"} broad enough to benefit from /compact, a fresh thread, or a clearer completion target.`
             : null,
@@ -7015,6 +8202,121 @@ async function summarizeTaskClarity(activeSessions = {}) {
       : "Done/verification markers are visible in the sampled active work.",
   ].filter(Boolean);
   return summary;
+}
+
+function emptyGoalReadinessSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "Optional",
+    action: "Use for long work",
+    detail: "No long active-work signal was strong enough to require Goal Mode.",
+    goalsFeature: false,
+    longWorkSignal: false,
+    explicitGoalSignal: false,
+    missingFeatureForLongWork: false,
+    missingExplicitGoalForLongWork: false,
+    missingCompletionCriteria: false,
+    goalModeMarkerCount: 0,
+    slashGoalCommandCount: 0,
+    goalModeFileCount: 0,
+    highChurnFileCount: 0,
+    compactMarkerCount: 0,
+    userTurnCount: 0,
+    doneMarkerCount: 0,
+    verificationMarkerCount: 0,
+  };
+}
+
+function buildGoalReadinessSummary(taskClarity = {}, codexConfig = {}) {
+  const goalsFeature = Boolean(codexConfig?.goalsFeature);
+  const userTurnCount = Number(taskClarity.userTurnCount || 0);
+  const highChurnFileCount = Number(taskClarity.highChurnFileCount || 0);
+  const compactMarkerCount = Number(taskClarity.compactMarkerCount || 0);
+  const goalModeMarkerCount = Number(taskClarity.goalModeMarkerCount || 0);
+  const slashGoalCommandCount = Number(taskClarity.slashGoalCommandCount || 0);
+  const goalModeFileCount = Number(taskClarity.goalModeFileCount || 0);
+  const doneMarkerCount = Number(taskClarity.doneMarkerCount || 0);
+  const verificationMarkerCount = Number(taskClarity.verificationMarkerCount || 0);
+  const explicitGoalSignal = goalModeMarkerCount > 0 || slashGoalCommandCount > 0 || goalModeFileCount > 0;
+  const longWorkSignal =
+    taskClarity.tone === "high" ||
+    highChurnFileCount > 0 ||
+    compactMarkerCount >= 2 ||
+    userTurnCount >= 30;
+  const missingFeatureForLongWork = longWorkSignal && !goalsFeature;
+  const missingExplicitGoalForLongWork = longWorkSignal && goalsFeature && !explicitGoalSignal;
+  const missingCompletionCriteria = longWorkSignal && doneMarkerCount === 0 && verificationMarkerCount === 0;
+  const highLoad = missingFeatureForLongWork && (taskClarity.tone === "high" || highChurnFileCount >= 3 || missingCompletionCriteria);
+  const mediumLoad =
+    highLoad ||
+    missingFeatureForLongWork ||
+    missingCompletionCriteria ||
+    (missingExplicitGoalForLongWork && highChurnFileCount > 0);
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = missingFeatureForLongWork
+    ? "Feature off"
+    : explicitGoalSignal
+      ? "Goal signaled"
+      : goalsFeature
+        ? longWorkSignal
+          ? "Set /goal"
+          : "Ready"
+        : "Optional";
+  const action = missingFeatureForLongWork
+    ? "Enable /goal"
+    : missingCompletionCriteria
+      ? "Add done-when"
+      : missingExplicitGoalForLongWork
+        ? "Set /goal"
+        : goalsFeature
+          ? "Use for long work"
+          : "Optional";
+  const detail =
+    tone === "low"
+      ? goalsFeature
+        ? explicitGoalSignal
+          ? `Goal Mode is enabled and Refit saw ${goalModeFileCount.toLocaleString()} sampled active thread${goalModeFileCount === 1 ? "" : "s"} with explicit /goal or goal-mode signals.`
+          : "Goal Mode is enabled. Use /goal when work may take many steps or needs a clear definition of done."
+        : "No long active-work signal was strong enough to require Goal Mode, but enabling features.goals keeps /goal available for larger tasks."
+      : [
+          `Refit sampled ${userTurnCount.toLocaleString()} user turn${userTurnCount === 1 ? "" : "s"}, ${highChurnFileCount.toLocaleString()} high-churn active thread${highChurnFileCount === 1 ? "" : "s"}, and ${compactMarkerCount.toLocaleString()} compact marker${compactMarkerCount === 1 ? "" : "s"}.`,
+          missingFeatureForLongWork
+            ? "Goal Mode is not enabled, so /goal may be unavailable when long work needs persistent completion criteria."
+            : null,
+          missingExplicitGoalForLongWork
+            ? "Goal Mode is enabled, but the sampled long active work did not show explicit /goal or goal-mode signals."
+            : null,
+          missingCompletionCriteria
+            ? "The sampled long active work also lacks obvious done-when or verification markers."
+            : null,
+          "The Codex manual says Goal Mode gives Codex a persistent objective and completion criteria across longer tasks.",
+          "Refit reports goal-readiness counts only, never transcript text.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    goalsFeature,
+    longWorkSignal,
+    explicitGoalSignal,
+    missingFeatureForLongWork,
+    missingExplicitGoalForLongWork,
+    missingCompletionCriteria,
+    goalModeMarkerCount,
+    slashGoalCommandCount,
+    goalModeFileCount,
+    highChurnFileCount,
+    compactMarkerCount,
+    userTurnCount,
+    doneMarkerCount,
+    verificationMarkerCount,
+  };
 }
 
 function emptyTurnTelemetrySummary(activeSessions = {}) {
@@ -8354,10 +9656,12 @@ async function getCodexConfigSummary() {
     reasoningEffort: null,
     modelVerbosity: null,
     modelReasoningSummary: null,
+    planModeReasoningEffort: null,
     modelSupportsReasoningSummaries: null,
     showRawAgentReasoning: false,
     hideAgentReasoning: false,
     responseShapeSummary: buildResponseShapeSummary({}),
+    planEffort: buildPlanEffortSummary({}),
     approvalPolicy: null,
     approvalReviewer: "user",
     approvalFlow: buildApprovalFlowSummary({}),
@@ -8369,15 +9673,19 @@ async function getCodexConfigSummary() {
     forcedLoginMethod: null,
     forcedWorkspaceConfigured: false,
     authCache: await getAuthCacheSummary({}),
+    manualFreshness: await getCodexManualFreshnessSummary(),
     modelProvider: emptyModelProviderSummary(),
     fastMode: false,
     fastModeFeature: true,
     shellSnapshot: true,
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
     shellStartup: emptyShellStartupSummary(),
+    cliCompletion: emptyCliCompletionSummary(),
+    strictConfig: emptyStrictConfigSummary(),
     notificationFlow: buildNotificationFlowSummary({}),
     telemetry: buildTelemetrySummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
+    statusLine: buildStatusLineSummary({}),
     historyRetention: buildHistoryRetentionSummary({}, historyMeta),
     storagePaths: null,
     networkSandbox: emptyNetworkSandboxSummary(),
@@ -8404,6 +9712,8 @@ async function getCodexConfigSummary() {
       sources: [],
       detail: "No active lifecycle hook commands were found in user or current trusted project config.",
     },
+    goalReadiness: emptyGoalReadinessSummary(),
+    planningReadiness: emptyPlanningReadinessSummary(),
     memoriesFeature: false,
     memoriesUseMemories: null,
     memoriesUseMemoriesEffective: false,
@@ -8442,6 +9752,8 @@ async function getCodexConfigSummary() {
       currentProject: null,
       weakestProjects: [],
     },
+    validationReadiness: emptyValidationReadinessSummary(),
+    reviewLane: emptyReviewLaneSummary(),
     automation: emptyAutomationSummary(),
     cloudHandoff: emptyCloudHandoffSummary(),
     remoteHosts: emptyRemoteHostSummary(),
@@ -8471,12 +9783,16 @@ async function getCodexConfigSummary() {
   Object.assign(summary, await getCodexProfileSummaries());
 
   if (!(await exists(paths.configToml))) {
+    summary.planEffort = buildPlanEffortSummary({}, summary);
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
     summary.networkSandbox = buildNetworkSandboxSummary({}, []);
     summary.permissionsProfile = buildPermissionsProfileSummary({}, []);
     summary.notificationFlow = buildNotificationFlowSummary({});
     summary.telemetry = buildTelemetrySummary({});
+    summary.statusLine = buildStatusLineSummary({});
     summary.shellStartup = await getShellStartupSummary();
+    summary.cliCompletion = await getCliCompletionSummary();
+    summary.strictConfig = await getStrictConfigSummary();
     summary.historyRetention = buildHistoryRetentionSummary({}, historyMeta);
     summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
@@ -8485,6 +9801,7 @@ async function getCodexConfigSummary() {
     summary.customPrompts = await getCustomPromptSummary();
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
+    summary.reviewLane = await getReviewLaneSummary(null, { values: {}, validationReadiness: summary.validationReadiness });
     summary.automation = await getAutomationSummary(null);
     summary.cloudHandoff = await getCloudHandoffSummary(null);
     summary.remoteHosts = await getRemoteHostSummary();
@@ -8500,10 +9817,12 @@ async function getCodexConfigSummary() {
     summary.reasoningEffort = values.model_reasoning_effort || values.reasoning_effort || null;
     summary.modelVerbosity = values.model_verbosity || null;
     summary.modelReasoningSummary = values.model_reasoning_summary || null;
+    summary.planModeReasoningEffort = values.plan_mode_reasoning_effort || null;
     summary.modelSupportsReasoningSummaries = values.model_supports_reasoning_summaries ?? null;
     summary.showRawAgentReasoning = values.show_raw_agent_reasoning === true;
     summary.hideAgentReasoning = values.hide_agent_reasoning === true;
     summary.responseShapeSummary = buildResponseShapeSummary(values);
+    summary.planEffort = buildPlanEffortSummary(values, summary);
     summary.approvalPolicy = values.approval_policy || null;
     summary.approvalReviewer = values.approvals_reviewer || "user";
     summary.approvalFlow = buildApprovalFlowSummary(values);
@@ -8521,8 +9840,11 @@ async function getCodexConfigSummary() {
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.shellEnvironmentSummary = buildShellEnvironmentSummary(values);
     summary.shellStartup = await getShellStartupSummary();
+    summary.cliCompletion = await getCliCompletionSummary();
+    summary.strictConfig = await getStrictConfigSummary();
     summary.notificationFlow = buildNotificationFlowSummary(values);
     summary.telemetry = buildTelemetrySummary(values);
+    summary.statusLine = buildStatusLineSummary(values);
     summary.contextBudgetSummary = buildContextBudgetSummary(values);
     summary.historyRetention = buildHistoryRetentionSummary(values, historyMeta);
     summary.storagePaths = await buildStoragePathSummary(values, { currentProject: null });
@@ -8566,6 +9888,11 @@ async function getCodexConfigSummary() {
     summary.staleTrustedProjectPaths = summary.trustedProjectStatuses.filter((project) => !project.exists).map((project) => project.path);
     summary.staleTrustedProjectCount = summary.staleTrustedProjectPaths.length;
     summary.projectReadiness = await getTrustedProjectReadiness(summary.trustedProjectStatuses);
+    summary.validationReadiness = await getValidationReadinessSummary(summary.projectReadiness.currentProject);
+    summary.reviewLane = await getReviewLaneSummary(summary.projectReadiness.currentProject, {
+      values,
+      validationReadiness: summary.validationReadiness,
+    });
     summary.automation = await getAutomationSummary(summary.projectReadiness.currentProject);
     summary.cloudHandoff = await getCloudHandoffSummary(summary.projectReadiness.currentProject);
     summary.remoteHosts = await getRemoteHostSummary();
@@ -8626,11 +9953,15 @@ async function getCodexConfigSummary() {
   } catch (error) {
     summary.error = error.message;
     summary.shellStartup = await getShellStartupSummary();
+    summary.cliCompletion = await getCliCompletionSummary();
+    summary.strictConfig = await getStrictConfigSummary();
     summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
     summary.automation = await getAutomationSummary(null);
     summary.remoteHosts = await getRemoteHostSummary();
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
+    summary.reviewLane = await getReviewLaneSummary(null, { values: {}, validationReadiness: summary.validationReadiness });
+    summary.planEffort = buildPlanEffortSummary({}, summary);
   }
 
   return summary;
@@ -8644,6 +9975,168 @@ function projectCommandLine(project, candidates, fallback) {
   const scripts = project?.scripts || {};
   const scriptName = candidates.find((name) => scripts[name]);
   return scriptName ? `npm run ${scriptName}` : fallback;
+}
+
+function emptyPlanningReadinessSummary() {
+  return {
+    status: "no-project",
+    tone: "low",
+    label: "No project",
+    action: "Open project",
+    detail: "Open a trusted project so Refit can check whether long work has a reusable planning template.",
+    currentProjectPath: null,
+    hasPlanTemplate: false,
+    missingPlanTemplate: false,
+    missingPlanForComplexWork: false,
+    templateCount: 0,
+    templateBytes: 0,
+    templateLargeCount: 0,
+    templateHuge: false,
+    complexSignalCount: 0,
+    highChurnFileCount: 0,
+    hasUsefulScripts: false,
+    files: [],
+  };
+}
+
+function planningTemplateCandidates(projectPath) {
+  return [
+    path.join(projectPath, "PLANS.md"),
+    path.join(projectPath, "PLAN.md"),
+    path.join(projectPath, ".codex", "PLANS.md"),
+    path.join(projectPath, ".codex", "PLAN.md"),
+    path.join(projectPath, ".codex", "plans.md"),
+    path.join(projectPath, ".codex", "plan.md"),
+    path.join(projectPath, ".codex", "execution-plan.md"),
+    path.join(projectPath, ".codex", "execution-plans.md"),
+    path.join(projectPath, "docs", "PLANS.md"),
+  ];
+}
+
+async function getPlanningReadinessSummary(currentProject = null, taskClarity = {}) {
+  if (!currentProject?.exists || !currentProject.path) return emptyPlanningReadinessSummary();
+
+  const projectPath = currentProject.path;
+  const candidates = planningTemplateCandidates(projectPath);
+  const files = [];
+  for (const filePath of candidates) {
+    const stats = await statOrNull(filePath);
+    if (!stats?.isFile()) continue;
+    files.push({
+      path: displayPath(filePath),
+      bytes: stats.size,
+      mtime: stats.mtime.toISOString(),
+      large: stats.size >= 12 * 1024,
+    });
+  }
+
+  const templateCount = files.length;
+  const templateBytes = files.reduce((total, file) => total + file.bytes, 0);
+  const templateLargeCount = files.filter((file) => file.large).length;
+  const templateHuge = templateBytes >= 48 * 1024 || templateLargeCount >= 3;
+  const hasPlanTemplate = templateCount > 0;
+  const scripts = currentProject.scripts || {};
+  const hasUsefulScripts = Boolean(
+    currentProject.hasPackageJson &&
+      (currentProject.hasDevScript ||
+        currentProject.hasBuildScript ||
+        currentProject.hasTestScript ||
+        Object.values(scripts).some(scriptLooksUseful)),
+  );
+  const complexSignalCount =
+    Number(taskClarity.highChurnFileCount || 0) +
+    Number(taskClarity.missingDoneMarkerFileCount || 0) +
+    Number(taskClarity.missingVerificationMarkerFileCount || 0) +
+    Math.max(0, Number(taskClarity.compactMarkerCount || 0) - 1);
+  const missingPlanTemplate = !hasPlanTemplate;
+  const missingPlanForComplexWork =
+    missingPlanTemplate &&
+    (taskClarity.tone === "high" ||
+      Number(taskClarity.highChurnFileCount || 0) > 0 ||
+      complexSignalCount >= 3 ||
+      (hasUsefulScripts && currentProject.score < 70));
+  const highLoad = missingPlanForComplexWork && (taskClarity.tone === "high" || Number(taskClarity.highChurnFileCount || 0) >= 3);
+  const mediumLoad = highLoad || missingPlanForComplexWork || templateHuge || templateBytes >= 24 * 1024;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = hasPlanTemplate
+    ? `${templateCount.toLocaleString()} template${templateCount === 1 ? "" : "s"}`
+    : missingPlanForComplexWork
+      ? "Missing plan"
+      : "Optional";
+  const action = hasPlanTemplate
+    ? templateHuge
+      ? "Trim template"
+      : "Use /plan"
+    : missingPlanForComplexWork
+      ? "Add PLANS.md"
+      : "Use /plan";
+  const detail =
+    tone === "low"
+      ? hasPlanTemplate
+        ? `Planning surface looks ready: ${templateCount.toLocaleString()} template${templateCount === 1 ? "" : "s"} totaling ${formatBytesServer(templateBytes)}. Use /plan or the template before long ambiguous work.`
+        : "No reusable plan template was found, but sampled thread shape is not showing planning pressure. Use /plan when a task is complex or fuzzy."
+      : [
+          "The Codex manual recommends Plan mode for complex or ambiguous tasks and a PLANS.md template for longer multi-step work.",
+          hasPlanTemplate
+            ? `Refit found ${templateCount.toLocaleString()} planning template${templateCount === 1 ? "" : "s"} totaling ${formatBytesServer(templateBytes)}.`
+            : "Refit did not find a PLANS.md or .codex plan template for the current project.",
+          missingPlanForComplexWork
+            ? `${complexSignalCount.toLocaleString()} sampled task-shape signal${complexSignalCount === 1 ? "" : "s"} suggest planning would help before more implementation.`
+            : null,
+          templateHuge ? "The planning template set is large enough to become its own context load; keep it concise." : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    currentProjectPath: displayPath(projectPath),
+    hasPlanTemplate,
+    missingPlanTemplate,
+    missingPlanForComplexWork,
+    templateCount,
+    templateBytes,
+    templateLargeCount,
+    templateHuge,
+    complexSignalCount,
+    highChurnFileCount: taskClarity.highChurnFileCount || 0,
+    hasUsefulScripts,
+    files,
+  };
+}
+
+function buildPlanningTemplateSnippet(project) {
+  const projectPath = project?.path || "/path/to/project";
+  const verifyCommand = projectCommandLine(project, ["test", "lint", "typecheck", "build"], "Document the smallest useful verification command.");
+  return [
+    `# ${path.join(projectPath, "PLANS.md")}`,
+    "",
+    "## Codex Execution Plan Template",
+    "",
+    "Use this before long, fuzzy, or multi-step work. Start Codex in /plan when the goal is not yet sharp.",
+    "",
+    "### Goal",
+    "- What should change?",
+    "",
+    "### Context",
+    "- Important files, folders, docs, errors, screenshots, or constraints:",
+    "",
+    "### Approach",
+    "1. Gather only the context needed.",
+    "2. Make the smallest coherent change.",
+    "3. Verify the behavior.",
+    "",
+    "### Verification",
+    `- Run: \`${verifyCommand}\``,
+    "",
+    "### Done When",
+    "- The requested behavior is visible or covered by verification.",
+    "- The working tree contains only intentional changes.",
+  ].join("\n");
 }
 
 function buildProjectPlaybookSnippet(project) {
@@ -8741,9 +10234,17 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const webSearchLegacyKeyCount = Number(codexConfig?.webSearchLegacyKeyCount || webSearchLegacyKeys.length || 0);
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const shellStartup = codexConfig?.shellStartup || emptyShellStartupSummary();
+  const cliCompletion = codexConfig?.cliCompletion || emptyCliCompletionSummary();
+  const strictConfig = codexConfig?.strictConfig || emptyStrictConfigSummary();
+  const runtimeLaunch = runtime?.launch || buildCodexLaunchSummary(runtime);
+  const projectReadiness = codexConfig?.projectReadiness || {};
+  const currentProject = projectReadiness.currentProject;
+  const validationReadiness = codexConfig?.validationReadiness || emptyValidationReadinessSummary(currentProject);
+  const reviewLane = codexConfig?.reviewLane || emptyReviewLaneSummary(currentProject);
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const telemetry = codexConfig?.telemetry || buildTelemetrySummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const statusLine = codexConfig?.statusLine || buildStatusLineSummary({});
   const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = codexConfig?.storagePaths || {
     status: "ready",
@@ -8762,9 +10263,8 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const managedConfig = codexConfig?.managedConfig || emptyManagedConfigSummary();
   const commandRules = codexConfig?.commandRules || emptyCommandRuleSummary(codexConfig?.rulesFeature !== false);
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
+  const planEffort = codexConfig?.planEffort || buildPlanEffortSummary({}, codexConfig || {});
   const profileHealth = codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
-  const projectReadiness = codexConfig?.projectReadiness || {};
-  const currentProject = projectReadiness.currentProject;
   const currentLocalEnvironment = currentProject?.localEnvironment || null;
   const automation = codexConfig?.automation || emptyAutomationSummary(currentProject?.path || null);
   const cloudHandoff = codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
@@ -8776,9 +10276,13 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         (Object.keys(currentProject.scripts || {}).length && !currentLocalEnvironment?.hasActions)),
   );
   const authCache = codexConfig?.authCache || {};
+  const manualFreshness = codexConfig?.manualFreshness || emptyCodexManualFreshnessSummary();
   const modelProvider = codexConfig?.modelProvider || emptyModelProviderSummary();
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const permissionsProfile = codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
+  const chronicleLoad = scan?.categories?.chronicleLoad || emptyChronicleLoadSummary();
+  const planningReadiness = codexConfig?.planningReadiness || emptyPlanningReadinessSummary();
+  const goalReadiness = codexConfig?.goalReadiness || emptyGoalReadinessSummary();
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const processSummary = context.processSummary || {};
   const backgroundSummary = processSummary.background || {};
@@ -8849,6 +10353,99 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "/compact",
         "# Then continue with the four-line shape above or start a fresh thread for the next focused task.",
       ].join("\n"),
+    });
+  }
+
+  if (planningReadiness.status === "ready" && planningReadiness.tone !== "low") {
+    addFix({
+      id: "planning-readiness",
+      label: "Planning",
+      value: planningReadiness.label,
+      tone: planningReadiness.tone === "high" ? "high" : "medium",
+      action: planningReadiness.action,
+      detail:
+        "Codex gets faster when hard work starts with the right structure. Use /plan for fuzzy tasks and keep PLANS.md short enough to be useful context.",
+      snippet: buildPlanningTemplateSnippet(currentProject),
+    });
+  }
+
+  if (validationReadiness.status === "ready" && validationReadiness.tone !== "low") {
+    const projectPath = currentProject?.path || rootDir;
+    addFix({
+      id: "validation-loop",
+      label: "Validation Loop",
+      value: validationReadiness.label,
+      tone: validationReadiness.tone === "high" ? "high" : "medium",
+      action: validationReadiness.action,
+      detail:
+        "A clear test/check/review path helps Codex finish faster because it can prove the work instead of rediscovering project expectations.",
+      snippet: [
+        `# ${path.join(projectPath, "AGENTS.md")}`,
+        "## Verification",
+        "- Run the smallest relevant check first.",
+        currentProject?.hasPackageJson ? "- Build: npm run build" : "- Build: <document the project build command>",
+        currentProject?.hasTestScript ? "- Tests: npm test" : "- Tests: <document the focused test command>",
+        "- Review the diff for regressions before handing off.",
+        "",
+        "# Optional review guide:",
+        `# ${path.join(projectPath, "code_review.md")}`,
+        "- Correctness risks",
+        "- Missing tests",
+        "- User-facing behavior changes",
+      ].join("\n"),
+    });
+  }
+
+  if (reviewLane.status === "ready" && reviewLane.tone !== "low") {
+    addFix({
+      id: "review-lane",
+      label: "Review Lane",
+      value: reviewLane.label,
+      tone: reviewLane.tone === "high" ? "high" : "medium",
+      action: reviewLane.action,
+      detail:
+        "Codex /review reads a selected diff and reports prioritized findings without changing files. Run it before a big local diff becomes another slow correction loop.",
+      snippet: [
+        "# In Codex, review the current working tree without changing files:",
+        "/review",
+        "Review uncommitted changes",
+        "",
+        reviewLane.hasUpstream ? "# Or review against the upstream/base branch:" : "# Set an upstream first if base-branch review is unavailable:",
+        reviewLane.hasUpstream ? "Review against a base branch" : "git push -u origin HEAD",
+        "",
+        "# Optional ~/.codex/config.toml if you want review to use a specific model:",
+        '# review_model = "gpt-5.5"',
+        "",
+        "# Add durable review guidance when this repo has repeated review preferences:",
+        `# ${path.join(currentProject?.path || rootDir, "code_review.md")}`,
+      ].join("\n"),
+    });
+  }
+
+  if (goalReadiness.status === "ready" && goalReadiness.tone !== "low") {
+    addFix({
+      id: "goal-readiness",
+      label: "Goal Mode",
+      value: goalReadiness.label,
+      tone: goalReadiness.tone === "high" ? "high" : "medium",
+      action: goalReadiness.action,
+      detail:
+        "Goal Mode gives Codex a persistent objective and completion criteria for long work. Refit only reports goal-readiness counts, never transcript text.",
+      snippet: [
+        goalReadiness.missingFeatureForLongWork ? "# ~/.codex/config.toml" : null,
+        goalReadiness.missingFeatureForLongWork ? "[features]" : null,
+        goalReadiness.missingFeatureForLongWork ? "goals = true" : null,
+        goalReadiness.missingFeatureForLongWork ? "" : null,
+        goalReadiness.missingFeatureForLongWork ? "# Or run:" : null,
+        goalReadiness.missingFeatureForLongWork ? "codex features enable goals" : null,
+        goalReadiness.missingFeatureForLongWork ? "" : null,
+        "# In a long Codex task:",
+        "/goal",
+        "Goal: <the concrete outcome Codex should keep optimizing for>",
+        "Done when: <tests, benchmark, visual proof, or exact acceptance criteria>",
+      ]
+        .filter((line) => line !== null)
+        .join("\n"),
     });
   }
 
@@ -8948,6 +10545,30 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Optional external notifier. Keep it lightweight and user-level, not project-level:",
         '# notify = ["terminal-notifier", "-title", "Codex", "-message", "Turn complete"]',
+      ].join("\n"),
+    });
+  }
+
+  if (chronicleLoad.status === "ready" && chronicleLoad.tone !== "low") {
+    addFix({
+      id: "chronicle-load",
+      label: "Chronicle",
+      value: chronicleLoad.value,
+      tone: chronicleLoad.tone === "high" ? "high" : "medium",
+      action: chronicleLoad.action,
+      detail:
+        "Chronicle can recover recent screen context, but its background memory agents can consume rate limits quickly. Refit only reports the local cache and generated memory weight.",
+      snippet: [
+        "# Codex App: use the menu bar icon to Pause Chronicle before meetings, sensitive browsing, or rate-limit-heavy work.",
+        "",
+        "# Optional ~/.codex/config.toml guard for memory generation:",
+        "[memories]",
+        "min_rate_limit_remaining_percent = 25",
+        "disable_on_external_context = true",
+        "",
+        "# Review generated Chronicle memories before sharing CODEX_HOME:",
+        `find ${shellQuote(paths.chronicleMemories)} -type f 2>/dev/null | wc -l`,
+        `du -sh ${shellQuote(paths.chronicleMemories)} ${shellQuote(paths.chronicleScreenRecording)} 2>/dev/null`,
       ].join("\n"),
     });
   }
@@ -9458,6 +11079,48 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (cliCompletion.status === "ready" && cliCompletion.tone !== "low") {
+    addFix({
+      id: "cli-completion",
+      label: "CLI Completion",
+      value: cliCompletion.label,
+      tone: "medium",
+      action: cliCompletion.action,
+      detail:
+        "Codex can generate shell completions for bash, zsh, and fish. This does not change model latency, but it speeds up everyday CLI control and reduces command typos.",
+      snippet: [
+        "# Pick the line for your shell:",
+        'eval "$(codex completion zsh)"',
+        'eval "$(codex completion bash)"',
+        "codex completion fish > ~/.config/fish/completions/codex.fish",
+        "",
+        "# zsh only, if compdef is missing:",
+        "autoload -Uz compinit && compinit",
+      ].join("\n"),
+    });
+  }
+
+  if (strictConfig.status === "ready" && strictConfig.tone !== "low") {
+    addFix({
+      id: "strict-config",
+      label: "Strict Config",
+      value: strictConfig.label,
+      tone: strictConfig.tone === "high" ? "high" : "medium",
+      action: strictConfig.action,
+      detail:
+        "Codex strict-config mode catches unsupported or misspelled config keys. Fix this before trusting model, provider, shell, or speed-profile settings.",
+      snippet: [
+        "codex --strict-config --version",
+        "",
+        "# If it fails, fix or remove unsupported keys in:",
+        "# ~/.codex/config.toml",
+        "# <trusted-project>/.codex/config.toml",
+        "",
+        "# In an interactive Codex session, run /debug-config to inspect loaded config layers.",
+      ].join("\n"),
+    });
+  }
+
   if (contextBudgetSummary.status === "ready" && contextBudgetSummary.tone !== "low") {
     addFix({
       id: "context-budget",
@@ -9478,6 +11141,26 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# In long active threads, use:",
         "/compact",
+      ].join("\n"),
+    });
+  }
+
+  if (statusLine.status === "ready" && statusLine.tone !== "low") {
+    addFix({
+      id: "status-line",
+      label: "Status Line",
+      value: statusLine.label,
+      tone: statusLine.tone === "high" ? "high" : "medium",
+      action: statusLine.action,
+      detail:
+        "Codex can show model and remaining context in the footer. Keep those visible so slow-thread pressure is easier to notice before it becomes a long debugging loop.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        'status_line = ["model-with-reasoning", "context-remaining", "git-branch"]',
+        "",
+        "# In the CLI, /status shows the full thread ID, context usage, rate limits,",
+        "# approval policy, sandbox, writable roots, and active model.",
+        "/status",
       ].join("\n"),
     });
   }
@@ -9539,6 +11222,31 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (runtimeLaunch.tone !== "low") {
+    addFix({
+      id: "codex-launch-check",
+      label: "Codex Launch",
+      value: runtimeLaunch.label,
+      tone: runtimeLaunch.tone === "high" ? "high" : "medium",
+      action: runtimeLaunch.missing ? "Install Codex" : "Compare launch",
+      detail:
+        runtimeLaunch.detail ||
+        "Compare terminal and bundled app Codex launch time before changing deeper speed settings.",
+      snippet: [
+        "# Compare Codex binary launch without printing secrets.",
+        "which codex",
+        "time codex --version",
+        "",
+        "# Bundled app binary, if the macOS app is installed:",
+        `${runtime?.appCliPath || codexAppCli} --version`,
+        `time ${shellQuote(runtime?.appCliPath || codexAppCli)} --version`,
+        "",
+        "# Then inspect the redacted runtime report:",
+        "codex doctor --summary",
+      ].join("\n"),
+    });
+  }
+
   if (authCache.needsLoginCheck) {
     addFix({
       id: "auth-cache-check",
@@ -9549,6 +11257,27 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
       detail:
         "Codex caches login in auth.json or the OS keychain. If it keeps asking you to sign in, refresh the login cache and inspect the redacted doctor report.",
       snippet: buildAuthCacheSnippet(authCache),
+    });
+  }
+
+  if (manualFreshness.tone !== "low") {
+    addFix({
+      id: "codex-manual-freshness",
+      label: "Codex Manual",
+      value: manualFreshness.label,
+      tone: manualFreshness.tone === "high" ? "high" : "medium",
+      action: manualFreshness.action || "Refresh manual",
+      detail:
+        "Refit's docs-informed advice is only as good as the local Codex manual cache. Refresh it when network access is available, then rerun Speed Check.",
+      snippet: [
+        "# Refresh the official Codex manual cache used by Refit's docs-informed checks:",
+        "node ~/.codex/skills/.system/openai-docs/scripts/fetch-codex-manual.mjs",
+        "",
+        "# If your skill path differs, search for the helper:",
+        "find ~/.codex/skills -path '*/openai-docs/scripts/fetch-codex-manual.mjs' -print",
+        "",
+        "# Refit only reads cache metadata and the outline; it does not print manual contents.",
+      ].join("\n"),
     });
   }
 
@@ -9591,6 +11320,31 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
               "# Project .codex/config.toml cannot set provider/profile/telemetry keys;",
               "# move those settings to ~/.codex/config.toml.",
             ]),
+      ].join("\n"),
+    });
+  }
+
+  if (planEffort.status === "ready" && planEffort.tone !== "low") {
+    addFix({
+      id: "plan-effort",
+      label: "Plan Effort",
+      value: planEffort.label,
+      tone: planEffort.tone === "high" ? "high" : "medium",
+      action: planEffort.action,
+      detail:
+        "Plan mode can use a separate reasoning effort. Keep normal turns quick, then let /plan think harder when the task is fuzzy or high stakes.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        'model_reasoning_effort = "medium"',
+        'plan_mode_reasoning_effort = "high"',
+        "",
+        "# Optional quick-task profile:",
+        "# ~/.codex/speed.config.toml",
+        '# model = "gpt-5.4-mini"',
+        '# model_reasoning_effort = "low"',
+        '# model_verbosity = "low"',
+        "",
+        "# Use deep planning for ambiguous work; use a fast profile for tiny edits.",
       ].join("\n"),
     });
   }
@@ -9926,9 +11680,12 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const shellStartup = codexConfig?.shellStartup || emptyShellStartupSummary();
+  const cliCompletion = codexConfig?.cliCompletion || emptyCliCompletionSummary();
+  const strictConfig = codexConfig?.strictConfig || emptyStrictConfigSummary();
   const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const telemetry = codexConfig?.telemetry || buildTelemetrySummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const statusLine = codexConfig?.statusLine || buildStatusLineSummary({});
   const historyRetention = codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = codexConfig?.storagePaths || {
     status: "ready",
@@ -9975,10 +11732,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     Number(projectReadiness.missingLocalEnvironmentCount || 0);
   const currentLocalEnvironment = currentProject?.localEnvironment || null;
   const authCache = codexConfig?.authCache || {};
+  const manualFreshness = codexConfig?.manualFreshness || emptyCodexManualFreshnessSummary();
   const modelProvider = codexConfig?.modelProvider || emptyModelProviderSummary();
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
   const permissionsProfile = codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
+  const chronicleLoad = categories.chronicleLoad || emptyChronicleLoadSummary();
+  const planningReadiness = codexConfig?.planningReadiness || emptyPlanningReadinessSummary();
+  const goalReadiness = codexConfig?.goalReadiness || emptyGoalReadinessSummary();
+  const validationReadiness = codexConfig?.validationReadiness || emptyValidationReadinessSummary(currentProject);
+  const reviewLane = codexConfig?.reviewLane || emptyReviewLaneSummary(currentProject);
+  const planEffort = codexConfig?.planEffort || buildPlanEffortSummary({}, codexConfig || {});
+  const runtimeLaunch = runtime?.launch || buildCodexLaunchSummary(runtime);
   const skillCatalog = scan?.skillCatalog || {};
   const skillCatalogReady = skillCatalog.status === "ready";
   const skillCatalogLoaded = skillCatalogReady && skillCatalog.tone !== "low";
@@ -10021,7 +11786,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         ? `Memories are enabled, but Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`
         : `Memories are off in config. Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`;
   const docsSource =
-    "Official Codex manual: Speed, /status, Permissions, Cloud Threads, Remote Connections, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
+    "Official Codex manual: Speed, /status, Permissions, Cloud Threads, Remote Connections, Models, Config, AGENTS, MCP, Memories, Chronicle, Troubleshooting";
   const processReady = processSummary?.status === "ready";
   const processLoaded = processReady && processSummary.tone !== "low";
   const processCount = Number(processSummary?.processCount || 0);
@@ -10070,7 +11835,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const runtimeDetail = runtime?.versionMismatch
     ? `Terminal Codex is ${runtime.cliVersion}; the bundled app binary is ${runtime.appVersion}. The manual notes app and CLI versions can differ.`
     : runtime?.cliVersion || runtime?.appVersion
-      ? `Terminal Codex ${runtime.cliVersion || "not found"}; app binary ${runtime.appVersion || "not found"}.`
+      ? `Terminal Codex ${runtime.cliVersion || "not found"}; app binary ${runtime.appVersion || "not found"}. Launch probe: ${runtimeLaunch.label}.`
       : "Codex CLI was not found on PATH and the app binary was not detected.";
 
   const processDetail =
@@ -10165,6 +11930,22 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         "Codex Refit checks only credential-cache metadata. It does not inspect auth token contents.",
     },
     {
+      id: "codex-manual-freshness",
+      label: "Codex Manual",
+      value: manualFreshness.label,
+      tone: manualFreshness.tone,
+      action: manualFreshness.action,
+      priority:
+        manualFreshness.tone === "high"
+          ? 88
+          : manualFreshness.tone === "medium"
+            ? manualFreshness.veryStale || !manualFreshness.hasManual || !manualFreshness.hasOutline
+              ? 72
+              : 48
+            : 20,
+      detail: manualFreshness.detail,
+    },
+    {
       id: "model-provider",
       label: "Model Provider",
       value: modelProvider.label,
@@ -10242,6 +12023,22 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: managedConfig.detail,
     },
     {
+      id: "strict-config",
+      label: "Strict Config",
+      value: strictConfig.label,
+      tone: strictConfig.tone,
+      action: strictConfig.action,
+      priority:
+        strictConfig.tone === "high"
+          ? 93
+          : strictConfig.tone === "medium"
+            ? 68
+            : strictConfig.ok
+              ? 22
+              : 13,
+      detail: strictConfig.detail,
+    },
+    {
       id: "command-rules",
       label: "Command Rules",
       value: commandRules.label,
@@ -10287,6 +12084,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: shellStartup.detail,
     },
     {
+      id: "cli-completion",
+      label: "CLI Completion",
+      value: cliCompletion.label,
+      tone: cliCompletion.tone,
+      action: cliCompletion.action,
+      priority: cliCompletion.tone === "high" ? 74 : cliCompletion.tone === "medium" ? 49 : 12,
+      detail: cliCompletion.detail,
+    },
+    {
       id: "shell-environment",
       label: "Shell Env",
       value: shellEnvironmentSummary.label,
@@ -10323,6 +12129,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: contextBudgetSummary.detail,
     },
     {
+      id: "status-line",
+      label: "Status Line",
+      value: statusLine.label,
+      tone: statusLine.tone,
+      action: statusLine.action,
+      priority: statusLine.tone === "high" ? 82 : statusLine.tone === "medium" ? 58 : 18,
+      detail: statusLine.detail,
+    },
+    {
       id: "history-retention",
       label: "History Retention",
       value: historyRetention.label,
@@ -10357,6 +12172,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: responseShapeSummary.action,
       priority: responseShapeSummary.tone === "high" ? 82 : responseShapeSummary.tone === "medium" ? 62 : 20,
       detail: responseShapeSummary.detail,
+    },
+    {
+      id: "plan-effort",
+      label: "Plan Effort",
+      value: planEffort.label,
+      tone: planEffort.tone,
+      action: planEffort.action,
+      priority: planEffort.tone === "high" ? 84 : planEffort.tone === "medium" ? 64 : planEffort.planEffortConfigured ? 26 : 18,
+      detail: planEffort.detail,
     },
     {
       id: "network-sandbox",
@@ -10477,15 +12301,29 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: memoryDetail,
     },
     {
+      id: "chronicle-load",
+      label: "Chronicle",
+      value: chronicleLoad.value,
+      tone: chronicleLoad.tone,
+      action: chronicleLoad.action,
+      priority: chronicleLoad.tone === "high" ? 82 : chronicleLoad.tone === "medium" ? 60 : chronicleLoad.exists ? 26 : 16,
+      detail: chronicleLoad.detail,
+    },
+    {
       id: "goal-mode",
       label: "Goal Mode",
-      value: goalsFeature ? "On" : "Optional",
-      tone: goalsFeature ? "low" : "medium",
-      action: goalsFeature ? "Use for long work" : "Enable for long work",
-      priority: goalsFeature ? 20 : 52,
-      detail: goalsFeature
-        ? "Goal mode is enabled for persistent, multi-step objectives."
-        : "For long speed/refactor work, enable features.goals = true so Codex can keep a clear completion target.",
+      value: goalReadiness.label,
+      tone: goalReadiness.tone,
+      action: goalReadiness.action,
+      priority:
+        goalReadiness.tone === "high"
+          ? 86
+          : goalReadiness.tone === "medium"
+            ? 64
+            : goalsFeature
+              ? 20
+              : 28,
+      detail: goalReadiness.detail,
     },
     {
       id: "guidance",
@@ -10568,6 +12406,51 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: taskClarity.action,
       priority: taskClarity.tone === "high" ? 90 : taskClarity.tone === "medium" ? 72 : 21,
       detail: taskClarity.detail,
+    },
+    {
+      id: "planning-readiness",
+      label: "Planning",
+      value: planningReadiness.label,
+      tone: planningReadiness.tone,
+      action: planningReadiness.action,
+      priority: planningReadiness.tone === "high" ? 88 : planningReadiness.tone === "medium" ? 70 : planningReadiness.hasPlanTemplate ? 27 : 18,
+      detail: planningReadiness.detail,
+    },
+    {
+      id: "plan-effort",
+      label: "Plan Effort",
+      value: planEffort.label,
+      tone: planEffort.tone,
+      action: planEffort.action,
+      priority: planEffort.tone === "high" ? 85 : planEffort.tone === "medium" ? 63 : planEffort.planEffortConfigured ? 25 : 17,
+      detail: planEffort.detail,
+    },
+    {
+      id: "validation-readiness",
+      label: "Validation Loop",
+      value: validationReadiness.label,
+      tone: validationReadiness.tone,
+      action: validationReadiness.action,
+      priority: validationReadiness.tone === "high" ? 87 : validationReadiness.tone === "medium" ? 69 : 21,
+      detail: validationReadiness.detail,
+    },
+    {
+      id: "review-lane",
+      label: "Review Lane",
+      value: reviewLane.label,
+      tone: reviewLane.tone,
+      action: reviewLane.action,
+      priority:
+        reviewLane.tone === "high"
+          ? 86
+          : reviewLane.tone === "medium"
+            ? reviewLane.largeChangeSet
+              ? 70
+              : 58
+            : reviewLane.dirtyCount
+              ? 29
+              : 16,
+      detail: reviewLane.detail,
     },
     {
       id: "turn-telemetry",
@@ -10673,10 +12556,19 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       id: "runtime-version",
       label: "Codex Runtime",
       value: runtime?.versionMismatch ? "Mismatch" : runtime?.cliVersion || runtime?.appVersion || "Missing",
-      tone: runtime?.versionMismatch || runtime?.status === "missing" ? "medium" : "low",
-      action: runtime?.versionMismatch ? "Align versions" : "Keep current",
-      priority: runtime?.versionMismatch ? 88 : runtime?.status === "missing" ? 62 : 20,
+      tone: runtime?.versionMismatch || runtime?.status === "missing" ? "medium" : runtimeLaunch.tone === "high" ? "medium" : "low",
+      action: runtime?.versionMismatch ? "Align versions" : runtimeLaunch.tone !== "low" ? "Check launch" : "Keep current",
+      priority: runtime?.versionMismatch ? 88 : runtimeLaunch.tone === "high" ? 82 : runtime?.status === "missing" ? 62 : 20,
       detail: runtimeDetail,
+    },
+    {
+      id: "codex-launch",
+      label: "Launch Probe",
+      value: runtimeLaunch.label,
+      tone: runtimeLaunch.tone,
+      action: runtimeLaunch.action,
+      priority: runtimeLaunch.tone === "high" ? 83 : runtimeLaunch.tone === "medium" ? 57 : 16,
+      detail: runtimeLaunch.detail,
     },
     {
       id: "thread-ceiling",
@@ -10758,6 +12650,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (runtimeLaunch.tone !== "low" && !runtime?.versionMismatch) {
+    addRecommendation({
+      id: "codex-launch-latency",
+      label: "Codex Launch",
+      value: runtimeLaunch.label,
+      action: runtimeLaunch.action,
+      tone: runtimeLaunch.tone === "high" ? "high" : "medium",
+      priority: runtimeLaunch.tone === "high" ? 91 : 63,
+      detail: runtimeLaunch.detail,
+    });
+  }
+
   if (authCache.needsLoginCheck) {
     addRecommendation({
       id: "auth-cache-check",
@@ -10768,6 +12672,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       priority: 92,
       detail:
         "Codex should reuse cached login details. If the cache is missing or empty, repeated sign-in prompts can make every run feel slower.",
+    });
+  }
+
+  if (manualFreshness.tone !== "low") {
+    addRecommendation({
+      id: "codex-manual-freshness",
+      label: "Codex Manual",
+      value: manualFreshness.label,
+      action: manualFreshness.action || "Refresh manual",
+      tone: manualFreshness.tone === "high" ? "high" : "medium",
+      priority: manualFreshness.veryStale || !manualFreshness.hasManual || !manualFreshness.hasOutline ? 74 : 46,
+      detail:
+        manualFreshness.stale || !manualFreshness.hasManual
+          ? `${manualFreshness.detail} Refresh the manual cache before trusting new Codex performance advice.`
+          : manualFreshness.detail,
     });
   }
 
@@ -10807,6 +12726,75 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: taskClarity.tone === "high" ? "high" : "medium",
       priority: taskClarity.tone === "high" ? 88 : 67,
       detail: taskClarity.detail,
+    });
+  }
+
+  if (goalReadiness.status === "ready" && goalReadiness.tone !== "low") {
+    addRecommendation({
+      id: "goal-readiness",
+      label: "Goal Mode",
+      value: goalReadiness.label,
+      action: goalReadiness.action,
+      tone: goalReadiness.tone === "high" ? "high" : "medium",
+      priority: goalReadiness.tone === "high" ? 86 : 65,
+      detail: `${goalReadiness.detail} Use /goal before adding more context to sprawling work.`,
+    });
+  }
+
+  if (planningReadiness.status === "ready" && planningReadiness.tone !== "low") {
+    addRecommendation({
+      id: "planning-readiness",
+      label: "Planning",
+      value: planningReadiness.label,
+      action: planningReadiness.action,
+      tone: planningReadiness.tone === "high" ? "high" : "medium",
+      priority: planningReadiness.tone === "high" ? 87 : 66,
+      detail:
+        planningReadiness.missingPlanForComplexWork
+          ? `${planningReadiness.detail} Start the next fuzzy task with /plan or add a compact PLANS.md template.`
+          : planningReadiness.detail,
+    });
+  }
+
+  if (planEffort.status === "ready" && planEffort.tone !== "low") {
+    addRecommendation({
+      id: "plan-effort",
+      label: "Plan Effort",
+      value: planEffort.label,
+      action: planEffort.action,
+      tone: planEffort.tone === "high" ? "high" : "medium",
+      priority: planEffort.tone === "high" ? 83 : 64,
+      detail: `${planEffort.detail} Keep deep thinking in /plan and keep ordinary turns/profile runs lighter.`,
+    });
+  }
+
+  if (validationReadiness.status === "ready" && validationReadiness.tone !== "low") {
+    addRecommendation({
+      id: "validation-readiness",
+      label: "Validation Loop",
+      value: validationReadiness.label,
+      action: validationReadiness.action,
+      tone: validationReadiness.tone === "high" ? "high" : "medium",
+      priority: validationReadiness.tone === "high" ? 90 : 71,
+      detail:
+        validationReadiness.missingValidationCommand || validationReadiness.missingVerificationGuidance
+          ? `${validationReadiness.detail} Add the proof path before asking Codex to do more implementation.`
+          : validationReadiness.detail,
+    });
+  }
+
+  if (reviewLane.status === "ready" && reviewLane.tone !== "low") {
+    addRecommendation({
+      id: "review-lane",
+      label: "Review Lane",
+      value: reviewLane.label,
+      action: reviewLane.action,
+      tone: reviewLane.tone === "high" ? "high" : "medium",
+      priority: reviewLane.conflictedCount ? 89 : reviewLane.largeChangeSet ? 78 : 57,
+      detail:
+        reviewLane.largeChangeSet || reviewLane.unreviewedDirtyWork
+          ? `${reviewLane.detail} Run /review before committing or handing this work off.`
+          : reviewLane.detail,
     });
   }
 
@@ -10930,6 +12918,30 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         shellStartup.tone === "high"
           ? `${shellStartup.detail} Fix shell startup before judging database cleanup results.`
           : shellStartup.detail,
+    });
+  }
+
+  if (cliCompletion.status === "ready" && cliCompletion.tone !== "low") {
+    addRecommendation({
+      id: "cli-completion",
+      label: "CLI Completion",
+      value: cliCompletion.label,
+      action: cliCompletion.action,
+      tone: "medium",
+      priority: 47,
+      detail: `${cliCompletion.detail} This is a small quality-of-life speed win for terminal-heavy Codex use.`,
+    });
+  }
+
+  if (strictConfig.status === "ready" && strictConfig.tone !== "low") {
+    addRecommendation({
+      id: "strict-config",
+      label: "Strict Config",
+      value: strictConfig.label,
+      action: strictConfig.action,
+      tone: strictConfig.tone === "high" ? "high" : "medium",
+      priority: strictConfig.tone === "high" ? 91 : 63,
+      detail: `${strictConfig.detail} Run this before changing speed settings again.`,
     });
   }
 
@@ -11223,6 +13235,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (statusLine.status === "ready" && statusLine.tone !== "low") {
+    addRecommendation({
+      id: "status-line",
+      label: "Status Line",
+      value: statusLine.label,
+      action: statusLine.action,
+      tone: statusLine.tone === "high" ? "high" : "medium",
+      priority: statusLine.tone === "high" ? 79 : 54,
+      detail:
+        statusLine.hidden || statusLine.missingContext
+          ? `${statusLine.detail} Restore model and context visibility before chasing local cleanup again.`
+          : statusLine.detail,
+    });
+  }
+
   if (responseShapeSummary.status === "ready" && responseShapeSummary.tone !== "low") {
     addRecommendation({
       id: "response-shape",
@@ -11422,6 +13449,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (chronicleLoad.status === "ready" && chronicleLoad.tone !== "low") {
+    addRecommendation({
+      id: "chronicle-load",
+      label: "Chronicle",
+      value: chronicleLoad.value,
+      action: chronicleLoad.action,
+      tone: chronicleLoad.tone === "high" ? "high" : "medium",
+      priority: chronicleLoad.tone === "high" ? 81 : 59,
+      detail:
+        chronicleLoad.likelyRunning || chronicleLoad.screenCaptureFiles
+          ? `${chronicleLoad.detail} Pause Chronicle from the Codex menu bar before sensitive or rate-limit-heavy sessions.`
+          : chronicleLoad.detail,
+    });
+  }
+
   if (memoryTone === "medium") {
     addRecommendation({
       id: "memory-context",
@@ -11435,7 +13477,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
-  if (!goalsFeature) {
+  if (!goalsFeature && goalReadiness.tone === "low") {
     addRecommendation({
       id: "enable-goals",
       label: "Long Work",
@@ -11482,6 +13524,8 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const headline =
     processSummary?.tone === "high"
       ? `Codex has ${processCount.toLocaleString()} live helper processes using ${formatBytesServer(processRssBytes)}.`
+      : runtimeLaunch.tone === "high"
+      ? `Codex launch probe is ${runtimeLaunch.label}; fix binary startup before deeper tuning.`
       : runtime?.versionMismatch
       ? `Codex versions differ: CLI ${runtime.cliVersion}, app ${runtime.appVersion}.`
       : activeReliefBytes > 1024 ** 3
@@ -11506,6 +13550,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellSnapshot,
     shellEnvironmentSummary,
     shellStartup,
+    strictConfig,
     notificationFlow,
     telemetry,
     contextBudgetSummary,
@@ -11533,6 +13578,12 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     memoriesMinRateLimitRemainingPercent: codexConfig?.memoriesMinRateLimitRemainingPercent ?? null,
     memoriesExtractModel: codexConfig?.memoriesExtractModel ?? null,
     memoriesConsolidationModel: codexConfig?.memoriesConsolidationModel ?? null,
+    chronicleLoad,
+    goalReadiness,
+    planningReadiness,
+    planEffort,
+    validationReadiness,
+    reviewLane,
     maxConcurrentThreadsPerSession: codexConfig?.maxConcurrentThreadsPerSession || null,
     agentMaxThreads: codexConfig?.agentMaxThreads ?? null,
     agentMaxThreadsEffective: agentMaxThreads,
@@ -11544,6 +13595,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     managedConfig,
     commandRules,
     authCache,
+    manualFreshness,
     projectReadiness,
     automation,
     cloudHandoff,
@@ -11636,6 +13688,12 @@ function addHotspots(scan) {
     categories.memoryState.bytes
       ? `${formatBytesServer(categories.memoryState.bytes)} of local recall context to review before sharing.`
       : "No local memory files found.",
+  ];
+  categories.chronicleLoad.hotspots = [
+    `${categories.chronicleLoad.screenCaptureFiles.toLocaleString()} temporary screen-capture file${categories.chronicleLoad.screenCaptureFiles === 1 ? "" : "s"}`,
+    categories.chronicleLoad.memoryFiles
+      ? `${categories.chronicleLoad.memoryFiles.toLocaleString()} generated Chronicle memor${categories.chronicleLoad.memoryFiles === 1 ? "y" : "ies"} (${formatBytesServer(categories.chronicleLoad.memoryBytes)}).`
+      : "No generated Chronicle memories found.",
   ];
   categories.logs.hotspots = [
     `${logs.fileCount.toLocaleString()} SQLite files`,
@@ -11796,6 +13854,8 @@ export async function scanCodex(options = {}) {
     generatedImagesArchive,
     codexWorktrees,
     memoryState,
+    chronicleScreenCapture,
+    chronicleMemory,
     crashDumps,
     browserCaches,
     archivedStillInSessions,
@@ -11830,6 +13890,17 @@ export async function scanCodex(options = {}) {
       largestLimit: 8,
       largestPredicate: (filePath) => /\.(md|json|jsonl|txt)$/i.test(filePath),
     }),
+    summarizeDirectory(paths.chronicleScreenRecording, {
+      label: "Chronicle Screen Cache",
+      risk: "scan",
+      largestLimit: 8,
+    }),
+    summarizeDirectory(paths.chronicleMemories, {
+      label: "Chronicle Memories",
+      risk: "scan",
+      largestLimit: 8,
+      largestPredicate: (filePath) => /\.(md|json|jsonl|txt)$/i.test(filePath),
+    }),
     summarizeMany(crashDirs(), {
       label: "Crash Dumps",
       pathLabel: "Crashpad pending/completed",
@@ -11859,6 +13930,13 @@ export async function scanCodex(options = {}) {
   const codexHomeBytes = await duBytes(paths.codexHome);
   const codexChromiumBytes = await duBytes(paths.chromiumCodex);
   const desktopCodexBytes = await duBytes(paths.desktopCodex);
+  const chronicleLoad = buildChronicleLoadSummary({
+    screenCapture: chronicleScreenCapture,
+    memory: chronicleMemory,
+    codexConfig,
+  });
+  codexConfig.planningReadiness = await getPlanningReadinessSummary(codexConfig.projectReadiness?.currentProject, taskClarity);
+  codexConfig.goalReadiness = buildGoalReadinessSummary(taskClarity, codexConfig);
 
   const categories = {
     codexHome: {
@@ -11905,6 +13983,7 @@ export async function scanCodex(options = {}) {
     generatedImagesArchive,
     codexWorktrees,
     memoryState,
+    chronicleLoad,
     logs,
     crashDumps,
     browserCaches,
@@ -11920,6 +13999,7 @@ export async function scanCodex(options = {}) {
     ...activeSessions.largest.map((file) => ({ ...file, bucket: "Active sessions" })),
     ...archivedSessions.largest.map((file) => ({ ...file, bucket: "Archived sessions" })),
     ...maintenanceArchive.largest.map((file) => ({ ...file, bucket: "Old Refit backups" })),
+    ...chronicleLoad.largest.map((file) => ({ ...file, bucket: "Chronicle load" })),
     ...archivedStillInSessions.largest,
   ].sort((a, b) => b.bytes - a.bytes);
   const seenLargestPaths = new Set();
@@ -12012,6 +14092,19 @@ function localScoreBreakdown(metrics) {
       detail: "OpenTelemetry export, prompt logging, secret-like headers, and ignored project telemetry config.",
     },
     {
+      id: "status-line",
+      label: "Status Line",
+      points: Math.min(
+        5,
+        Number(metrics.statusLineHidden || 0) * 3 +
+          Number(metrics.statusLineMissingContext || 0) * 1.6 +
+          Number(metrics.statusLineMissingModel || 0) * 1 +
+          Number(metrics.statusLineDense || 0) * 0.7,
+      ),
+      value: metrics.statusLineLabel || "Default",
+      detail: "Codex footer visibility for model, remaining context, and fast thread triage.",
+    },
+    {
       id: "codex-automation",
       label: "Automation",
       points: Math.min(
@@ -12067,6 +14160,41 @@ function localScoreBreakdown(metrics) {
       detail: "No-op non-interactive shell startup timing for repeated Codex command execution.",
     },
     {
+      id: "cli-completion",
+      label: "CLI Completion",
+      points: Math.min(
+        3,
+        Number(metrics.cliCompletionCliFound && !metrics.cliCompletionFound) * 1.8 +
+          Number(metrics.cliCompletionZshCompinitMissing || 0) * 1,
+      ),
+      value: metrics.cliCompletionLabel || "Not checked",
+      detail: "Codex shell completion setup for faster everyday CLI control.",
+    },
+    {
+      id: "strict-config",
+      label: "Strict Config",
+      points: Math.min(
+        5,
+        Number(metrics.strictConfigFailed || 0) * 4 +
+          Number(metrics.strictConfigTimedOut || 0) * 2,
+      ),
+      value: metrics.strictConfigLabel || "Not checked",
+      detail: "Official Codex --strict-config validation for unsupported config keys.",
+    },
+    {
+      id: "codex-launch",
+      label: "Codex Launch",
+      points: Math.min(
+        5,
+        Math.max(0, Number(metrics.runtimeMaxLaunchMs || 0) - codexLaunchMediumMs) / 450 +
+          Number(metrics.runtimeLaunchTimedOut || 0) * 3 +
+          Number(metrics.runtimeLaunchFailed || 0) * 2 +
+          Number(metrics.runtimeLaunchMissing || 0) * 2,
+      ),
+      value: metrics.runtimeLaunchLabel || "Not measured",
+      detail: "Elapsed time for terminal/app Codex --version launch probes.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -12090,6 +14218,86 @@ function localScoreBreakdown(metrics) {
       ),
       value: `${Number(metrics.taskClarityUserTurnCount || 0).toLocaleString()} turn${metrics.taskClarityUserTurnCount === 1 ? "" : "s"}`,
       detail: "Sampled active-thread shape: goal, context, constraints, done-when, verification, and churn markers.",
+    },
+    {
+      id: "planning-readiness",
+      label: "Planning",
+      points: Math.min(
+        5,
+        Number(metrics.planningMissingForComplexWork || 0) * 2.8 +
+          Number(metrics.planningTemplateHuge || 0) * 1.4 +
+          Math.max(0, Number(metrics.planningTemplateBytes || 0) - 24 * 1024) / 8192 +
+          Math.max(0, Number(metrics.planningComplexSignalCount || 0) - 3) * 0.25,
+      ),
+      value: metrics.planningLabel || "Optional",
+      detail: "Current-project plan template readiness for long or ambiguous Codex work.",
+    },
+    {
+      id: "plan-effort",
+      label: "Plan Effort",
+      points: Math.min(
+        4,
+        Number(metrics.planEffortSmallTaskDragRisk || 0) * 1.4 +
+          Number(metrics.planEffortFlatHigh || 0) * 1.1 +
+          Number(metrics.planEffortDefaultXHigh || 0) * 1 +
+          Number(metrics.planEffortPlanXHigh || 0) * 0.8 +
+          Number(metrics.planEffortFlatLow || 0) * 0.9 +
+          Number(metrics.planEffortPlanLow || 0) * 0.8,
+      ),
+      value: metrics.planEffortLabel || "Default",
+      detail: "Separate plan-mode reasoning from everyday turns so hard planning stays smart without slowing small tasks.",
+    },
+    {
+      id: "validation-readiness",
+      label: "Validation Loop",
+      points: Math.min(
+        5,
+        Number(metrics.validationMissingCommand || 0) * 2.2 +
+          Number(metrics.validationMissingGuidance || 0) * 1.5 +
+          Number(metrics.validationMissingReviewGuidance || 0) * 0.9,
+      ),
+      value: metrics.validationLabel || "Optional",
+      detail: "Current-project test/check/review readiness for fast Codex proof loops.",
+    },
+    {
+      id: "review-lane",
+      label: "Review Lane",
+      points: Math.min(
+        5,
+        Number(metrics.reviewLaneConflictedCount || 0) * 2.5 +
+          Number(metrics.reviewLaneUnreviewedDirtyWork || 0) * 1.6 +
+          Number(metrics.reviewLaneLargeChangeSet || 0) * 1.4 +
+          Number(metrics.reviewLaneMissingBaseForReview || 0) * 0.8 +
+          Math.max(0, Number(metrics.reviewLaneDiffLineChangeCount || 0) - 800) / 700,
+      ),
+      value: metrics.reviewLaneLabel || "Clean",
+      detail: "Local diff size, review guidance, review_model, and /review readiness for the current project.",
+    },
+    {
+      id: "manual-freshness",
+      label: "Codex Manual",
+      points: Math.min(
+        3,
+        Number(!metrics.manualHasCache) * 2.4 +
+          Number(metrics.manualHasCache && !metrics.manualHasOutline) * 1.2 +
+          Number(metrics.manualVeryStale || 0) * 1.6 +
+          Number(metrics.manualStale && !metrics.manualVeryStale) * 0.8 +
+          Math.max(0, Number(metrics.manualMissingTopicCount || 0) - 2) * 0.2,
+      ),
+      value: metrics.manualFreshnessLabel || "No manual",
+      detail: "Local Codex manual cache freshness and outline coverage for docs-informed speed advice.",
+    },
+    {
+      id: "goal-readiness",
+      label: "Goal Mode",
+      points: Math.min(
+        5,
+        Number(metrics.goalMissingFeatureForLongWork || 0) * 2.4 +
+          Number(metrics.goalMissingExplicitForLongWork || 0) * 1.2 +
+          Number(metrics.goalMissingCompletionCriteria || 0) * 1.3,
+      ),
+      value: metrics.goalReadinessLabel || "Optional",
+      detail: "Goal Mode feature and explicit /goal readiness for long active work.",
     },
     {
       id: "turn-telemetry",
@@ -12136,6 +14344,21 @@ function localScoreBreakdown(metrics) {
       ),
       value: metrics.permissionsProfileLabel || "Default",
       detail: "Configured default_permissions profile, workspace roots, filesystem deny rules, and scoped profile network settings.",
+    },
+    {
+      id: "chronicle-load",
+      label: "Chronicle",
+      points: Math.min(
+        6,
+        gb(metrics.chronicleScreenCaptureBytes) * 1.8 +
+          Math.max(0, Number(metrics.chronicleScreenCaptureFiles || 0) - 50) * 0.006 +
+          ((Number(metrics.chronicleMemoryBytes || 0) / 1024 ** 2) || 0) * 0.06 +
+          Math.max(0, Number(metrics.chronicleMemoryFiles || 0) - 50) * 0.01 +
+          Number(metrics.chronicleLikelyRunning || 0) * 1.2 +
+          Number(metrics.chronicleRateLimitGuardLow || 0) * 0.8,
+      ),
+      value: metrics.chronicleValue || "Quiet",
+      detail: "Chronicle temporary screen-capture cache, generated Chronicle memories, and memory-generation rate-limit guard.",
     },
     {
       id: "log-wal",
@@ -12233,6 +14456,29 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(7, Number(metrics.taskClarityHighChurnFileCount || 0) * 1.5);
   score -= Math.min(4, Number(metrics.taskClarityMissingDoneMarkerFileCount || 0) * 0.6);
   score -= Math.min(4, Number(metrics.taskClarityMissingVerificationMarkerFileCount || 0) * 0.7);
+  if (metrics.planningMissingForComplexWork) score -= 2.5;
+  if (metrics.planningTemplateHuge) score -= 1.5;
+  score -= Math.min(3, Math.max(0, Number(metrics.planningTemplateBytes || 0) - 24 * 1024) / 8192);
+  if (metrics.planEffortSmallTaskDragRisk) score -= 1.5;
+  if (metrics.planEffortFlatHigh) score -= 1;
+  if (metrics.planEffortDefaultXHigh) score -= 1;
+  if (metrics.planEffortPlanXHigh) score -= 0.7;
+  if (metrics.planEffortFlatLow || metrics.planEffortPlanLow) score -= 0.8;
+  if (metrics.validationMissingCommand) score -= 2;
+  if (metrics.validationMissingGuidance) score -= 1.4;
+  if (metrics.validationMissingReviewGuidance) score -= 0.8;
+  if (metrics.reviewLaneConflictedCount) score -= Math.min(5, Number(metrics.reviewLaneConflictedCount || 0) * 2.5);
+  if (metrics.reviewLaneUnreviewedDirtyWork) score -= 1.2;
+  if (metrics.reviewLaneLargeChangeSet) score -= metrics.reviewLaneHasReviewGuidance ? 1 : 2;
+  if (metrics.reviewLaneMissingBaseForReview) score -= 0.8;
+  if (!metrics.manualHasCache) score -= 1.5;
+  else if (!metrics.manualHasOutline) score -= 0.8;
+  if (metrics.manualVeryStale) score -= 1;
+  else if (metrics.manualStale) score -= 0.4;
+  score -= Math.min(1, Math.max(0, Number(metrics.manualMissingTopicCount || 0) - 4) * 0.2);
+  if (metrics.goalMissingFeatureForLongWork) score -= 2;
+  if (metrics.goalMissingExplicitForLongWork) score -= 1;
+  if (metrics.goalMissingCompletionCriteria) score -= 1;
   score -= Math.min(6, Number(metrics.turnTelemetrySlowTurnCount || 0) * 1.1 + Number(metrics.turnTelemetryVerySlowTurnCount || 0) * 2);
   score -= Math.min(5, Number(metrics.turnTelemetrySlowFirstTokenCount || 0) * 0.9 + Number(metrics.turnTelemetryVerySlowFirstTokenCount || 0) * 1.5);
   score -= Math.min(5, Number(metrics.turnTelemetryLowRateLimitCount || 0) * 1.4 + Number(metrics.turnTelemetryRateLimitReachedCount || 0) * 2);
@@ -12253,6 +14499,12 @@ function benchmarkLiveScore(metrics) {
   if (!metrics.shellEnvTightPolicy) score -= Math.min(5, Math.max(0, Number(metrics.shellEnvVarCount || 0) - 80) * 0.035);
   if (!metrics.shellEnvTightPolicy) score -= Math.min(4, Number(metrics.shellEnvSecretLikeNameCount || 0) * 0.35);
   if (metrics.shellEnvMissingPath) score -= 6;
+  if (metrics.cliCompletionCliFound && !metrics.cliCompletionFound) score -= 1.2;
+  if (metrics.cliCompletionZshCompinitMissing) score -= 0.8;
+  if (metrics.strictConfigFailed) score -= metrics.strictConfigTimedOut ? 1.5 : 3;
+  score -= Math.min(5, Math.max(0, Number(metrics.runtimeMaxLaunchMs || 0) - codexLaunchMediumMs) / 500);
+  if (metrics.runtimeLaunchTimedOut) score -= 3;
+  if (metrics.runtimeLaunchFailed) score -= 2;
   score -= Math.min(6, Math.max(0, Number(metrics.toolOutputTokenLimit || 12000) - 12000) / 4000);
   if (metrics.responseHighVerbosity) score -= 2;
   if (metrics.responseDetailedSummary) score -= 1;
@@ -12270,6 +14522,10 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(3, Math.max(0, Number(metrics.customPromptCount || 0) - 5) * 0.35);
   score -= Math.min(3, Math.max(0, Number(metrics.customPromptBytes || 0) - 24 * 1024) / 8192);
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
+  if (metrics.chronicleLikelyRunning) score -= 2;
+  score -= Math.min(4, ((Number(metrics.chronicleScreenCaptureBytes || 0) / 1024 ** 3) || 0) * 2);
+  score -= Math.min(3, ((Number(metrics.chronicleMemoryBytes || 0) / 1024 ** 2) || 0) / 12);
+  if (metrics.chronicleRateLimitGuardLow) score -= 1;
   score -= Math.min(5, Math.max(0, Number(metrics.skillEstimatedCatalogChars || 0) - skillCatalogBudgetChars) / 4000);
   score -= Math.min(4, Math.max(0, Number(metrics.skillCount || 0) - 40) * 0.08);
   if (metrics.skillCatalogTruncated) score -= 2;
@@ -12293,6 +14549,12 @@ function benchmarkLiveScore(metrics) {
   if (metrics.telemetryLogUserPrompt) score -= 2;
   if (metrics.telemetryHeaderSecretLike) score -= 1;
   if (metrics.telemetryProjectIgnored) score -= 2;
+  if (metrics.statusLineHidden) score -= 3;
+  else {
+    if (metrics.statusLineMissingContext) score -= 1.5;
+    if (metrics.statusLineMissingModel) score -= 1;
+    if (metrics.statusLineDense) score -= 0.5;
+  }
   if (metrics.automationDirectApiKeyRisk) score -= Math.min(4, Number(metrics.automationDirectApiKeyRisk || 0) * 3);
   if (metrics.automationDangerFullAccessCount) score -= Math.min(4, Number(metrics.automationDangerFullAccessCount || 0) * 2);
   if (metrics.automationDeprecatedFullAutoCount) score -= Math.min(3, Number(metrics.automationDeprecatedFullAutoCount || 0) * 2);
@@ -12381,6 +14643,54 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Name the verification step in new prompts; ${Number(metrics.taskClarityMissingVerificationMarkerFileCount).toLocaleString()} sampled active thread${metrics.taskClarityMissingVerificationMarkerFileCount === 1 ? "" : "s"} lacked test/build/benchmark markers.`,
     );
+  }
+  if (metrics.planningMissingForComplexWork) {
+    guidance.push("Add a concise PLANS.md template or start fuzzy work with /plan before implementation; sampled active threads show planning pressure.");
+  } else if (metrics.planningTemplateHuge) {
+    guidance.push(`Trim planning templates; ${formatBytesServer(metrics.planningTemplateBytes)} of PLANS.md-style guidance can become its own context load.`);
+  } else if (metrics.planningHasTemplate && metrics.taskClarityHighChurnFileCount > 0) {
+    guidance.push("Use the existing planning template with /plan before adding more context to high-churn work.");
+  }
+  if (metrics.planEffortSmallTaskDragRisk || metrics.planEffortFlatHigh) {
+    guidance.push("Set plan_mode_reasoning_effort = high and keep normal reasoning or a speed profile lighter so quick Codex turns do not inherit deep-work settings.");
+  } else if (metrics.planEffortFlatLow || metrics.planEffortPlanLow) {
+    guidance.push("Raise plan_mode_reasoning_effort to high for fuzzy work, then keep normal turns lower for speed.");
+  } else if (metrics.planEffortPlanXHigh) {
+    guidance.push("Review plan_mode_reasoning_effort = xhigh; high usually gives a better planning/speed balance.");
+  }
+  if (metrics.validationMissingCommand) {
+    guidance.push("Add or document a focused test/build/lint command so Codex can prove changes without rediscovering the project.");
+  } else if (metrics.validationMissingGuidance) {
+    guidance.push("Add verification notes to AGENTS.md so Codex knows which check proves normal changes.");
+  } else if (metrics.validationMissingReviewGuidance) {
+    guidance.push("Add lightweight review guidance such as code_review.md or PR expectations so Codex can review diffs consistently.");
+  }
+  if (metrics.reviewLaneConflictedCount > 0) {
+    guidance.push(`Resolve ${Number(metrics.reviewLaneConflictedCount).toLocaleString()} conflicted Git file${metrics.reviewLaneConflictedCount === 1 ? "" : "s"} before running /review.`);
+  } else if (metrics.reviewLaneLargeChangeSet) {
+    guidance.push(
+      `Run /review before committing this larger local diff: ${Number(metrics.reviewLaneDirtyCount).toLocaleString()} changed file${metrics.reviewLaneDirtyCount === 1 ? "" : "s"} with ${Number(metrics.reviewLaneDiffLineChangeCount).toLocaleString()} tracked line change${metrics.reviewLaneDiffLineChangeCount === 1 ? "" : "s"}.`,
+    );
+  } else if (metrics.reviewLaneUnreviewedDirtyWork) {
+    guidance.push("Add lightweight review guidance or run /review on uncommitted changes so Codex catches regressions before another implementation pass.");
+  } else if (metrics.reviewLaneDirtyCount > 0 && metrics.reviewLaneReviewRecommended) {
+    guidance.push("Run /review on the current uncommitted changes before committing or handing the work to cloud.");
+  }
+  if (!metrics.manualHasCache) {
+    guidance.push("Refresh the local Codex manual cache before trusting new Refit speed advice; the manual cache is missing.");
+  } else if (!metrics.manualHasOutline) {
+    guidance.push("Refresh the Codex manual outline so Refit can confirm the sections behind its docs-informed checks.");
+  } else if (metrics.manualVeryStale) {
+    guidance.push(`Refresh the Codex manual cache; the local copy is about ${Number(metrics.manualAgeDays || 0).toFixed(0)} days old.`);
+  } else if (metrics.manualStale) {
+    guidance.push("Refresh the Codex manual cache soon so Refit's Doctor advice tracks current Codex behavior.");
+  }
+  if (metrics.goalMissingFeatureForLongWork) {
+    guidance.push("Enable Goal Mode with features.goals = true, then use /goal for long work so Codex keeps completion criteria visible.");
+  } else if (metrics.goalMissingCompletionCriteria) {
+    guidance.push("Set a /goal or add done-when criteria before adding more context to long active work.");
+  } else if (metrics.goalMissingExplicitForLongWork) {
+    guidance.push("Use /goal on high-churn work so Codex can keep a persistent objective across compaction and follow-up turns.");
   }
   if (metrics.turnTelemetryLowRateLimitCount > 0 || metrics.turnTelemetryRateLimitReachedCount > 0) {
     guidance.push(
@@ -12549,6 +14859,15 @@ function benchmarkGuidance(metrics) {
   if (metrics.memoriesUseMemories && metrics.memoryBytes > 10 * 1024 ** 2) {
     guidance.push(`Review ${formatBytesServer(metrics.memoryBytes)} of local memories if Codex starts carrying stale assumptions.`);
   }
+  if (metrics.chronicleLikelyRunning) {
+    guidance.push("Chronicle appears active. Pause it from the Codex menu bar before rate-limit-heavy work, meetings, or sensitive browsing.");
+  } else if (metrics.chronicleScreenCaptureBytes > 128 * 1024 ** 2) {
+    guidance.push(`Review Chronicle's temporary screen cache; Refit found ${formatBytesServer(metrics.chronicleScreenCaptureBytes)} under $TMPDIR/chronicle.`);
+  } else if (metrics.chronicleMemoryBytes > 10 * 1024 ** 2 || metrics.chronicleMemoryFiles >= 100) {
+    guidance.push(`Review generated Chronicle memories; ${formatBytesServer(metrics.chronicleMemoryBytes)} can become hidden context in future sessions.`);
+  } else if (metrics.chronicleRateLimitGuardLow) {
+    guidance.push("Raise memories.min_rate_limit_remaining_percent if memory generation should stop before Codex gets close to a rate limit.");
+  }
   if (metrics.skillCatalogTruncated) {
     guidance.push("Review installed skills with /skills; Refit hit its skill scan cap, so the local/plugin skill catalog may be oversized.");
   } else if (metrics.skillEstimatedCatalogChars >= skillCatalogBudgetChars) {
@@ -12627,6 +14946,15 @@ function benchmarkGuidance(metrics) {
   } else if (metrics.telemetryEnvironmentConfigured) {
     guidance.push("OpenTelemetry is in local-events mode. Keep it that way unless you are actively tracing a Codex run.");
   }
+  if (metrics.statusLineHidden) {
+    guidance.push('Restore the Codex status line; include "model-with-reasoning" and "context-remaining" so slow-thread pressure is visible.');
+  } else if (metrics.statusLineMissingContext) {
+    guidance.push('Add "context-remaining" to status_line so you can catch near-full context before a thread gets sluggish.');
+  } else if (metrics.statusLineMissingModel) {
+    guidance.push('Add "model-with-reasoning" or "model" to status_line so task/model mismatch is visible during quick work.');
+  } else if (metrics.statusLineDense) {
+    guidance.push("Trim status_line to the few fields you actually scan during fast local work.");
+  }
   if (metrics.historyInvalidConfig) {
     guidance.push('Fix history config; use history.persistence = "save-all" or "none" and a positive history.max_bytes value.');
   } else if (metrics.historyFileHuge || (metrics.historyUnbounded && metrics.historyFileLarge)) {
@@ -12678,6 +15006,27 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Trim shell_environment_policy for spawned commands; Refit sees ${Number(metrics.shellEnvVarCount).toLocaleString()} visible env var${metrics.shellEnvVarCount === 1 ? "" : "s"}.`,
     );
+  }
+  if (metrics.cliCompletionCliFound && !metrics.cliCompletionFound) {
+    guidance.push(`Install Codex shell completions for ${metrics.cliCompletionShellName || "your shell"} to speed everyday CLI control.`);
+  } else if (metrics.cliCompletionZshCompinitMissing) {
+    guidance.push('Add "autoload -Uz compinit && compinit" before eval "$(codex completion zsh)" if zsh completion reports compdef errors.');
+  }
+  if (metrics.runtimeLaunchTimedOut) {
+    guidance.push("Fix Codex binary startup: a --version probe timed out before Refit could get a clean baseline.");
+  } else if (metrics.runtimeLaunchFailed) {
+    guidance.push("Compare terminal and bundled app Codex binaries; at least one --version probe failed.");
+  } else if (metrics.runtimeMaxLaunchMs >= codexLaunchHighMs) {
+    guidance.push(
+      `Fix Codex launch latency: the slowest --version probe took ${Number(metrics.runtimeMaxLaunchMs).toLocaleString()} ms.`,
+    );
+  } else if (metrics.runtimeMaxLaunchMs >= codexLaunchMediumMs) {
+    guidance.push(
+      `Watch Codex launch latency: the slowest --version probe took ${Number(metrics.runtimeMaxLaunchMs).toLocaleString()} ms.`,
+    );
+  }
+  if (metrics.strictConfigFailed) {
+    guidance.push("Run `codex --strict-config --version` and fix unsupported config keys before tuning Codex speed settings.");
   }
   if (metrics.toolOutputTokenLimit > 24000) {
     guidance.push(`Lower tool_output_token_limit from ${Number(metrics.toolOutputTokenLimit).toLocaleString()} or keep huge logs in files so context stays usable.`);
@@ -12759,14 +15108,26 @@ function scoreMetricsFromScan(scan) {
   const historyRetention = scan?.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = scan?.codexConfig?.storagePaths || {};
   const telemetry = scan?.codexConfig?.telemetry || buildTelemetrySummary({});
+  const statusLine = scan?.codexConfig?.statusLine || buildStatusLineSummary({});
   const automation = scan?.codexConfig?.automation || emptyAutomationSummary();
   const appServerTransport = scan?.processes?.appServerTransport || emptyAppServerTransportSummary();
   const remoteHosts = scan?.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const shellStartup = scan?.codexConfig?.shellStartup || emptyShellStartupSummary();
+  const cliCompletion = scan?.codexConfig?.cliCompletion || emptyCliCompletionSummary();
+  const strictConfig = scan?.codexConfig?.strictConfig || emptyStrictConfigSummary();
+  const runtime = scan?.runtime || {};
+  const runtimeLaunch = runtime.launch || buildCodexLaunchSummary(runtime);
   const approvalFriction = categories.approvalFriction || emptyApprovalFrictionSummary(categories.activeSessions || {});
   const permissionsProfile = scan?.codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
+  const chronicleLoad = categories.chronicleLoad || emptyChronicleLoadSummary();
+  const planningReadiness = scan?.codexConfig?.planningReadiness || emptyPlanningReadinessSummary();
+  const planEffort = scan?.codexConfig?.planEffort || buildPlanEffortSummary({}, scan?.codexConfig || {});
+  const goalReadiness = scan?.codexConfig?.goalReadiness || emptyGoalReadinessSummary();
+  const validationReadiness = scan?.codexConfig?.validationReadiness || emptyValidationReadinessSummary(scan?.codexConfig?.projectReadiness?.currentProject);
+  const reviewLane = scan?.codexConfig?.reviewLane || emptyReviewLaneSummary(scan?.codexConfig?.projectReadiness?.currentProject);
+  const manualFreshness = scan?.codexConfig?.manualFreshness || emptyCodexManualFreshnessSummary();
   return {
-    scoreModel: "local-state-v24",
+    scoreModel: "local-state-v35",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -12783,7 +15144,104 @@ function scoreMetricsFromScan(scan) {
     taskClarityHighChurnFileCount: categories.taskClarity?.highChurnFileCount || 0,
     taskClarityMissingDoneMarkerFileCount: categories.taskClarity?.missingDoneMarkerFileCount || 0,
     taskClarityMissingVerificationMarkerFileCount: categories.taskClarity?.missingVerificationMarkerFileCount || 0,
+    taskClarityGoalModeMarkerCount: categories.taskClarity?.goalModeMarkerCount || 0,
+    taskClaritySlashGoalCommandCount: categories.taskClarity?.slashGoalCommandCount || 0,
+    taskClarityGoalModeFileCount: categories.taskClarity?.goalModeFileCount || 0,
     taskClarityUnparsedFileCount: categories.taskClarity?.unparsedFileCount || 0,
+    planningTone: planningReadiness.tone || "low",
+    planningLabel: planningReadiness.label || "Optional",
+    planningHasTemplate: Boolean(planningReadiness.hasPlanTemplate),
+    planningMissingTemplate: Boolean(planningReadiness.missingPlanTemplate),
+    planningMissingForComplexWork: Boolean(planningReadiness.missingPlanForComplexWork),
+    planningTemplateCount: planningReadiness.templateCount || 0,
+    planningTemplateBytes: planningReadiness.templateBytes || 0,
+    planningTemplateLargeCount: planningReadiness.templateLargeCount || 0,
+    planningTemplateHuge: Boolean(planningReadiness.templateHuge),
+    planningComplexSignalCount: planningReadiness.complexSignalCount || 0,
+    planEffortTone: planEffort.tone || "low",
+    planEffortLabel: planEffort.label || "Default",
+    planEffortConfigured: Boolean(planEffort.planEffortConfigured),
+    planEffortDefaultHigh: Boolean(planEffort.defaultHighEffort),
+    planEffortDefaultXHigh: Boolean(planEffort.defaultXHighEffort),
+    planEffortDefaultLow: Boolean(planEffort.defaultLowEffort),
+    planEffortPlanHigh: Boolean(planEffort.planHighEffort),
+    planEffortPlanXHigh: Boolean(planEffort.planXHighEffort),
+    planEffortPlanLow: Boolean(planEffort.planLowEffort),
+    planEffortSplit: Boolean(planEffort.splitPlanningEffort),
+    planEffortFlatHigh: Boolean(planEffort.flatHighReasoning),
+    planEffortFlatLow: Boolean(planEffort.flatLowPlanning),
+    planEffortSmallTaskDragRisk: Boolean(planEffort.smallTaskDragRisk),
+    planEffortFastProfileBackstop: Boolean(planEffort.fastProfileBackstop),
+    planEffortOverkill: Boolean(planEffort.planEffortOverkill),
+    planEffortUndercooked: Boolean(planEffort.planEffortUndercooked),
+    validationTone: validationReadiness.tone || "low",
+    validationLabel: validationReadiness.label || "Optional",
+    validationHasCommand: Boolean(validationReadiness.hasValidationScript),
+    validationHasTestScript: Boolean(validationReadiness.hasTestScript),
+    validationHasBuildScript: Boolean(validationReadiness.hasBuildScript),
+    validationHasLintScript: Boolean(validationReadiness.hasLintScript),
+    validationHasTypecheckScript: Boolean(validationReadiness.hasTypecheckScript),
+    validationScriptCount: validationReadiness.validationScriptCount || 0,
+    validationReviewFileCount: validationReadiness.reviewFileCount || 0,
+    validationGuidanceFileCount: validationReadiness.guidanceFileCount || 0,
+    validationHasGuidance: Boolean(validationReadiness.hasVerificationGuidance),
+    validationHasReviewGuidance: Boolean(validationReadiness.hasReviewGuidance),
+    validationMissingCommand: Boolean(validationReadiness.missingValidationCommand),
+    validationMissingGuidance: Boolean(validationReadiness.missingVerificationGuidance),
+    validationMissingReviewGuidance: Boolean(validationReadiness.missingReviewGuidance),
+    reviewLaneTone: reviewLane.tone || "low",
+    reviewLaneLabel: reviewLane.label || "Clean",
+    reviewLaneHasGitRepo: Boolean(reviewLane.hasGitRepo),
+    reviewLaneDirtyCount: reviewLane.dirtyCount || 0,
+    reviewLaneStagedCount: reviewLane.stagedCount || 0,
+    reviewLaneUnstagedCount: reviewLane.unstagedCount || 0,
+    reviewLaneUntrackedCount: reviewLane.untrackedCount || 0,
+    reviewLaneConflictedCount: reviewLane.conflictedCount || 0,
+    reviewLaneDiffFileCount: reviewLane.diffFileCount || 0,
+    reviewLaneDiffInsertions: reviewLane.diffInsertions || 0,
+    reviewLaneDiffDeletions: reviewLane.diffDeletions || 0,
+    reviewLaneDiffLineChangeCount: reviewLane.diffLineChangeCount || 0,
+    reviewLaneHasReviewGuidance: Boolean(reviewLane.hasReviewGuidance),
+    reviewLaneReviewFileCount: reviewLane.reviewFileCount || 0,
+    reviewLaneHasReviewModel: Boolean(reviewLane.hasReviewModel),
+    reviewLaneLargeChangeSet: Boolean(reviewLane.largeChangeSet),
+    reviewLaneUnreviewedDirtyWork: Boolean(reviewLane.unreviewedDirtyWork),
+    reviewLaneMissingBaseForReview: Boolean(reviewLane.missingBaseForReview),
+    reviewLaneReviewRecommended: Boolean(reviewLane.reviewRecommended),
+    manualFreshnessTone: manualFreshness.tone || "medium",
+    manualFreshnessLabel: manualFreshness.label || "No manual",
+    manualHasCache: Boolean(manualFreshness.hasManual),
+    manualHasOutline: Boolean(manualFreshness.hasOutline),
+    manualBytes: manualFreshness.manualBytes || 0,
+    manualOutlineBytes: manualFreshness.outlineBytes || 0,
+    manualAgeDays: manualFreshness.manualAgeDays || 0,
+    manualStale: Boolean(manualFreshness.stale),
+    manualVeryStale: Boolean(manualFreshness.veryStale),
+    manualTopicCount: manualFreshness.topicCount || 0,
+    manualCoveredTopicCount: manualFreshness.coveredTopicCount || 0,
+    manualMissingTopicCount: manualFreshness.missingTopicCount || 0,
+    goalReadinessTone: goalReadiness.tone || "low",
+    goalReadinessLabel: goalReadiness.label || "Optional",
+    goalGoalsFeature: Boolean(goalReadiness.goalsFeature),
+    goalLongWorkSignal: Boolean(goalReadiness.longWorkSignal),
+    goalExplicitSignal: Boolean(goalReadiness.explicitGoalSignal),
+    goalMissingFeatureForLongWork: Boolean(goalReadiness.missingFeatureForLongWork),
+    goalMissingExplicitForLongWork: Boolean(goalReadiness.missingExplicitGoalForLongWork),
+    goalMissingCompletionCriteria: Boolean(goalReadiness.missingCompletionCriteria),
+    goalModeMarkerCount: goalReadiness.goalModeMarkerCount || 0,
+    goalSlashCommandCount: goalReadiness.slashGoalCommandCount || 0,
+    goalModeFileCount: goalReadiness.goalModeFileCount || 0,
+    runtimeLaunchTone: runtimeLaunch.tone || "low",
+    runtimeLaunchLabel: runtimeLaunch.label || "Not measured",
+    runtimeCliDurationMs: runtime.cliDurationMs || 0,
+    runtimeAppDurationMs: runtime.appDurationMs || 0,
+    runtimeMaxLaunchMs: runtimeLaunch.maxDurationMs || 0,
+    runtimeLaunchTimedOut: Boolean(runtimeLaunch.timedOut),
+    runtimeLaunchFailed: Boolean(runtimeLaunch.failed),
+    runtimeLaunchMissing: Boolean(runtimeLaunch.missing),
+    runtimeCliTimedOut: Boolean(runtime.cliTimedOut),
+    runtimeAppTimedOut: Boolean(runtime.appTimedOut),
+    runtimeVersionMismatch: Boolean(runtime.versionMismatch),
     turnTelemetrySlowTurnCount: categories.turnTelemetry?.slowTurnCount || 0,
     turnTelemetryVerySlowTurnCount: categories.turnTelemetry?.verySlowTurnCount || 0,
     turnTelemetrySlowFirstTokenCount: categories.turnTelemetry?.slowFirstTokenCount || 0,
@@ -12826,6 +15284,17 @@ function scoreMetricsFromScan(scan) {
     permissionsProfileNetworkDomainRuleCount: permissionsProfile.networkDomainRuleCount || 0,
     permissionsProfileNetworkGlobalAllow: Boolean(permissionsProfile.networkGlobalAllow),
     permissionsProfileNetworkNoDomainRules: Boolean(permissionsProfile.networkNoDomainRules),
+    chronicleTone: chronicleLoad.tone || "low",
+    chronicleValue: chronicleLoad.value || "Quiet",
+    chronicleBytes: chronicleLoad.bytes || 0,
+    chronicleFiles: chronicleLoad.fileCount || 0,
+    chronicleScreenCaptureBytes: chronicleLoad.screenCaptureBytes || 0,
+    chronicleScreenCaptureFiles: chronicleLoad.screenCaptureFiles || 0,
+    chronicleMemoryBytes: chronicleLoad.memoryBytes || 0,
+    chronicleMemoryFiles: chronicleLoad.memoryFiles || 0,
+    chronicleLikelyRunning: Boolean(chronicleLoad.likelyRunning),
+    chronicleRateLimitGuardConfigured: Boolean(chronicleLoad.rateLimitGuardConfigured),
+    chronicleRateLimitGuardLow: Boolean(chronicleLoad.rateLimitGuardLow),
     codexWorktreeBytes: categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
@@ -12866,6 +15335,14 @@ function scoreMetricsFromScan(scan) {
     telemetryProjectIgnoredCount: telemetry.projectIgnoredTelemetryCount || 0,
     telemetryHeaderKeyCount: telemetry.headerKeyCount || 0,
     telemetryEnvironmentConfigured: Boolean(telemetry.environmentConfigured),
+    statusLineTone: statusLine.tone || "low",
+    statusLineLabel: statusLine.label || "Default",
+    statusLineConfigured: Boolean(statusLine.configured),
+    statusLineHidden: Boolean(statusLine.hidden),
+    statusLineFieldCount: statusLine.fieldCount || 0,
+    statusLineMissingModel: Boolean(statusLine.missingModel),
+    statusLineMissingContext: Boolean(statusLine.missingContext),
+    statusLineDense: Boolean(statusLine.dense),
     automationTone: automation.tone || "low",
     automationLabel: automation.label || "No automation",
     automationCodexExecCount: automation.codexExecCount || 0,
@@ -12918,6 +15395,23 @@ function scoreMetricsFromScan(scan) {
     shellStartupMedianMs: shellStartup.medianMs || 0,
     shellStartupMeanMs: shellStartup.meanMs || 0,
     shellStartupMaxMs: shellStartup.maxMs || 0,
+    cliCompletionTone: cliCompletion.tone || "low",
+    cliCompletionLabel: cliCompletion.label || "Not checked",
+    cliCompletionShellName: cliCompletion.shellName || null,
+    cliCompletionCliFound: Boolean(cliCompletion.cliFound),
+    cliCompletionFound: Boolean(cliCompletion.completionFound),
+    cliCompletionConfigMatchCount: cliCompletion.configMatchCount || 0,
+    cliCompletionFileCount: cliCompletion.completionFileCount || 0,
+    cliCompletionZshCompinitMissing: Boolean(cliCompletion.zshCompinitMissing),
+    strictConfigTone: strictConfig.tone || "low",
+    strictConfigLabel: strictConfig.label || "Not checked",
+    strictConfigCliFound: Boolean(strictConfig.cliFound),
+    strictConfigOk: Boolean(strictConfig.ok),
+    strictConfigFailed: Boolean(strictConfig.failed),
+    strictConfigTimedOut: Boolean(strictConfig.timedOut),
+    strictConfigWarningCount: strictConfig.warningCount || 0,
+    strictConfigDurationMs: strictConfig.durationMs || 0,
+    strictConfigExitCode: strictConfig.exitCode ?? null,
   };
 }
 
@@ -13590,6 +16084,15 @@ function benchmarkDeltas(current, previous) {
     "appServerWebsocketAuthCount",
     "appServerUnauthenticatedWebsocketCount",
     "appServerNonLoopbackUnauthenticatedCount",
+    "runtimeCliDurationMs",
+    "runtimeAppDurationMs",
+    "runtimeMaxLaunchMs",
+    "runtimeLaunchTimedOut",
+    "runtimeLaunchFailed",
+    "runtimeLaunchMissing",
+    "runtimeCliTimedOut",
+    "runtimeAppTimedOut",
+    "runtimeVersionMismatch",
     "modelHighEffort",
     "modelXHighEffort",
     "modelLowEffort",
@@ -13619,10 +16122,84 @@ function benchmarkDeltas(current, previous) {
     "taskClarityToolCallCount",
     "taskClarityCompactMarkerCount",
     "taskClarityStructuredPromptFileCount",
+    "taskClarityGoalModeMarkerCount",
+    "taskClaritySlashGoalCommandCount",
+    "taskClarityGoalModeFileCount",
     "taskClarityMissingDoneMarkerFileCount",
     "taskClarityMissingVerificationMarkerFileCount",
     "taskClarityHighChurnFileCount",
     "taskClarityUnparsedFileCount",
+    "planningHasTemplate",
+    "planningMissingTemplate",
+    "planningMissingForComplexWork",
+    "planningTemplateCount",
+    "planningTemplateBytes",
+    "planningTemplateLargeCount",
+    "planningTemplateHuge",
+    "planningComplexSignalCount",
+    "planEffortConfigured",
+    "planEffortDefaultHigh",
+    "planEffortDefaultXHigh",
+    "planEffortDefaultLow",
+    "planEffortPlanHigh",
+    "planEffortPlanXHigh",
+    "planEffortPlanLow",
+    "planEffortSplit",
+    "planEffortFlatHigh",
+    "planEffortFlatLow",
+    "planEffortSmallTaskDragRisk",
+    "planEffortFastProfileBackstop",
+    "planEffortOverkill",
+    "planEffortUndercooked",
+    "validationHasCommand",
+    "validationHasTestScript",
+    "validationHasBuildScript",
+    "validationHasLintScript",
+    "validationHasTypecheckScript",
+    "validationScriptCount",
+    "validationReviewFileCount",
+    "validationGuidanceFileCount",
+    "validationHasGuidance",
+    "validationHasReviewGuidance",
+    "validationMissingCommand",
+    "validationMissingGuidance",
+    "validationMissingReviewGuidance",
+    "reviewLaneHasGitRepo",
+    "reviewLaneDirtyCount",
+    "reviewLaneStagedCount",
+    "reviewLaneUnstagedCount",
+    "reviewLaneUntrackedCount",
+    "reviewLaneConflictedCount",
+    "reviewLaneDiffFileCount",
+    "reviewLaneDiffInsertions",
+    "reviewLaneDiffDeletions",
+    "reviewLaneDiffLineChangeCount",
+    "reviewLaneHasReviewGuidance",
+    "reviewLaneReviewFileCount",
+    "reviewLaneHasReviewModel",
+    "reviewLaneLargeChangeSet",
+    "reviewLaneUnreviewedDirtyWork",
+    "reviewLaneMissingBaseForReview",
+    "reviewLaneReviewRecommended",
+    "manualHasCache",
+    "manualHasOutline",
+    "manualBytes",
+    "manualOutlineBytes",
+    "manualAgeDays",
+    "manualStale",
+    "manualVeryStale",
+    "manualTopicCount",
+    "manualCoveredTopicCount",
+    "manualMissingTopicCount",
+    "goalGoalsFeature",
+    "goalLongWorkSignal",
+    "goalExplicitSignal",
+    "goalMissingFeatureForLongWork",
+    "goalMissingExplicitForLongWork",
+    "goalMissingCompletionCriteria",
+    "goalModeMarkerCount",
+    "goalSlashCommandCount",
+    "goalModeFileCount",
     "turnTelemetryScannedFileCount",
     "turnTelemetryCompletedTurnCount",
     "turnTelemetryDurationCount",
@@ -13707,6 +16284,17 @@ function benchmarkDeltas(current, previous) {
     "shellStartupMedianMs",
     "shellStartupMeanMs",
     "shellStartupMaxMs",
+    "cliCompletionCliFound",
+    "cliCompletionFound",
+    "cliCompletionConfigMatchCount",
+    "cliCompletionFileCount",
+    "cliCompletionZshCompinitMissing",
+    "strictConfigCliFound",
+    "strictConfigOk",
+    "strictConfigFailed",
+    "strictConfigTimedOut",
+    "strictConfigWarningCount",
+    "strictConfigDurationMs",
     "hasFastTaskProfile",
     "fastTaskProfileCount",
     "hasMiniProfile",
@@ -13756,6 +16344,15 @@ function benchmarkDeltas(current, previous) {
     "hookBroadMatcherCount",
     "memoryBytes",
     "memoryFiles",
+    "chronicleBytes",
+    "chronicleFiles",
+    "chronicleScreenCaptureBytes",
+    "chronicleScreenCaptureFiles",
+    "chronicleMemoryBytes",
+    "chronicleMemoryFiles",
+    "chronicleLikelyRunning",
+    "chronicleRateLimitGuardConfigured",
+    "chronicleRateLimitGuardLow",
     "skillCount",
     "skillUserManagedCount",
     "skillPluginCount",
@@ -13803,6 +16400,12 @@ function benchmarkDeltas(current, previous) {
     "telemetryProjectIgnoredCount",
     "telemetryHeaderKeyCount",
     "telemetryEnvironmentConfigured",
+    "statusLineConfigured",
+    "statusLineHidden",
+    "statusLineFieldCount",
+    "statusLineMissingModel",
+    "statusLineMissingContext",
+    "statusLineDense",
     "automationScannedFileCount",
     "automationScannedBytes",
     "automationCodexExecCount",
@@ -13902,11 +16505,97 @@ function summarizeBenchmarkEntry(entry) {
     taskClarityDoneMarkerCount: entry.metrics.taskClarityDoneMarkerCount || 0,
     taskClarityVerificationMarkerCount: entry.metrics.taskClarityVerificationMarkerCount || 0,
     taskClarityStructuredPromptFileCount: entry.metrics.taskClarityStructuredPromptFileCount || 0,
+    taskClarityGoalModeMarkerCount: entry.metrics.taskClarityGoalModeMarkerCount || 0,
+    taskClaritySlashGoalCommandCount: entry.metrics.taskClaritySlashGoalCommandCount || 0,
+    taskClarityGoalModeFileCount: entry.metrics.taskClarityGoalModeFileCount || 0,
     taskClarityMissingDoneMarkerFileCount: entry.metrics.taskClarityMissingDoneMarkerFileCount || 0,
     taskClarityMissingVerificationMarkerFileCount: entry.metrics.taskClarityMissingVerificationMarkerFileCount || 0,
     taskClarityHighChurnFileCount: entry.metrics.taskClarityHighChurnFileCount || 0,
     taskClarityCappedFileCount: entry.metrics.taskClarityCappedFileCount || 0,
     taskClarityUnparsedFileCount: entry.metrics.taskClarityUnparsedFileCount || 0,
+    planningTone: entry.metrics.planningTone || "low",
+    planningLabel: entry.metrics.planningLabel || "Optional",
+    planningHasTemplate: Boolean(entry.metrics.planningHasTemplate),
+    planningMissingTemplate: Boolean(entry.metrics.planningMissingTemplate),
+    planningMissingForComplexWork: Boolean(entry.metrics.planningMissingForComplexWork),
+    planningTemplateCount: entry.metrics.planningTemplateCount || 0,
+    planningTemplateBytes: entry.metrics.planningTemplateBytes || 0,
+    planningTemplateLargeCount: entry.metrics.planningTemplateLargeCount || 0,
+    planningTemplateHuge: Boolean(entry.metrics.planningTemplateHuge),
+    planningComplexSignalCount: entry.metrics.planningComplexSignalCount || 0,
+    planEffortTone: entry.metrics.planEffortTone || "low",
+    planEffortLabel: entry.metrics.planEffortLabel || "Default",
+    planEffortConfigured: Boolean(entry.metrics.planEffortConfigured),
+    planEffortDefaultHigh: Boolean(entry.metrics.planEffortDefaultHigh),
+    planEffortDefaultXHigh: Boolean(entry.metrics.planEffortDefaultXHigh),
+    planEffortDefaultLow: Boolean(entry.metrics.planEffortDefaultLow),
+    planEffortPlanHigh: Boolean(entry.metrics.planEffortPlanHigh),
+    planEffortPlanXHigh: Boolean(entry.metrics.planEffortPlanXHigh),
+    planEffortPlanLow: Boolean(entry.metrics.planEffortPlanLow),
+    planEffortSplit: Boolean(entry.metrics.planEffortSplit),
+    planEffortFlatHigh: Boolean(entry.metrics.planEffortFlatHigh),
+    planEffortFlatLow: Boolean(entry.metrics.planEffortFlatLow),
+    planEffortSmallTaskDragRisk: Boolean(entry.metrics.planEffortSmallTaskDragRisk),
+    planEffortFastProfileBackstop: Boolean(entry.metrics.planEffortFastProfileBackstop),
+    planEffortOverkill: Boolean(entry.metrics.planEffortOverkill),
+    planEffortUndercooked: Boolean(entry.metrics.planEffortUndercooked),
+    validationTone: entry.metrics.validationTone || "low",
+    validationLabel: entry.metrics.validationLabel || "Optional",
+    validationHasCommand: Boolean(entry.metrics.validationHasCommand),
+    validationHasTestScript: Boolean(entry.metrics.validationHasTestScript),
+    validationHasBuildScript: Boolean(entry.metrics.validationHasBuildScript),
+    validationHasLintScript: Boolean(entry.metrics.validationHasLintScript),
+    validationHasTypecheckScript: Boolean(entry.metrics.validationHasTypecheckScript),
+    validationScriptCount: entry.metrics.validationScriptCount || 0,
+    validationReviewFileCount: entry.metrics.validationReviewFileCount || 0,
+    validationGuidanceFileCount: entry.metrics.validationGuidanceFileCount || 0,
+    validationHasGuidance: Boolean(entry.metrics.validationHasGuidance),
+    validationHasReviewGuidance: Boolean(entry.metrics.validationHasReviewGuidance),
+    validationMissingCommand: Boolean(entry.metrics.validationMissingCommand),
+    validationMissingGuidance: Boolean(entry.metrics.validationMissingGuidance),
+    validationMissingReviewGuidance: Boolean(entry.metrics.validationMissingReviewGuidance),
+    reviewLaneTone: entry.metrics.reviewLaneTone || "low",
+    reviewLaneLabel: entry.metrics.reviewLaneLabel || "Clean",
+    reviewLaneHasGitRepo: Boolean(entry.metrics.reviewLaneHasGitRepo),
+    reviewLaneDirtyCount: entry.metrics.reviewLaneDirtyCount || 0,
+    reviewLaneStagedCount: entry.metrics.reviewLaneStagedCount || 0,
+    reviewLaneUnstagedCount: entry.metrics.reviewLaneUnstagedCount || 0,
+    reviewLaneUntrackedCount: entry.metrics.reviewLaneUntrackedCount || 0,
+    reviewLaneConflictedCount: entry.metrics.reviewLaneConflictedCount || 0,
+    reviewLaneDiffFileCount: entry.metrics.reviewLaneDiffFileCount || 0,
+    reviewLaneDiffInsertions: entry.metrics.reviewLaneDiffInsertions || 0,
+    reviewLaneDiffDeletions: entry.metrics.reviewLaneDiffDeletions || 0,
+    reviewLaneDiffLineChangeCount: entry.metrics.reviewLaneDiffLineChangeCount || 0,
+    reviewLaneHasReviewGuidance: Boolean(entry.metrics.reviewLaneHasReviewGuidance),
+    reviewLaneReviewFileCount: entry.metrics.reviewLaneReviewFileCount || 0,
+    reviewLaneHasReviewModel: Boolean(entry.metrics.reviewLaneHasReviewModel),
+    reviewLaneLargeChangeSet: Boolean(entry.metrics.reviewLaneLargeChangeSet),
+    reviewLaneUnreviewedDirtyWork: Boolean(entry.metrics.reviewLaneUnreviewedDirtyWork),
+    reviewLaneMissingBaseForReview: Boolean(entry.metrics.reviewLaneMissingBaseForReview),
+    reviewLaneReviewRecommended: Boolean(entry.metrics.reviewLaneReviewRecommended),
+    manualFreshnessTone: entry.metrics.manualFreshnessTone || "medium",
+    manualFreshnessLabel: entry.metrics.manualFreshnessLabel || "No manual",
+    manualHasCache: Boolean(entry.metrics.manualHasCache),
+    manualHasOutline: Boolean(entry.metrics.manualHasOutline),
+    manualBytes: entry.metrics.manualBytes || 0,
+    manualOutlineBytes: entry.metrics.manualOutlineBytes || 0,
+    manualAgeDays: entry.metrics.manualAgeDays || 0,
+    manualStale: Boolean(entry.metrics.manualStale),
+    manualVeryStale: Boolean(entry.metrics.manualVeryStale),
+    manualTopicCount: entry.metrics.manualTopicCount || 0,
+    manualCoveredTopicCount: entry.metrics.manualCoveredTopicCount || 0,
+    manualMissingTopicCount: entry.metrics.manualMissingTopicCount || 0,
+    goalReadinessTone: entry.metrics.goalReadinessTone || "low",
+    goalReadinessLabel: entry.metrics.goalReadinessLabel || "Optional",
+    goalGoalsFeature: Boolean(entry.metrics.goalGoalsFeature),
+    goalLongWorkSignal: Boolean(entry.metrics.goalLongWorkSignal),
+    goalExplicitSignal: Boolean(entry.metrics.goalExplicitSignal),
+    goalMissingFeatureForLongWork: Boolean(entry.metrics.goalMissingFeatureForLongWork),
+    goalMissingExplicitForLongWork: Boolean(entry.metrics.goalMissingExplicitForLongWork),
+    goalMissingCompletionCriteria: Boolean(entry.metrics.goalMissingCompletionCriteria),
+    goalModeMarkerCount: entry.metrics.goalModeMarkerCount || 0,
+    goalSlashCommandCount: entry.metrics.goalSlashCommandCount || 0,
+    goalModeFileCount: entry.metrics.goalModeFileCount || 0,
     turnTelemetryTone: entry.metrics.turnTelemetryTone || "low",
     turnTelemetryScannedFileCount: entry.metrics.turnTelemetryScannedFileCount || 0,
     turnTelemetryFileCount: entry.metrics.turnTelemetryFileCount || 0,
@@ -14021,6 +16710,23 @@ function summarizeBenchmarkEntry(entry) {
     shellStartupMedianMs: entry.metrics.shellStartupMedianMs || 0,
     shellStartupMeanMs: entry.metrics.shellStartupMeanMs || 0,
     shellStartupMaxMs: entry.metrics.shellStartupMaxMs || 0,
+    cliCompletionTone: entry.metrics.cliCompletionTone || "low",
+    cliCompletionLabel: entry.metrics.cliCompletionLabel || "Not checked",
+    cliCompletionShellName: entry.metrics.cliCompletionShellName || null,
+    cliCompletionCliFound: Boolean(entry.metrics.cliCompletionCliFound),
+    cliCompletionFound: Boolean(entry.metrics.cliCompletionFound),
+    cliCompletionConfigMatchCount: entry.metrics.cliCompletionConfigMatchCount || 0,
+    cliCompletionFileCount: entry.metrics.cliCompletionFileCount || 0,
+    cliCompletionZshCompinitMissing: Boolean(entry.metrics.cliCompletionZshCompinitMissing),
+    strictConfigTone: entry.metrics.strictConfigTone || "low",
+    strictConfigLabel: entry.metrics.strictConfigLabel || "Not checked",
+    strictConfigCliFound: Boolean(entry.metrics.strictConfigCliFound),
+    strictConfigOk: Boolean(entry.metrics.strictConfigOk),
+    strictConfigFailed: Boolean(entry.metrics.strictConfigFailed),
+    strictConfigTimedOut: Boolean(entry.metrics.strictConfigTimedOut),
+    strictConfigWarningCount: entry.metrics.strictConfigWarningCount || 0,
+    strictConfigDurationMs: entry.metrics.strictConfigDurationMs || 0,
+    strictConfigExitCode: entry.metrics.strictConfigExitCode ?? null,
     codexWorktreeBytes: entry.metrics.codexWorktreeBytes || 0,
     codexWorktreeCount: entry.metrics.codexWorktreeCount || 0,
     codexWorktreeLargeCount: entry.metrics.codexWorktreeLargeCount || 0,
@@ -14045,6 +16751,17 @@ function summarizeBenchmarkEntry(entry) {
     appServerWebsocketAuthCount: entry.metrics.appServerWebsocketAuthCount || 0,
     appServerUnauthenticatedWebsocketCount: entry.metrics.appServerUnauthenticatedWebsocketCount || 0,
     appServerNonLoopbackUnauthenticatedCount: entry.metrics.appServerNonLoopbackUnauthenticatedCount || 0,
+    runtimeLaunchTone: entry.metrics.runtimeLaunchTone || "low",
+    runtimeLaunchLabel: entry.metrics.runtimeLaunchLabel || "Not measured",
+    runtimeCliDurationMs: entry.metrics.runtimeCliDurationMs || 0,
+    runtimeAppDurationMs: entry.metrics.runtimeAppDurationMs || 0,
+    runtimeMaxLaunchMs: entry.metrics.runtimeMaxLaunchMs || 0,
+    runtimeLaunchTimedOut: Boolean(entry.metrics.runtimeLaunchTimedOut),
+    runtimeLaunchFailed: Boolean(entry.metrics.runtimeLaunchFailed),
+    runtimeLaunchMissing: Boolean(entry.metrics.runtimeLaunchMissing),
+    runtimeCliTimedOut: Boolean(entry.metrics.runtimeCliTimedOut),
+    runtimeAppTimedOut: Boolean(entry.metrics.runtimeAppTimedOut),
+    runtimeVersionMismatch: Boolean(entry.metrics.runtimeVersionMismatch),
     modelDefault: entry.metrics.modelDefault || "default",
     modelReasoningEffort: entry.metrics.modelReasoningEffort || "default",
     modelHighEffort: Boolean(entry.metrics.modelHighEffort),
@@ -14158,6 +16875,20 @@ function summarizeBenchmarkEntry(entry) {
     memoryFiles: entry.metrics.memoryFiles || 0,
     memoriesUseMemories: Boolean(entry.metrics.memoriesUseMemories),
     memoriesGenerateMemories: Boolean(entry.metrics.memoriesGenerateMemories),
+    chronicleTone: entry.metrics.chronicleTone || "low",
+    chronicleValue: entry.metrics.chronicleValue || "Quiet",
+    chronicleBytes: entry.metrics.chronicleBytes || 0,
+    chronicleFiles: entry.metrics.chronicleFiles || 0,
+    chronicleScreenCaptureExists: Boolean(entry.metrics.chronicleScreenCaptureExists),
+    chronicleScreenCaptureBytes: entry.metrics.chronicleScreenCaptureBytes || 0,
+    chronicleScreenCaptureFiles: entry.metrics.chronicleScreenCaptureFiles || 0,
+    chronicleMemoryExists: Boolean(entry.metrics.chronicleMemoryExists),
+    chronicleMemoryBytes: entry.metrics.chronicleMemoryBytes || 0,
+    chronicleMemoryFiles: entry.metrics.chronicleMemoryFiles || 0,
+    chronicleLikelyRunning: Boolean(entry.metrics.chronicleLikelyRunning),
+    chronicleRateLimitGuardConfigured: Boolean(entry.metrics.chronicleRateLimitGuardConfigured),
+    chronicleRateLimitGuardLow: Boolean(entry.metrics.chronicleRateLimitGuardLow),
+    chronicleMinRateLimitRemainingPercent: entry.metrics.chronicleMinRateLimitRemainingPercent ?? null,
     skillCount: entry.metrics.skillCount || 0,
     skillUserManagedCount: entry.metrics.skillUserManagedCount || 0,
     skillSystemCount: entry.metrics.skillSystemCount || 0,
@@ -14254,6 +16985,14 @@ function summarizeBenchmarkEntry(entry) {
     telemetryProjectIgnoredCount: entry.metrics.telemetryProjectIgnoredCount || 0,
     telemetryHeaderKeyCount: entry.metrics.telemetryHeaderKeyCount || 0,
     telemetryEnvironmentConfigured: Boolean(entry.metrics.telemetryEnvironmentConfigured),
+    statusLineTone: entry.metrics.statusLineTone || "low",
+    statusLineLabel: entry.metrics.statusLineLabel || "Default",
+    statusLineConfigured: Boolean(entry.metrics.statusLineConfigured),
+    statusLineHidden: Boolean(entry.metrics.statusLineHidden),
+    statusLineFieldCount: entry.metrics.statusLineFieldCount || 0,
+    statusLineMissingModel: Boolean(entry.metrics.statusLineMissingModel),
+    statusLineMissingContext: Boolean(entry.metrics.statusLineMissingContext),
+    statusLineDense: Boolean(entry.metrics.statusLineDense),
     automationTone: entry.metrics.automationTone || "low",
     automationLabel: entry.metrics.automationLabel || "No automation",
     automationScannedFileCount: entry.metrics.automationScannedFileCount || 0,
@@ -14364,11 +17103,61 @@ export async function benchmarkHistory(limit = 12) {
         taskClarityToolCallCount: latest.taskClarityToolCallCount - oldest.taskClarityToolCallCount,
         taskClarityCompactMarkerCount: latest.taskClarityCompactMarkerCount - oldest.taskClarityCompactMarkerCount,
         taskClarityStructuredPromptFileCount: latest.taskClarityStructuredPromptFileCount - oldest.taskClarityStructuredPromptFileCount,
+        taskClarityGoalModeMarkerCount: latest.taskClarityGoalModeMarkerCount - oldest.taskClarityGoalModeMarkerCount,
+        taskClaritySlashGoalCommandCount: latest.taskClaritySlashGoalCommandCount - oldest.taskClaritySlashGoalCommandCount,
+        taskClarityGoalModeFileCount: latest.taskClarityGoalModeFileCount - oldest.taskClarityGoalModeFileCount,
         taskClarityMissingDoneMarkerFileCount: latest.taskClarityMissingDoneMarkerFileCount - oldest.taskClarityMissingDoneMarkerFileCount,
         taskClarityMissingVerificationMarkerFileCount:
           latest.taskClarityMissingVerificationMarkerFileCount - oldest.taskClarityMissingVerificationMarkerFileCount,
         taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - oldest.taskClarityHighChurnFileCount,
         taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - oldest.taskClarityUnparsedFileCount,
+        planningHasTemplate: Number(latest.planningHasTemplate) - Number(oldest.planningHasTemplate),
+        planningMissingForComplexWork: Number(latest.planningMissingForComplexWork) - Number(oldest.planningMissingForComplexWork),
+        planningTemplateCount: latest.planningTemplateCount - oldest.planningTemplateCount,
+        planningTemplateBytes: latest.planningTemplateBytes - oldest.planningTemplateBytes,
+        planningComplexSignalCount: latest.planningComplexSignalCount - oldest.planningComplexSignalCount,
+        planEffortConfigured: Number(latest.planEffortConfigured) - Number(oldest.planEffortConfigured),
+        planEffortSplit: Number(latest.planEffortSplit) - Number(oldest.planEffortSplit),
+        planEffortFlatHigh: Number(latest.planEffortFlatHigh) - Number(oldest.planEffortFlatHigh),
+        planEffortFlatLow: Number(latest.planEffortFlatLow) - Number(oldest.planEffortFlatLow),
+        planEffortSmallTaskDragRisk:
+          Number(latest.planEffortSmallTaskDragRisk) - Number(oldest.planEffortSmallTaskDragRisk),
+        planEffortFastProfileBackstop:
+          Number(latest.planEffortFastProfileBackstop) - Number(oldest.planEffortFastProfileBackstop),
+        planEffortOverkill: Number(latest.planEffortOverkill) - Number(oldest.planEffortOverkill),
+        planEffortUndercooked: Number(latest.planEffortUndercooked) - Number(oldest.planEffortUndercooked),
+        validationHasCommand: Number(latest.validationHasCommand) - Number(oldest.validationHasCommand),
+        validationHasGuidance: Number(latest.validationHasGuidance) - Number(oldest.validationHasGuidance),
+        validationHasReviewGuidance: Number(latest.validationHasReviewGuidance) - Number(oldest.validationHasReviewGuidance),
+        validationMissingCommand: Number(latest.validationMissingCommand) - Number(oldest.validationMissingCommand),
+        validationMissingGuidance: Number(latest.validationMissingGuidance) - Number(oldest.validationMissingGuidance),
+        validationMissingReviewGuidance:
+          Number(latest.validationMissingReviewGuidance) - Number(oldest.validationMissingReviewGuidance),
+        validationScriptCount: latest.validationScriptCount - oldest.validationScriptCount,
+        validationReviewFileCount: latest.validationReviewFileCount - oldest.validationReviewFileCount,
+        validationGuidanceFileCount: latest.validationGuidanceFileCount - oldest.validationGuidanceFileCount,
+        reviewLaneDirtyCount: latest.reviewLaneDirtyCount - oldest.reviewLaneDirtyCount,
+        reviewLaneConflictedCount: latest.reviewLaneConflictedCount - oldest.reviewLaneConflictedCount,
+        reviewLaneDiffLineChangeCount: latest.reviewLaneDiffLineChangeCount - oldest.reviewLaneDiffLineChangeCount,
+        reviewLaneHasReviewGuidance: Number(latest.reviewLaneHasReviewGuidance) - Number(oldest.reviewLaneHasReviewGuidance),
+        reviewLaneHasReviewModel: Number(latest.reviewLaneHasReviewModel) - Number(oldest.reviewLaneHasReviewModel),
+        reviewLaneLargeChangeSet: Number(latest.reviewLaneLargeChangeSet) - Number(oldest.reviewLaneLargeChangeSet),
+        reviewLaneUnreviewedDirtyWork: Number(latest.reviewLaneUnreviewedDirtyWork) - Number(oldest.reviewLaneUnreviewedDirtyWork),
+        manualHasCache: Number(latest.manualHasCache) - Number(oldest.manualHasCache),
+        manualHasOutline: Number(latest.manualHasOutline) - Number(oldest.manualHasOutline),
+        manualAgeDays: latest.manualAgeDays - oldest.manualAgeDays,
+        manualStale: Number(latest.manualStale) - Number(oldest.manualStale),
+        manualVeryStale: Number(latest.manualVeryStale) - Number(oldest.manualVeryStale),
+        manualMissingTopicCount: latest.manualMissingTopicCount - oldest.manualMissingTopicCount,
+        goalGoalsFeature: Number(latest.goalGoalsFeature) - Number(oldest.goalGoalsFeature),
+        goalLongWorkSignal: Number(latest.goalLongWorkSignal) - Number(oldest.goalLongWorkSignal),
+        goalExplicitSignal: Number(latest.goalExplicitSignal) - Number(oldest.goalExplicitSignal),
+        goalMissingFeatureForLongWork: Number(latest.goalMissingFeatureForLongWork) - Number(oldest.goalMissingFeatureForLongWork),
+        goalMissingExplicitForLongWork: Number(latest.goalMissingExplicitForLongWork) - Number(oldest.goalMissingExplicitForLongWork),
+        goalMissingCompletionCriteria: Number(latest.goalMissingCompletionCriteria) - Number(oldest.goalMissingCompletionCriteria),
+        goalModeMarkerCount: latest.goalModeMarkerCount - oldest.goalModeMarkerCount,
+        goalSlashCommandCount: latest.goalSlashCommandCount - oldest.goalSlashCommandCount,
+        goalModeFileCount: latest.goalModeFileCount - oldest.goalModeFileCount,
         turnTelemetryCompletedTurnCount: latest.turnTelemetryCompletedTurnCount - oldest.turnTelemetryCompletedTurnCount,
         turnTelemetryMaxDurationMs: latest.turnTelemetryMaxDurationMs - oldest.turnTelemetryMaxDurationMs,
         turnTelemetrySlowTurnCount: latest.turnTelemetrySlowTurnCount - oldest.turnTelemetrySlowTurnCount,
@@ -14420,6 +17209,14 @@ export async function benchmarkHistory(limit = 12) {
         shellStartupTimeoutCount: latest.shellStartupTimeoutCount - oldest.shellStartupTimeoutCount,
         shellStartupMedianMs: latest.shellStartupMedianMs - oldest.shellStartupMedianMs,
         shellStartupMaxMs: latest.shellStartupMaxMs - oldest.shellStartupMaxMs,
+        cliCompletionFound: Number(latest.cliCompletionFound) - Number(oldest.cliCompletionFound),
+        cliCompletionConfigMatchCount: latest.cliCompletionConfigMatchCount - oldest.cliCompletionConfigMatchCount,
+        cliCompletionFileCount: latest.cliCompletionFileCount - oldest.cliCompletionFileCount,
+        cliCompletionZshCompinitMissing: Number(latest.cliCompletionZshCompinitMissing) - Number(oldest.cliCompletionZshCompinitMissing),
+        strictConfigOk: Number(latest.strictConfigOk) - Number(oldest.strictConfigOk),
+        strictConfigFailed: Number(latest.strictConfigFailed) - Number(oldest.strictConfigFailed),
+        strictConfigWarningCount: latest.strictConfigWarningCount - oldest.strictConfigWarningCount,
+        strictConfigDurationMs: latest.strictConfigDurationMs - oldest.strictConfigDurationMs,
         codexWorktreeBytes: latest.codexWorktreeBytes - oldest.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - oldest.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - oldest.codexWorktreeLargeCount,
@@ -14437,6 +17234,15 @@ export async function benchmarkHistory(limit = 12) {
         appServerUnauthenticatedWebsocketCount: latest.appServerUnauthenticatedWebsocketCount - oldest.appServerUnauthenticatedWebsocketCount,
         appServerNonLoopbackUnauthenticatedCount:
           latest.appServerNonLoopbackUnauthenticatedCount - oldest.appServerNonLoopbackUnauthenticatedCount,
+        runtimeCliDurationMs: latest.runtimeCliDurationMs - oldest.runtimeCliDurationMs,
+        runtimeAppDurationMs: latest.runtimeAppDurationMs - oldest.runtimeAppDurationMs,
+        runtimeMaxLaunchMs: latest.runtimeMaxLaunchMs - oldest.runtimeMaxLaunchMs,
+        runtimeLaunchTimedOut: Number(latest.runtimeLaunchTimedOut) - Number(oldest.runtimeLaunchTimedOut),
+        runtimeLaunchFailed: Number(latest.runtimeLaunchFailed) - Number(oldest.runtimeLaunchFailed),
+        runtimeLaunchMissing: Number(latest.runtimeLaunchMissing) - Number(oldest.runtimeLaunchMissing),
+        runtimeCliTimedOut: Number(latest.runtimeCliTimedOut) - Number(oldest.runtimeCliTimedOut),
+        runtimeAppTimedOut: Number(latest.runtimeAppTimedOut) - Number(oldest.runtimeAppTimedOut),
+        runtimeVersionMismatch: Number(latest.runtimeVersionMismatch) - Number(oldest.runtimeVersionMismatch),
         modelHighEffort: Number(latest.modelHighEffort) - Number(oldest.modelHighEffort),
         modelXHighEffort: Number(latest.modelXHighEffort) - Number(oldest.modelXHighEffort),
         modelLowEffort: Number(latest.modelLowEffort) - Number(oldest.modelLowEffort),
@@ -14484,6 +17290,13 @@ export async function benchmarkHistory(limit = 12) {
         instructionOverrideBytes: latest.instructionOverrideBytes - oldest.instructionOverrideBytes,
         compactOverrideBytes: latest.compactOverrideBytes - oldest.compactOverrideBytes,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
+        chronicleBytes: latest.chronicleBytes - oldest.chronicleBytes,
+        chronicleScreenCaptureBytes: latest.chronicleScreenCaptureBytes - oldest.chronicleScreenCaptureBytes,
+        chronicleScreenCaptureFiles: latest.chronicleScreenCaptureFiles - oldest.chronicleScreenCaptureFiles,
+        chronicleMemoryBytes: latest.chronicleMemoryBytes - oldest.chronicleMemoryBytes,
+        chronicleMemoryFiles: latest.chronicleMemoryFiles - oldest.chronicleMemoryFiles,
+        chronicleLikelyRunning: Number(latest.chronicleLikelyRunning) - Number(oldest.chronicleLikelyRunning),
+        chronicleRateLimitGuardLow: Number(latest.chronicleRateLimitGuardLow) - Number(oldest.chronicleRateLimitGuardLow),
         skillCount: latest.skillCount - oldest.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - oldest.skillEstimatedCatalogChars,
         skillLongDescriptionCount: latest.skillLongDescriptionCount - oldest.skillLongDescriptionCount,
@@ -14519,6 +17332,12 @@ export async function benchmarkHistory(limit = 12) {
         telemetryProjectIgnoredCount: latest.telemetryProjectIgnoredCount - oldest.telemetryProjectIgnoredCount,
         telemetryHeaderKeyCount: latest.telemetryHeaderKeyCount - oldest.telemetryHeaderKeyCount,
         telemetryEnvironmentConfigured: Number(latest.telemetryEnvironmentConfigured) - Number(oldest.telemetryEnvironmentConfigured),
+        statusLineConfigured: Number(latest.statusLineConfigured) - Number(oldest.statusLineConfigured),
+        statusLineHidden: Number(latest.statusLineHidden) - Number(oldest.statusLineHidden),
+        statusLineFieldCount: latest.statusLineFieldCount - oldest.statusLineFieldCount,
+        statusLineMissingModel: Number(latest.statusLineMissingModel) - Number(oldest.statusLineMissingModel),
+        statusLineMissingContext: Number(latest.statusLineMissingContext) - Number(oldest.statusLineMissingContext),
+        statusLineDense: Number(latest.statusLineDense) - Number(oldest.statusLineDense),
         automationScannedFileCount: latest.automationScannedFileCount - oldest.automationScannedFileCount,
         automationScannedBytes: latest.automationScannedBytes - oldest.automationScannedBytes,
         automationCodexExecCount: latest.automationCodexExecCount - oldest.automationCodexExecCount,
@@ -14580,11 +17399,64 @@ export async function benchmarkHistory(limit = 12) {
         taskClarityToolCallCount: latest.taskClarityToolCallCount - previous.taskClarityToolCallCount,
         taskClarityCompactMarkerCount: latest.taskClarityCompactMarkerCount - previous.taskClarityCompactMarkerCount,
         taskClarityStructuredPromptFileCount: latest.taskClarityStructuredPromptFileCount - previous.taskClarityStructuredPromptFileCount,
+        taskClarityGoalModeMarkerCount: latest.taskClarityGoalModeMarkerCount - previous.taskClarityGoalModeMarkerCount,
+        taskClaritySlashGoalCommandCount: latest.taskClaritySlashGoalCommandCount - previous.taskClaritySlashGoalCommandCount,
+        taskClarityGoalModeFileCount: latest.taskClarityGoalModeFileCount - previous.taskClarityGoalModeFileCount,
         taskClarityMissingDoneMarkerFileCount: latest.taskClarityMissingDoneMarkerFileCount - previous.taskClarityMissingDoneMarkerFileCount,
         taskClarityMissingVerificationMarkerFileCount:
           latest.taskClarityMissingVerificationMarkerFileCount - previous.taskClarityMissingVerificationMarkerFileCount,
         taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - previous.taskClarityHighChurnFileCount,
         taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - previous.taskClarityUnparsedFileCount,
+        planningHasTemplate: Number(latest.planningHasTemplate) - Number(previous.planningHasTemplate),
+        planningMissingForComplexWork: Number(latest.planningMissingForComplexWork) - Number(previous.planningMissingForComplexWork),
+        planningTemplateCount: latest.planningTemplateCount - previous.planningTemplateCount,
+        planningTemplateBytes: latest.planningTemplateBytes - previous.planningTemplateBytes,
+        planningComplexSignalCount: latest.planningComplexSignalCount - previous.planningComplexSignalCount,
+        planEffortConfigured: Number(latest.planEffortConfigured) - Number(previous.planEffortConfigured),
+        planEffortSplit: Number(latest.planEffortSplit) - Number(previous.planEffortSplit),
+        planEffortFlatHigh: Number(latest.planEffortFlatHigh) - Number(previous.planEffortFlatHigh),
+        planEffortFlatLow: Number(latest.planEffortFlatLow) - Number(previous.planEffortFlatLow),
+        planEffortSmallTaskDragRisk:
+          Number(latest.planEffortSmallTaskDragRisk) - Number(previous.planEffortSmallTaskDragRisk),
+        planEffortFastProfileBackstop:
+          Number(latest.planEffortFastProfileBackstop) - Number(previous.planEffortFastProfileBackstop),
+        planEffortOverkill: Number(latest.planEffortOverkill) - Number(previous.planEffortOverkill),
+        planEffortUndercooked: Number(latest.planEffortUndercooked) - Number(previous.planEffortUndercooked),
+        validationHasCommand: Number(latest.validationHasCommand) - Number(previous.validationHasCommand),
+        validationHasGuidance: Number(latest.validationHasGuidance) - Number(previous.validationHasGuidance),
+        validationHasReviewGuidance: Number(latest.validationHasReviewGuidance) - Number(previous.validationHasReviewGuidance),
+        validationMissingCommand: Number(latest.validationMissingCommand) - Number(previous.validationMissingCommand),
+        validationMissingGuidance: Number(latest.validationMissingGuidance) - Number(previous.validationMissingGuidance),
+        validationMissingReviewGuidance:
+          Number(latest.validationMissingReviewGuidance) - Number(previous.validationMissingReviewGuidance),
+        validationScriptCount: latest.validationScriptCount - previous.validationScriptCount,
+        validationReviewFileCount: latest.validationReviewFileCount - previous.validationReviewFileCount,
+        validationGuidanceFileCount: latest.validationGuidanceFileCount - previous.validationGuidanceFileCount,
+        reviewLaneDirtyCount: latest.reviewLaneDirtyCount - previous.reviewLaneDirtyCount,
+        reviewLaneConflictedCount: latest.reviewLaneConflictedCount - previous.reviewLaneConflictedCount,
+        reviewLaneDiffLineChangeCount: latest.reviewLaneDiffLineChangeCount - previous.reviewLaneDiffLineChangeCount,
+        reviewLaneHasReviewGuidance: Number(latest.reviewLaneHasReviewGuidance) - Number(previous.reviewLaneHasReviewGuidance),
+        reviewLaneHasReviewModel: Number(latest.reviewLaneHasReviewModel) - Number(previous.reviewLaneHasReviewModel),
+        reviewLaneLargeChangeSet: Number(latest.reviewLaneLargeChangeSet) - Number(previous.reviewLaneLargeChangeSet),
+        reviewLaneUnreviewedDirtyWork: Number(latest.reviewLaneUnreviewedDirtyWork) - Number(previous.reviewLaneUnreviewedDirtyWork),
+        manualHasCache: Number(latest.manualHasCache) - Number(previous.manualHasCache),
+        manualHasOutline: Number(latest.manualHasOutline) - Number(previous.manualHasOutline),
+        manualAgeDays: latest.manualAgeDays - previous.manualAgeDays,
+        manualStale: Number(latest.manualStale) - Number(previous.manualStale),
+        manualVeryStale: Number(latest.manualVeryStale) - Number(previous.manualVeryStale),
+        manualMissingTopicCount: latest.manualMissingTopicCount - previous.manualMissingTopicCount,
+        goalGoalsFeature: Number(latest.goalGoalsFeature) - Number(previous.goalGoalsFeature),
+        goalLongWorkSignal: Number(latest.goalLongWorkSignal) - Number(previous.goalLongWorkSignal),
+        goalExplicitSignal: Number(latest.goalExplicitSignal) - Number(previous.goalExplicitSignal),
+        goalMissingFeatureForLongWork:
+          Number(latest.goalMissingFeatureForLongWork) - Number(previous.goalMissingFeatureForLongWork),
+        goalMissingExplicitForLongWork:
+          Number(latest.goalMissingExplicitForLongWork) - Number(previous.goalMissingExplicitForLongWork),
+        goalMissingCompletionCriteria:
+          Number(latest.goalMissingCompletionCriteria) - Number(previous.goalMissingCompletionCriteria),
+        goalModeMarkerCount: latest.goalModeMarkerCount - previous.goalModeMarkerCount,
+        goalSlashCommandCount: latest.goalSlashCommandCount - previous.goalSlashCommandCount,
+        goalModeFileCount: latest.goalModeFileCount - previous.goalModeFileCount,
         turnTelemetryCompletedTurnCount: latest.turnTelemetryCompletedTurnCount - previous.turnTelemetryCompletedTurnCount,
         turnTelemetryMaxDurationMs: latest.turnTelemetryMaxDurationMs - previous.turnTelemetryMaxDurationMs,
         turnTelemetrySlowTurnCount: latest.turnTelemetrySlowTurnCount - previous.turnTelemetrySlowTurnCount,
@@ -14636,6 +17508,14 @@ export async function benchmarkHistory(limit = 12) {
         shellStartupTimeoutCount: latest.shellStartupTimeoutCount - previous.shellStartupTimeoutCount,
         shellStartupMedianMs: latest.shellStartupMedianMs - previous.shellStartupMedianMs,
         shellStartupMaxMs: latest.shellStartupMaxMs - previous.shellStartupMaxMs,
+        cliCompletionFound: Number(latest.cliCompletionFound) - Number(previous.cliCompletionFound),
+        cliCompletionConfigMatchCount: latest.cliCompletionConfigMatchCount - previous.cliCompletionConfigMatchCount,
+        cliCompletionFileCount: latest.cliCompletionFileCount - previous.cliCompletionFileCount,
+        cliCompletionZshCompinitMissing: Number(latest.cliCompletionZshCompinitMissing) - Number(previous.cliCompletionZshCompinitMissing),
+        strictConfigOk: Number(latest.strictConfigOk) - Number(previous.strictConfigOk),
+        strictConfigFailed: Number(latest.strictConfigFailed) - Number(previous.strictConfigFailed),
+        strictConfigWarningCount: latest.strictConfigWarningCount - previous.strictConfigWarningCount,
+        strictConfigDurationMs: latest.strictConfigDurationMs - previous.strictConfigDurationMs,
         codexWorktreeBytes: latest.codexWorktreeBytes - previous.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - previous.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - previous.codexWorktreeLargeCount,
@@ -14651,6 +17531,15 @@ export async function benchmarkHistory(limit = 12) {
         appServerUnauthenticatedWebsocketCount: latest.appServerUnauthenticatedWebsocketCount - previous.appServerUnauthenticatedWebsocketCount,
         appServerNonLoopbackUnauthenticatedCount:
           latest.appServerNonLoopbackUnauthenticatedCount - previous.appServerNonLoopbackUnauthenticatedCount,
+        runtimeCliDurationMs: latest.runtimeCliDurationMs - previous.runtimeCliDurationMs,
+        runtimeAppDurationMs: latest.runtimeAppDurationMs - previous.runtimeAppDurationMs,
+        runtimeMaxLaunchMs: latest.runtimeMaxLaunchMs - previous.runtimeMaxLaunchMs,
+        runtimeLaunchTimedOut: Number(latest.runtimeLaunchTimedOut) - Number(previous.runtimeLaunchTimedOut),
+        runtimeLaunchFailed: Number(latest.runtimeLaunchFailed) - Number(previous.runtimeLaunchFailed),
+        runtimeLaunchMissing: Number(latest.runtimeLaunchMissing) - Number(previous.runtimeLaunchMissing),
+        runtimeCliTimedOut: Number(latest.runtimeCliTimedOut) - Number(previous.runtimeCliTimedOut),
+        runtimeAppTimedOut: Number(latest.runtimeAppTimedOut) - Number(previous.runtimeAppTimedOut),
+        runtimeVersionMismatch: Number(latest.runtimeVersionMismatch) - Number(previous.runtimeVersionMismatch),
         modelHighEffort: Number(latest.modelHighEffort) - Number(previous.modelHighEffort),
         modelXHighEffort: Number(latest.modelXHighEffort) - Number(previous.modelXHighEffort),
         modelLowEffort: Number(latest.modelLowEffort) - Number(previous.modelLowEffort),
@@ -14691,6 +17580,13 @@ export async function benchmarkHistory(limit = 12) {
         instructionTotalBytes: latest.instructionTotalBytes - previous.instructionTotalBytes,
         instructionProjectCandidateBytes: latest.instructionProjectCandidateBytes - previous.instructionProjectCandidateBytes,
         instructionOverrideBytes: latest.instructionOverrideBytes - previous.instructionOverrideBytes,
+        chronicleBytes: latest.chronicleBytes - previous.chronicleBytes,
+        chronicleScreenCaptureBytes: latest.chronicleScreenCaptureBytes - previous.chronicleScreenCaptureBytes,
+        chronicleScreenCaptureFiles: latest.chronicleScreenCaptureFiles - previous.chronicleScreenCaptureFiles,
+        chronicleMemoryBytes: latest.chronicleMemoryBytes - previous.chronicleMemoryBytes,
+        chronicleMemoryFiles: latest.chronicleMemoryFiles - previous.chronicleMemoryFiles,
+        chronicleLikelyRunning: Number(latest.chronicleLikelyRunning) - Number(previous.chronicleLikelyRunning),
+        chronicleRateLimitGuardLow: Number(latest.chronicleRateLimitGuardLow) - Number(previous.chronicleRateLimitGuardLow),
         skillCount: latest.skillCount - previous.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - previous.skillEstimatedCatalogChars,
         customPromptCount: latest.customPromptCount - previous.customPromptCount,
@@ -14719,6 +17615,12 @@ export async function benchmarkHistory(limit = 12) {
         telemetryProjectIgnoredCount: latest.telemetryProjectIgnoredCount - previous.telemetryProjectIgnoredCount,
         telemetryHeaderKeyCount: latest.telemetryHeaderKeyCount - previous.telemetryHeaderKeyCount,
         telemetryEnvironmentConfigured: Number(latest.telemetryEnvironmentConfigured) - Number(previous.telemetryEnvironmentConfigured),
+        statusLineConfigured: Number(latest.statusLineConfigured) - Number(previous.statusLineConfigured),
+        statusLineHidden: Number(latest.statusLineHidden) - Number(previous.statusLineHidden),
+        statusLineFieldCount: latest.statusLineFieldCount - previous.statusLineFieldCount,
+        statusLineMissingModel: Number(latest.statusLineMissingModel) - Number(previous.statusLineMissingModel),
+        statusLineMissingContext: Number(latest.statusLineMissingContext) - Number(previous.statusLineMissingContext),
+        statusLineDense: Number(latest.statusLineDense) - Number(previous.statusLineDense),
         automationScannedFileCount: latest.automationScannedFileCount - previous.automationScannedFileCount,
         automationScannedBytes: latest.automationScannedBytes - previous.automationScannedBytes,
         automationCodexExecCount: latest.automationCodexExecCount - previous.automationCodexExecCount,
@@ -14823,6 +17725,7 @@ export async function runBenchmark() {
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const notificationFlow = scan.codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const telemetry = scan.codexConfig?.telemetry || buildTelemetrySummary({});
+  const statusLine = scan.codexConfig?.statusLine || buildStatusLineSummary({});
   const automation = scan.codexConfig?.automation || emptyAutomationSummary();
   const historyRetention = scan.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = scan.codexConfig?.storagePaths || {};
@@ -14834,8 +17737,19 @@ export async function runBenchmark() {
   const cloudHandoff = scan.codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const remoteHosts = scan.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const shellStartup = scan.codexConfig?.shellStartup || emptyShellStartupSummary();
+  const cliCompletion = scan.codexConfig?.cliCompletion || emptyCliCompletionSummary();
+  const strictConfig = scan.codexConfig?.strictConfig || emptyStrictConfigSummary();
   const appServerTransport = scan.processes?.appServerTransport || emptyAppServerTransportSummary();
   const permissionsProfile = scan.codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
+  const chronicleLoad = scan.categories?.chronicleLoad || emptyChronicleLoadSummary();
+  const planningReadiness = scan.codexConfig?.planningReadiness || emptyPlanningReadinessSummary();
+  const planEffort = scan.codexConfig?.planEffort || buildPlanEffortSummary({}, scan.codexConfig || {});
+  const goalReadiness = scan.codexConfig?.goalReadiness || emptyGoalReadinessSummary();
+  const validationReadiness = scan.codexConfig?.validationReadiness || emptyValidationReadinessSummary(currentProject);
+  const reviewLane = scan.codexConfig?.reviewLane || emptyReviewLaneSummary(currentProject);
+  const manualFreshness = scan.codexConfig?.manualFreshness || emptyCodexManualFreshnessSummary();
+  const runtime = scan.runtime || {};
+  const runtimeLaunch = runtime.launch || buildCodexLaunchSummary(runtime);
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
   const modelEffort = scan.codexConfig?.reasoningEffort || "default";
@@ -14848,7 +17762,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v24",
+    scoreModel: "local-state-v35",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -14893,9 +17807,107 @@ export async function runBenchmark() {
     taskClarityStructuredPromptFileCount: taskClarity.structuredPromptFileCount || 0,
     taskClarityMissingDoneMarkerFileCount: taskClarity.missingDoneMarkerFileCount || 0,
     taskClarityMissingVerificationMarkerFileCount: taskClarity.missingVerificationMarkerFileCount || 0,
+    taskClarityGoalModeMarkerCount: taskClarity.goalModeMarkerCount || 0,
+    taskClaritySlashGoalCommandCount: taskClarity.slashGoalCommandCount || 0,
+    taskClarityGoalModeFileCount: taskClarity.goalModeFileCount || 0,
     taskClarityHighChurnFileCount: taskClarity.highChurnFileCount || 0,
     taskClarityCappedFileCount: taskClarity.cappedFileCount || 0,
     taskClarityUnparsedFileCount: taskClarity.unparsedFileCount || 0,
+    planningTone: planningReadiness.tone || "low",
+    planningLabel: planningReadiness.label || "Optional",
+    planningHasTemplate: Boolean(planningReadiness.hasPlanTemplate),
+    planningMissingTemplate: Boolean(planningReadiness.missingPlanTemplate),
+    planningMissingForComplexWork: Boolean(planningReadiness.missingPlanForComplexWork),
+    planningTemplateCount: planningReadiness.templateCount || 0,
+    planningTemplateBytes: planningReadiness.templateBytes || 0,
+    planningTemplateLargeCount: planningReadiness.templateLargeCount || 0,
+    planningTemplateHuge: Boolean(planningReadiness.templateHuge),
+    planningComplexSignalCount: planningReadiness.complexSignalCount || 0,
+    planningHighChurnFileCount: planningReadiness.highChurnFileCount || 0,
+    planEffortTone: planEffort.tone || "low",
+    planEffortLabel: planEffort.label || "Default",
+    planEffortConfigured: Boolean(planEffort.planEffortConfigured),
+    planEffortDefaultHigh: Boolean(planEffort.defaultHighEffort),
+    planEffortDefaultXHigh: Boolean(planEffort.defaultXHighEffort),
+    planEffortDefaultLow: Boolean(planEffort.defaultLowEffort),
+    planEffortPlanHigh: Boolean(planEffort.planHighEffort),
+    planEffortPlanXHigh: Boolean(planEffort.planXHighEffort),
+    planEffortPlanLow: Boolean(planEffort.planLowEffort),
+    planEffortSplit: Boolean(planEffort.splitPlanningEffort),
+    planEffortFlatHigh: Boolean(planEffort.flatHighReasoning),
+    planEffortFlatLow: Boolean(planEffort.flatLowPlanning),
+    planEffortSmallTaskDragRisk: Boolean(planEffort.smallTaskDragRisk),
+    planEffortFastProfileBackstop: Boolean(planEffort.fastProfileBackstop),
+    planEffortOverkill: Boolean(planEffort.planEffortOverkill),
+    planEffortUndercooked: Boolean(planEffort.planEffortUndercooked),
+    validationTone: validationReadiness.tone || "low",
+    validationLabel: validationReadiness.label || "Optional",
+    validationHasCommand: Boolean(validationReadiness.hasValidationScript),
+    validationHasTestScript: Boolean(validationReadiness.hasTestScript),
+    validationHasBuildScript: Boolean(validationReadiness.hasBuildScript),
+    validationHasLintScript: Boolean(validationReadiness.hasLintScript),
+    validationHasTypecheckScript: Boolean(validationReadiness.hasTypecheckScript),
+    validationScriptCount: validationReadiness.validationScriptCount || 0,
+    validationReviewFileCount: validationReadiness.reviewFileCount || 0,
+    validationGuidanceFileCount: validationReadiness.guidanceFileCount || 0,
+    validationHasGuidance: Boolean(validationReadiness.hasVerificationGuidance),
+    validationHasReviewGuidance: Boolean(validationReadiness.hasReviewGuidance),
+    validationMissingCommand: Boolean(validationReadiness.missingValidationCommand),
+    validationMissingGuidance: Boolean(validationReadiness.missingVerificationGuidance),
+    validationMissingReviewGuidance: Boolean(validationReadiness.missingReviewGuidance),
+    reviewLaneTone: reviewLane.tone || "low",
+    reviewLaneLabel: reviewLane.label || "Clean",
+    reviewLaneHasGitRepo: Boolean(reviewLane.hasGitRepo),
+    reviewLaneDirtyCount: reviewLane.dirtyCount || 0,
+    reviewLaneStagedCount: reviewLane.stagedCount || 0,
+    reviewLaneUnstagedCount: reviewLane.unstagedCount || 0,
+    reviewLaneUntrackedCount: reviewLane.untrackedCount || 0,
+    reviewLaneConflictedCount: reviewLane.conflictedCount || 0,
+    reviewLaneDiffFileCount: reviewLane.diffFileCount || 0,
+    reviewLaneDiffInsertions: reviewLane.diffInsertions || 0,
+    reviewLaneDiffDeletions: reviewLane.diffDeletions || 0,
+    reviewLaneDiffLineChangeCount: reviewLane.diffLineChangeCount || 0,
+    reviewLaneHasReviewGuidance: Boolean(reviewLane.hasReviewGuidance),
+    reviewLaneReviewFileCount: reviewLane.reviewFileCount || 0,
+    reviewLaneHasReviewModel: Boolean(reviewLane.hasReviewModel),
+    reviewLaneLargeChangeSet: Boolean(reviewLane.largeChangeSet),
+    reviewLaneUnreviewedDirtyWork: Boolean(reviewLane.unreviewedDirtyWork),
+    reviewLaneMissingBaseForReview: Boolean(reviewLane.missingBaseForReview),
+    reviewLaneReviewRecommended: Boolean(reviewLane.reviewRecommended),
+    manualFreshnessTone: manualFreshness.tone || "medium",
+    manualFreshnessLabel: manualFreshness.label || "No manual",
+    manualHasCache: Boolean(manualFreshness.hasManual),
+    manualHasOutline: Boolean(manualFreshness.hasOutline),
+    manualBytes: manualFreshness.manualBytes || 0,
+    manualOutlineBytes: manualFreshness.outlineBytes || 0,
+    manualAgeDays: manualFreshness.manualAgeDays || 0,
+    manualStale: Boolean(manualFreshness.stale),
+    manualVeryStale: Boolean(manualFreshness.veryStale),
+    manualTopicCount: manualFreshness.topicCount || 0,
+    manualCoveredTopicCount: manualFreshness.coveredTopicCount || 0,
+    manualMissingTopicCount: manualFreshness.missingTopicCount || 0,
+    goalReadinessTone: goalReadiness.tone || "low",
+    goalReadinessLabel: goalReadiness.label || "Optional",
+    goalGoalsFeature: Boolean(goalReadiness.goalsFeature),
+    goalLongWorkSignal: Boolean(goalReadiness.longWorkSignal),
+    goalExplicitSignal: Boolean(goalReadiness.explicitGoalSignal),
+    goalMissingFeatureForLongWork: Boolean(goalReadiness.missingFeatureForLongWork),
+    goalMissingExplicitForLongWork: Boolean(goalReadiness.missingExplicitGoalForLongWork),
+    goalMissingCompletionCriteria: Boolean(goalReadiness.missingCompletionCriteria),
+    goalModeMarkerCount: goalReadiness.goalModeMarkerCount || 0,
+    goalSlashCommandCount: goalReadiness.slashGoalCommandCount || 0,
+    goalModeFileCount: goalReadiness.goalModeFileCount || 0,
+    runtimeLaunchTone: runtimeLaunch.tone || "low",
+    runtimeLaunchLabel: runtimeLaunch.label || "Not measured",
+    runtimeCliDurationMs: runtime.cliDurationMs || 0,
+    runtimeAppDurationMs: runtime.appDurationMs || 0,
+    runtimeMaxLaunchMs: runtimeLaunch.maxDurationMs || 0,
+    runtimeLaunchTimedOut: Boolean(runtimeLaunch.timedOut),
+    runtimeLaunchFailed: Boolean(runtimeLaunch.failed),
+    runtimeLaunchMissing: Boolean(runtimeLaunch.missing),
+    runtimeCliTimedOut: Boolean(runtime.cliTimedOut),
+    runtimeAppTimedOut: Boolean(runtime.appTimedOut),
+    runtimeVersionMismatch: Boolean(runtime.versionMismatch),
     turnTelemetryTone: turnTelemetry.tone || "low",
     turnTelemetryScannedFileCount: turnTelemetry.scannedFileCount || 0,
     turnTelemetryFileCount: turnTelemetry.fileCount || 0,
@@ -14985,6 +17997,23 @@ export async function runBenchmark() {
     shellStartupMedianMs: shellStartup.medianMs || 0,
     shellStartupMeanMs: shellStartup.meanMs || 0,
     shellStartupMaxMs: shellStartup.maxMs || 0,
+    cliCompletionTone: cliCompletion.tone || "low",
+    cliCompletionLabel: cliCompletion.label || "Not checked",
+    cliCompletionShellName: cliCompletion.shellName || null,
+    cliCompletionCliFound: Boolean(cliCompletion.cliFound),
+    cliCompletionFound: Boolean(cliCompletion.completionFound),
+    cliCompletionConfigMatchCount: cliCompletion.configMatchCount || 0,
+    cliCompletionFileCount: cliCompletion.completionFileCount || 0,
+    cliCompletionZshCompinitMissing: Boolean(cliCompletion.zshCompinitMissing),
+    strictConfigTone: strictConfig.tone || "low",
+    strictConfigLabel: strictConfig.label || "Not checked",
+    strictConfigCliFound: Boolean(strictConfig.cliFound),
+    strictConfigOk: Boolean(strictConfig.ok),
+    strictConfigFailed: Boolean(strictConfig.failed),
+    strictConfigTimedOut: Boolean(strictConfig.timedOut),
+    strictConfigWarningCount: strictConfig.warningCount || 0,
+    strictConfigDurationMs: strictConfig.durationMs || 0,
+    strictConfigExitCode: strictConfig.exitCode ?? null,
     codexWorktreeBytes: scan.categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: scan.categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: scan.categories.codexWorktrees?.largeWorktreeCount || 0,
@@ -15089,6 +18118,20 @@ export async function runBenchmark() {
     permissionsProfileNetworkDomainRuleCount: permissionsProfile.networkDomainRuleCount || 0,
     permissionsProfileNetworkGlobalAllow: Boolean(permissionsProfile.networkGlobalAllow),
     permissionsProfileNetworkNoDomainRules: Boolean(permissionsProfile.networkNoDomainRules),
+    chronicleTone: chronicleLoad.tone || "low",
+    chronicleValue: chronicleLoad.value || "Quiet",
+    chronicleBytes: chronicleLoad.bytes || 0,
+    chronicleFiles: chronicleLoad.fileCount || 0,
+    chronicleScreenCaptureExists: Boolean(chronicleLoad.screenCaptureExists),
+    chronicleScreenCaptureBytes: chronicleLoad.screenCaptureBytes || 0,
+    chronicleScreenCaptureFiles: chronicleLoad.screenCaptureFiles || 0,
+    chronicleMemoryExists: Boolean(chronicleLoad.memoryExists),
+    chronicleMemoryBytes: chronicleLoad.memoryBytes || 0,
+    chronicleMemoryFiles: chronicleLoad.memoryFiles || 0,
+    chronicleLikelyRunning: Boolean(chronicleLoad.likelyRunning),
+    chronicleRateLimitGuardConfigured: Boolean(chronicleLoad.rateLimitGuardConfigured),
+    chronicleRateLimitGuardLow: Boolean(chronicleLoad.rateLimitGuardLow),
+    chronicleMinRateLimitRemainingPercent: chronicleLoad.minRateLimitRemainingPercent ?? null,
     mcpEnabledCount: scan.codexConfig?.mcpSummary?.enabledCount || 0,
     mcpRequiredCount: scan.codexConfig?.mcpSummary?.requiredCount || 0,
     mcpMissingEnvVarCount: scan.codexConfig?.mcpSummary?.missingEnvVarCount || 0,
@@ -15223,6 +18266,14 @@ export async function runBenchmark() {
     telemetryProjectIgnoredCount: telemetry.projectIgnoredTelemetryCount || 0,
     telemetryHeaderKeyCount: telemetry.headerKeyCount || 0,
     telemetryEnvironmentConfigured: Boolean(telemetry.environmentConfigured),
+    statusLineTone: statusLine.tone || "low",
+    statusLineLabel: statusLine.label || "Default",
+    statusLineConfigured: Boolean(statusLine.configured),
+    statusLineHidden: Boolean(statusLine.hidden),
+    statusLineFieldCount: statusLine.fieldCount || 0,
+    statusLineMissingModel: Boolean(statusLine.missingModel),
+    statusLineMissingContext: Boolean(statusLine.missingContext),
+    statusLineDense: Boolean(statusLine.dense),
     automationTone: automation.tone || "low",
     automationLabel: automation.label || "No automation",
     automationScannedFileCount: automation.scannedFileCount || 0,

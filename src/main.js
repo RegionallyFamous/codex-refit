@@ -618,6 +618,7 @@ function renderScan(scan) {
     scan.categories.generatedImagesArchive,
     scan.categories.codexWorktrees,
     scan.categories.memoryState,
+    scan.categories.chronicleLoad,
     scan.categories.logs,
     scan.categories.crashDumps,
     scan.categories.browserCaches,
