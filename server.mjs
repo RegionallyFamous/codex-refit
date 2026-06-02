@@ -200,6 +200,271 @@ function buildApprovalFlowSummary(values = {}) {
   };
 }
 
+function emptyPermissionsProfileSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "Default",
+    action: "Optional",
+    detail:
+      "No custom Codex permissions profile is selected. Refit will use sandbox, approval, and command-rule diagnostics for the current permission shape.",
+    defaultPermissions: null,
+    activeProfileName: null,
+    activeBuiltInProfile: null,
+    activeCustomProfile: false,
+    profileCount: 0,
+    activeProfileFound: false,
+    unknownDefaultProfile: false,
+    dangerFullAccessDefault: false,
+    readOnlyDefault: false,
+    workspaceDefault: false,
+    profileWithoutExtendsCount: 0,
+    activeProfileWithoutExtends: false,
+    profileExtendsDangerCount: 0,
+    workspaceRootCount: 0,
+    relativeWorkspaceRootCount: 0,
+    filesystemRuleCount: 0,
+    workspaceRootRuleCount: 0,
+    writeRuleCount: 0,
+    denyRuleCount: 0,
+    envDenyRuleCount: 0,
+    networkEnabled: false,
+    networkDomainRuleCount: 0,
+    networkGlobalAllow: false,
+    networkNoDomainRules: false,
+    profiles: [],
+  };
+}
+
+function permissionBuiltInProfile(value) {
+  const normalized = normalizeConfigKey(String(value || "").replace(/^:/, ""));
+  if (normalized === "read_only") return ":read-only";
+  if (normalized === "workspace") return ":workspace";
+  if (normalized === "danger_full_access" || normalized === "dangerously_bypass_approvals_and_sandbox") return ":danger-full-access";
+  return null;
+}
+
+function permissionProfileDescriptors(values = {}, sections = []) {
+  const descriptors = new Map();
+  const add = (name, prefix) => {
+    if (!name || !prefix) return;
+    const existing = descriptors.get(name) || { name, prefixes: new Set() };
+    existing.prefixes.add(prefix);
+    descriptors.set(name, existing);
+  };
+  const collect = (source) => {
+    const match = String(source || "").match(/^permissions\.(?:"([^"]+)"|([^.]+))(?:\.|$)/);
+    if (!match) return;
+    const name = match[1] || match[2];
+    const prefix = `permissions.${match[1] ? `"${match[1]}"` : match[2]}`;
+    add(name, prefix);
+  };
+
+  for (const key of Object.keys(values)) collect(key);
+  for (const section of sections) collect(section);
+  return [...descriptors.values()].map((descriptor) => ({
+    name: descriptor.name,
+    prefixes: [...descriptor.prefixes],
+  }));
+}
+
+function firstPermissionValue(values = {}, prefixes = [], suffix) {
+  for (const prefix of prefixes) {
+    const key = `${prefix}.${suffix}`;
+    if (values[key] !== undefined) return values[key];
+  }
+  return undefined;
+}
+
+function permissionEntries(values = {}, prefixes = [], suffix) {
+  const entries = [];
+  for (const prefix of prefixes) {
+    const tablePrefix = `${prefix}.${suffix}`;
+    entries.push(...tomlInlineTableEntries(values[tablePrefix]));
+    entries.push(...sectionTableEntries(values, tablePrefix));
+  }
+  return entries;
+}
+
+function permissionKeys(values = {}, prefixes = [], suffix) {
+  return Object.keys(values).filter((key) => prefixes.some((prefix) => key.startsWith(`${prefix}.${suffix}`)));
+}
+
+function resolvePermissionRoot(rootValue) {
+  const text = String(rootValue || "").trim();
+  if (!text) return text;
+  if (text === "~") return homeDir;
+  if (text.startsWith("~/")) return path.join(homeDir, text.slice(2));
+  return text;
+}
+
+function buildPermissionsProfileSummary(values = {}, sections = []) {
+  const summary = emptyPermissionsProfileSummary();
+  const defaultPermissions = values.default_permissions ? String(values.default_permissions) : null;
+  const builtInDefault = permissionBuiltInProfile(defaultPermissions);
+  const descriptors = permissionProfileDescriptors(values, sections);
+  const profiles = descriptors
+    .map((descriptor) => {
+      const workspaceEntries = permissionEntries(values, descriptor.prefixes, "workspace_roots");
+      const workspaceRoots = workspaceEntries
+        .filter((entry) => entry.value === true || normalizeConfigKey(entry.value) === "true")
+        .map((entry) => String(entry.key || ""))
+        .filter(Boolean);
+      const resolvedWorkspaceRoots = workspaceRoots.map(resolvePermissionRoot);
+      const relativeWorkspaceRoots = resolvedWorkspaceRoots.filter((root) => root && !path.isAbsolute(root) && !root.startsWith(":"));
+      const filesystemKeys = permissionKeys(values, descriptor.prefixes, "filesystem");
+      const filesystemRules = filesystemKeys
+        .map((key) => ({
+          key,
+          value: normalizeConfigKey(values[key]),
+        }))
+        .filter((rule) => ["read", "write", "deny"].includes(rule.value));
+      const workspaceRootRuleCount = filesystemRules.filter(
+        (rule) => rule.key.includes("filesystem.:workspace_roots.") || rule.key.includes('filesystem.":workspace_roots".'),
+      ).length;
+      const networkEnabled = descriptor.prefixes.some((prefix) => values[`${prefix}.network.enabled`] === true);
+      const networkDomainEntriesForProfile = descriptor.prefixes.flatMap((prefix) => networkDomainEntries(values, `${prefix}.network.domains`));
+      const networkGlobalAllow = networkDomainEntriesForProfile.some(
+        (entry) => entry.key === "*" && (entry.value === "allow" || entry.value === "true"),
+      );
+      const extendsProfile = firstPermissionValue(values, descriptor.prefixes, "extends") || null;
+      const builtInParent = permissionBuiltInProfile(extendsProfile);
+
+      return {
+        name: descriptor.name,
+        extends: extendsProfile,
+        extendsBuiltIn: builtInParent,
+        extendsDanger: builtInParent === ":danger-full-access",
+        workspaceRootCount: workspaceRoots.length,
+        relativeWorkspaceRootCount: relativeWorkspaceRoots.length,
+        filesystemRuleCount: filesystemRules.length,
+        workspaceRootRuleCount,
+        writeRuleCount: filesystemRules.filter((rule) => rule.value === "write").length,
+        denyRuleCount: filesystemRules.filter((rule) => rule.value === "deny").length,
+        envDenyRuleCount: filesystemRules.filter((rule) => rule.value === "deny" && /\.env|env/i.test(rule.key)).length,
+        networkEnabled,
+        networkDomainRuleCount: networkDomainEntriesForProfile.length,
+        networkGlobalAllow,
+        networkNoDomainRules: networkEnabled && networkDomainEntriesForProfile.length === 0,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const activeCustomProfile = defaultPermissions && !builtInDefault ? profiles.find((profile) => profile.name === defaultPermissions) || null : null;
+  const activeProfile = activeCustomProfile || null;
+  const unknownDefaultProfile = Boolean(defaultPermissions && !builtInDefault && !activeCustomProfile);
+  const dangerFullAccessDefault = builtInDefault === ":danger-full-access";
+  const readOnlyDefault = builtInDefault === ":read-only";
+  const workspaceDefault = builtInDefault === ":workspace";
+  const profileWithoutExtendsCount = profiles.filter((profile) => !profile.extends).length;
+  const profileExtendsDangerCount = profiles.filter((profile) => profile.extendsDanger).length;
+  const networkEnabled = Boolean(activeProfile?.networkEnabled);
+  const networkDomainRuleCount = Number(activeProfile?.networkDomainRuleCount || 0);
+  const networkGlobalAllow = Boolean(activeProfile?.networkGlobalAllow);
+  const networkNoDomainRules = Boolean(activeProfile?.networkNoDomainRules);
+  const highLoad = dangerFullAccessDefault || networkGlobalAllow || profileExtendsDangerCount > 0;
+  const mediumLoad =
+    highLoad ||
+    unknownDefaultProfile ||
+    readOnlyDefault ||
+    Boolean(activeProfile && !activeProfile.extends) ||
+    Boolean(activeProfile && activeProfile.workspaceRootCount === 0) ||
+    Boolean(activeProfile && activeProfile.relativeWorkspaceRootCount > 0) ||
+    networkNoDomainRules;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = dangerFullAccessDefault
+    ? "Full access"
+    : readOnlyDefault
+      ? "Read only"
+      : activeProfile
+        ? activeProfile.name
+        : workspaceDefault
+          ? "Workspace"
+          : defaultPermissions
+            ? "Unknown profile"
+            : profiles.length
+              ? `${profiles.length.toLocaleString()} configured`
+              : "Default";
+  const action = highLoad
+    ? "Scope profile"
+    : unknownDefaultProfile
+      ? "Fix default"
+      : readOnlyDefault
+        ? "Use workspace"
+        : activeProfile && !activeProfile.extends
+          ? "Extend built-in"
+          : activeProfile && activeProfile.workspaceRootCount === 0
+            ? "Add roots"
+            : networkNoDomainRules
+              ? "Add domains"
+              : profiles.length
+                ? "Keep scoped"
+                : "Optional";
+  const detail =
+    tone === "low"
+      ? activeProfile
+        ? `Active permissions profile ${activeProfile.name} is scoped with ${activeProfile.workspaceRootCount.toLocaleString()} workspace root${activeProfile.workspaceRootCount === 1 ? "" : "s"}, ${activeProfile.denyRuleCount.toLocaleString()} deny rule${activeProfile.denyRuleCount === 1 ? "" : "s"}, and ${networkDomainRuleCount.toLocaleString()} network domain rule${networkDomainRuleCount === 1 ? "" : "s"}.`
+        : profiles.length
+          ? `${profiles.length.toLocaleString()} custom permissions profile${profiles.length === 1 ? "" : "s"} configured, but none is selected with default_permissions.`
+          : "No custom Codex permissions profile is selected. Refit will use sandbox, approval, and command-rule diagnostics for the current permission shape."
+      : [
+          defaultPermissions ? `default_permissions is ${defaultPermissions}.` : null,
+          unknownDefaultProfile ? "That default does not match a built-in profile or a configured custom permissions profile." : null,
+          dangerFullAccessDefault ? "The active built-in profile removes local sandbox restrictions; reserve it for isolated, intentional runs." : null,
+          readOnlyDefault ? "Read-only permissions are good for planning, but can make setup and edit-heavy work stop repeatedly." : null,
+          activeProfile && !activeProfile.extends
+            ? `Profile ${activeProfile.name} does not extend a built-in profile. The Codex manual recommends extending :workspace or :read-only so baseline protections carry forward.`
+            : null,
+          activeProfile && activeProfile.workspaceRootCount === 0
+            ? `Profile ${activeProfile.name} has no configured workspace roots, so it may not reduce permission friction for your usual project folders.`
+            : null,
+          activeProfile && activeProfile.relativeWorkspaceRootCount
+            ? `${activeProfile.relativeWorkspaceRootCount.toLocaleString()} workspace root${activeProfile.relativeWorkspaceRootCount === 1 ? " is" : "s are"} relative; use concrete paths for predictable app and CLI behavior.`
+            : null,
+          networkNoDomainRules ? "The active profile enables network access without domain rules. Add exact hosts or scoped wildcards for repeat workflows." : null,
+          networkGlobalAllow ? "The active profile has a global '*' network allow rule; prefer exact hosts or scoped wildcards." : null,
+          profileExtendsDangerCount
+            ? `${profileExtendsDangerCount.toLocaleString()} profile${profileExtendsDangerCount === 1 ? "" : "s"} ${pluralVerb(profileExtendsDangerCount)} configured to extend danger-full-access, which Codex rejects.`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    ...summary,
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    defaultPermissions,
+    activeProfileName: activeProfile?.name || null,
+    activeBuiltInProfile: builtInDefault,
+    activeCustomProfile: Boolean(activeProfile),
+    profileCount: profiles.length,
+    activeProfileFound: Boolean(activeProfile || builtInDefault),
+    unknownDefaultProfile,
+    dangerFullAccessDefault,
+    readOnlyDefault,
+    workspaceDefault,
+    profileWithoutExtendsCount,
+    activeProfileWithoutExtends: Boolean(activeProfile && !activeProfile.extends),
+    profileExtendsDangerCount,
+    workspaceRootCount: activeProfile?.workspaceRootCount || 0,
+    relativeWorkspaceRootCount: activeProfile?.relativeWorkspaceRootCount || 0,
+    filesystemRuleCount: activeProfile?.filesystemRuleCount || 0,
+    workspaceRootRuleCount: activeProfile?.workspaceRootRuleCount || 0,
+    writeRuleCount: activeProfile?.writeRuleCount || 0,
+    denyRuleCount: activeProfile?.denyRuleCount || 0,
+    envDenyRuleCount: activeProfile?.envDenyRuleCount || 0,
+    networkEnabled,
+    networkDomainRuleCount,
+    networkGlobalAllow,
+    networkNoDomainRules,
+    profiles,
+  };
+}
+
 function effectiveWebSearchMode(values = {}) {
   const configured = normalizeConfigKey(values.web_search || "");
   if (["live", "cached", "disabled"].includes(configured)) return configured;
@@ -1030,6 +1295,7 @@ const managedSpeedKeys = new Set([
   "approval_policy",
   "approvals_reviewer",
   "sandbox_mode",
+  "default_permissions",
   "web_search",
   "web_search_cached",
   "web_search_request",
@@ -1098,6 +1364,7 @@ function isManagedSpeedKey(key) {
     managedSpeedKeys.has(normalized) ||
     requirementControlKeys.has(normalized) ||
     normalized.startsWith("shell_environment_policy.") ||
+    normalized.startsWith("permissions.") ||
     normalized.startsWith("mcp_servers.") ||
     normalized.startsWith("hooks.") ||
     normalized.startsWith("features.") ||
@@ -8095,6 +8362,7 @@ async function getCodexConfigSummary() {
     approvalReviewer: "user",
     approvalFlow: buildApprovalFlowSummary({}),
     sandboxMode: null,
+    permissionsProfile: emptyPermissionsProfileSummary(),
     serviceTier: null,
     desktopServiceTier: null,
     cliAuthCredentialsStore: null,
@@ -8205,6 +8473,7 @@ async function getCodexConfigSummary() {
   if (!(await exists(paths.configToml))) {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
     summary.networkSandbox = buildNetworkSandboxSummary({}, []);
+    summary.permissionsProfile = buildPermissionsProfileSummary({}, []);
     summary.notificationFlow = buildNotificationFlowSummary({});
     summary.telemetry = buildTelemetrySummary({});
     summary.shellStartup = await getShellStartupSummary();
@@ -8239,6 +8508,7 @@ async function getCodexConfigSummary() {
     summary.approvalReviewer = values.approvals_reviewer || "user";
     summary.approvalFlow = buildApprovalFlowSummary(values);
     summary.sandboxMode = values.sandbox_mode || null;
+    summary.permissionsProfile = buildPermissionsProfileSummary(values, sections);
     summary.serviceTier = values.service_tier || null;
     summary.desktopServiceTier = values["desktop.default-service-tier"] || null;
     summary.cliAuthCredentialsStore = values.cli_auth_credentials_store || null;
@@ -8337,6 +8607,7 @@ async function getCodexConfigSummary() {
       currentProject: summary.projectReadiness.currentProject,
     });
     summary.networkSandbox = buildNetworkSandboxSummary(mcpValues, mcpSections);
+    summary.permissionsProfile = buildPermissionsProfileSummary(mcpValues, mcpSections);
     summary.instructionOverrides = await getInstructionOverrideSummary({
       globalConfigText: text,
       currentProject: summary.projectReadiness.currentProject,
@@ -8507,6 +8778,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const authCache = codexConfig?.authCache || {};
   const modelProvider = codexConfig?.modelProvider || emptyModelProviderSummary();
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
+  const permissionsProfile = codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const processSummary = context.processSummary || {};
   const backgroundSummary = processSummary.background || {};
@@ -8621,6 +8893,39 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Keep approvals scoped. Use fewer prompts only for trusted, focused runs,",
         "# and avoid global danger-full-access unless the environment is isolated.",
+      ].join("\n"),
+    });
+  }
+
+  if (permissionsProfile.status === "ready" && permissionsProfile.tone !== "low") {
+    addFix({
+      id: "permissions-profile",
+      label: "Permissions Profile",
+      value: permissionsProfile.label,
+      tone: permissionsProfile.tone === "high" ? "high" : "medium",
+      action: permissionsProfile.action,
+      detail:
+        "Permissions profiles let Codex keep access scoped while reducing repeated prompts for known project roots and network hosts. Refit reports profile structure only.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        'default_permissions = "project-edit"',
+        "",
+        "[permissions.project-edit]",
+        'description = "Project editing with scoped API/network access."',
+        'extends = ":workspace"',
+        "",
+        "[permissions.project-edit.workspace_roots]",
+        '"/absolute/path/to/project" = true',
+        "",
+        '[permissions.project-edit.filesystem.":workspace_roots"]',
+        '"**/*.env" = "deny"',
+        "",
+        "[permissions.project-edit.network]",
+        "enabled = true",
+        "",
+        "[permissions.project-edit.network.domains]",
+        '"api.openai.com" = "allow"',
+        '"objects.githubusercontent.com" = "allow"',
       ].join("\n"),
     });
   }
@@ -9672,6 +9977,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const authCache = codexConfig?.authCache || {};
   const modelProvider = codexConfig?.modelProvider || emptyModelProviderSummary();
   const approvalFlow = codexConfig?.approvalFlow || buildApprovalFlowSummary({});
+  const permissionsProfile = codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const skillCatalog = scan?.skillCatalog || {};
   const skillCatalogReady = skillCatalog.status === "ready";
@@ -9714,7 +10020,8 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       : memoriesFeature
         ? `Memories are enabled, but Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`
         : `Memories are off in config. Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`;
-  const docsSource = "Official Codex manual: Speed, /status, Cloud Threads, Remote Connections, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
+  const docsSource =
+    "Official Codex manual: Speed, /status, Permissions, Cloud Threads, Remote Connections, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
   const processReady = processSummary?.status === "ready";
   const processLoaded = processReady && processSummary.tone !== "low";
   const processCount = Number(processSummary?.processCount || 0);
@@ -9881,6 +10188,24 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: approvalFlow.action || "Review prompts",
       priority: approvalFlow.priority || 72,
       detail: approvalFlow.detail || "Approval prompts can interrupt fast runs. Use /permissions or config only when the trust/safety tradeoff is right.",
+    },
+    {
+      id: "permissions-profile",
+      label: "Permissions Profile",
+      value: permissionsProfile.label,
+      tone: permissionsProfile.tone,
+      action: permissionsProfile.action,
+      priority:
+        permissionsProfile.tone === "high"
+          ? 92
+          : permissionsProfile.tone === "medium"
+            ? permissionsProfile.unknownDefaultProfile || permissionsProfile.dangerFullAccessDefault
+              ? 82
+              : 66
+            : permissionsProfile.activeCustomProfile
+              ? 28
+              : 15,
+      detail: permissionsProfile.detail,
     },
     {
       id: "approval-friction",
@@ -10512,6 +10837,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         approvalFriction.sandboxDenialCount || approvalFriction.execPolicyMarkerCount
           ? `${approvalFriction.detail} Use /permissions and codex execpolicy check to tune the approval path before assuming database cleanup will help.`
           : approvalFriction.detail,
+    });
+  }
+
+  if (permissionsProfile.status === "ready" && permissionsProfile.tone !== "low") {
+    addRecommendation({
+      id: "permissions-profile",
+      label: "Permissions Profile",
+      value: permissionsProfile.label,
+      action: permissionsProfile.action,
+      tone: permissionsProfile.tone === "high" ? "high" : "medium",
+      priority: permissionsProfile.tone === "high" ? 91 : 70,
+      detail:
+        permissionsProfile.dangerFullAccessDefault || permissionsProfile.networkGlobalAllow
+          ? `${permissionsProfile.detail} Use a custom profile that extends :workspace before choosing broad access as the default.`
+          : permissionsProfile.detail,
     });
   }
 
@@ -11781,6 +12121,23 @@ function localScoreBreakdown(metrics) {
       detail: "Sampled active-thread approval, permission, sandbox-denial, escalation, and execpolicy metadata markers.",
     },
     {
+      id: "permissions-profile",
+      label: "Permissions Profile",
+      points: Math.min(
+        6,
+        Number(metrics.permissionsProfileDangerDefault || 0) * 4 +
+          Number(metrics.permissionsProfileUnknownDefault || 0) * 2 +
+          Number(metrics.permissionsProfileReadOnlyDefault || 0) * 1.2 +
+          Number(metrics.permissionsProfileActiveWithoutExtends || 0) * 1.2 +
+          Number(metrics.permissionsProfileExtendsDangerCount || 0) * 3 +
+          Number(metrics.permissionsProfileRelativeWorkspaceRootCount || 0) * 0.8 +
+          Number(metrics.permissionsProfileNetworkGlobalAllow || 0) * 2 +
+          Number(metrics.permissionsProfileNetworkNoDomainRules || 0) * 1.6,
+      ),
+      value: metrics.permissionsProfileLabel || "Default",
+      detail: "Configured default_permissions profile, workspace roots, filesystem deny rules, and scoped profile network settings.",
+    },
+    {
       id: "log-wal",
       label: "Log WAL",
       points: Math.min(18, gb(metrics.logWalBytes) * 12),
@@ -11863,6 +12220,10 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(8, Math.max(0, Number(metrics.hookTurnScopedCommandCount || 0) - 1) * 1.2);
   score -= Math.min(4, Math.max(0, Number(metrics.hookBroadMatcherCount || 0)) * 1.5);
   if (metrics.approvalAutoReview) score -= 4;
+  if (metrics.permissionsProfileDangerDefault) score -= 4;
+  if (metrics.permissionsProfileUnknownDefault) score -= 2;
+  if (metrics.permissionsProfileNetworkGlobalAllow) score -= 2;
+  if (metrics.permissionsProfileNetworkNoDomainRules) score -= 1.5;
   score -= Math.min(8, Number(metrics.modelProviderActiveMissingEnvKeyCount || 0) * 5);
   score -= Math.min(6, Number(metrics.modelProviderAuthConflictCount || 0) * 4);
   score -= Math.min(4, Number(metrics.modelProviderSlowAuthTimeoutCount || 0) * 2);
@@ -12050,6 +12411,17 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Test command rules with codex execpolicy check; Refit saw ${Number(metrics.approvalFrictionExecPolicyMarkerCount).toLocaleString()} execpolicy marker${metrics.approvalFrictionExecPolicyMarkerCount === 1 ? "" : "s"} in sampled active metadata.`,
     );
+  }
+  if (metrics.permissionsProfileDangerDefault) {
+    guidance.push("Replace default_permissions danger-full-access with a scoped custom profile that extends :workspace for normal local work.");
+  } else if (metrics.permissionsProfileUnknownDefault) {
+    guidance.push("Fix default_permissions: it does not match a built-in profile or a configured custom permissions profile.");
+  } else if (metrics.permissionsProfileActiveWithoutExtends) {
+    guidance.push("Update the active permissions profile to extend :workspace or :read-only so baseline protections carry forward.");
+  } else if (metrics.permissionsProfileNetworkGlobalAllow) {
+    guidance.push("Narrow the active permissions profile network policy; a global '*' allow rule is broad access.");
+  } else if (metrics.permissionsProfileNetworkNoDomainRules) {
+    guidance.push("Add exact domain rules to the active permissions profile network policy before using it as a repeat speed path.");
   }
   if (metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffHasGithubRemote) {
     guidance.push("Add a GitHub remote before expecting Codex cloud threads to offload heavy local work.");
@@ -12392,8 +12764,9 @@ function scoreMetricsFromScan(scan) {
   const remoteHosts = scan?.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const shellStartup = scan?.codexConfig?.shellStartup || emptyShellStartupSummary();
   const approvalFriction = categories.approvalFriction || emptyApprovalFrictionSummary(categories.activeSessions || {});
+  const permissionsProfile = scan?.codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
   return {
-    scoreModel: "local-state-v23",
+    scoreModel: "local-state-v24",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -12434,6 +12807,25 @@ function scoreMetricsFromScan(scan) {
     approvalFrictionHighFrictionFileCount: approvalFriction.highFrictionFileCount || 0,
     approvalFrictionCappedFileCount: approvalFriction.cappedFileCount || 0,
     approvalFrictionUnparsedFileCount: approvalFriction.unparsedFileCount || 0,
+    permissionsProfileTone: permissionsProfile.tone || "low",
+    permissionsProfileLabel: permissionsProfile.label || "Default",
+    permissionsProfileCount: permissionsProfile.profileCount || 0,
+    permissionsProfileActiveCustom: Boolean(permissionsProfile.activeCustomProfile),
+    permissionsProfileUnknownDefault: Boolean(permissionsProfile.unknownDefaultProfile),
+    permissionsProfileDangerDefault: Boolean(permissionsProfile.dangerFullAccessDefault),
+    permissionsProfileReadOnlyDefault: Boolean(permissionsProfile.readOnlyDefault),
+    permissionsProfileWithoutExtendsCount: permissionsProfile.profileWithoutExtendsCount || 0,
+    permissionsProfileActiveWithoutExtends: Boolean(permissionsProfile.activeProfileWithoutExtends),
+    permissionsProfileExtendsDangerCount: permissionsProfile.profileExtendsDangerCount || 0,
+    permissionsProfileWorkspaceRootCount: permissionsProfile.workspaceRootCount || 0,
+    permissionsProfileRelativeWorkspaceRootCount: permissionsProfile.relativeWorkspaceRootCount || 0,
+    permissionsProfileFilesystemRuleCount: permissionsProfile.filesystemRuleCount || 0,
+    permissionsProfileDenyRuleCount: permissionsProfile.denyRuleCount || 0,
+    permissionsProfileEnvDenyRuleCount: permissionsProfile.envDenyRuleCount || 0,
+    permissionsProfileNetworkEnabled: Boolean(permissionsProfile.networkEnabled),
+    permissionsProfileNetworkDomainRuleCount: permissionsProfile.networkDomainRuleCount || 0,
+    permissionsProfileNetworkGlobalAllow: Boolean(permissionsProfile.networkGlobalAllow),
+    permissionsProfileNetworkNoDomainRules: Boolean(permissionsProfile.networkNoDomainRules),
     codexWorktreeBytes: categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
@@ -13271,6 +13663,23 @@ function benchmarkDeltas(current, previous) {
     "approvalFrictionHighFrictionFileCount",
     "approvalFrictionCappedFileCount",
     "approvalFrictionUnparsedFileCount",
+    "permissionsProfileCount",
+    "permissionsProfileActiveCustom",
+    "permissionsProfileUnknownDefault",
+    "permissionsProfileDangerDefault",
+    "permissionsProfileReadOnlyDefault",
+    "permissionsProfileWithoutExtendsCount",
+    "permissionsProfileActiveWithoutExtends",
+    "permissionsProfileExtendsDangerCount",
+    "permissionsProfileWorkspaceRootCount",
+    "permissionsProfileRelativeWorkspaceRootCount",
+    "permissionsProfileFilesystemRuleCount",
+    "permissionsProfileDenyRuleCount",
+    "permissionsProfileEnvDenyRuleCount",
+    "permissionsProfileNetworkEnabled",
+    "permissionsProfileNetworkDomainRuleCount",
+    "permissionsProfileNetworkGlobalAllow",
+    "permissionsProfileNetworkNoDomainRules",
     "cloudHandoffReady",
     "cloudHandoffHasGithubRemote",
     "cloudHandoffDirtyCount",
@@ -13547,6 +13956,31 @@ function summarizeBenchmarkEntry(entry) {
     approvalFrictionHighFrictionFileCount: entry.metrics.approvalFrictionHighFrictionFileCount || 0,
     approvalFrictionCappedFileCount: entry.metrics.approvalFrictionCappedFileCount || 0,
     approvalFrictionUnparsedFileCount: entry.metrics.approvalFrictionUnparsedFileCount || 0,
+    permissionsProfileTone: entry.metrics.permissionsProfileTone || "low",
+    permissionsProfileLabel: entry.metrics.permissionsProfileLabel || "Default",
+    permissionsProfileDefault: entry.metrics.permissionsProfileDefault || null,
+    permissionsProfileActiveName: entry.metrics.permissionsProfileActiveName || null,
+    permissionsProfileActiveBuiltIn: entry.metrics.permissionsProfileActiveBuiltIn || null,
+    permissionsProfileCount: entry.metrics.permissionsProfileCount || 0,
+    permissionsProfileActiveCustom: Boolean(entry.metrics.permissionsProfileActiveCustom),
+    permissionsProfileUnknownDefault: Boolean(entry.metrics.permissionsProfileUnknownDefault),
+    permissionsProfileDangerDefault: Boolean(entry.metrics.permissionsProfileDangerDefault),
+    permissionsProfileReadOnlyDefault: Boolean(entry.metrics.permissionsProfileReadOnlyDefault),
+    permissionsProfileWorkspaceDefault: Boolean(entry.metrics.permissionsProfileWorkspaceDefault),
+    permissionsProfileWithoutExtendsCount: entry.metrics.permissionsProfileWithoutExtendsCount || 0,
+    permissionsProfileActiveWithoutExtends: Boolean(entry.metrics.permissionsProfileActiveWithoutExtends),
+    permissionsProfileExtendsDangerCount: entry.metrics.permissionsProfileExtendsDangerCount || 0,
+    permissionsProfileWorkspaceRootCount: entry.metrics.permissionsProfileWorkspaceRootCount || 0,
+    permissionsProfileRelativeWorkspaceRootCount: entry.metrics.permissionsProfileRelativeWorkspaceRootCount || 0,
+    permissionsProfileFilesystemRuleCount: entry.metrics.permissionsProfileFilesystemRuleCount || 0,
+    permissionsProfileWorkspaceRootRuleCount: entry.metrics.permissionsProfileWorkspaceRootRuleCount || 0,
+    permissionsProfileWriteRuleCount: entry.metrics.permissionsProfileWriteRuleCount || 0,
+    permissionsProfileDenyRuleCount: entry.metrics.permissionsProfileDenyRuleCount || 0,
+    permissionsProfileEnvDenyRuleCount: entry.metrics.permissionsProfileEnvDenyRuleCount || 0,
+    permissionsProfileNetworkEnabled: Boolean(entry.metrics.permissionsProfileNetworkEnabled),
+    permissionsProfileNetworkDomainRuleCount: entry.metrics.permissionsProfileNetworkDomainRuleCount || 0,
+    permissionsProfileNetworkGlobalAllow: Boolean(entry.metrics.permissionsProfileNetworkGlobalAllow),
+    permissionsProfileNetworkNoDomainRules: Boolean(entry.metrics.permissionsProfileNetworkNoDomainRules),
     cloudHandoffTone: entry.metrics.cloudHandoffTone || "low",
     cloudHandoffReady: Boolean(entry.metrics.cloudHandoffReady),
     cloudHandoffProjectReady: Boolean(entry.metrics.cloudHandoffProjectReady),
@@ -13957,6 +14391,18 @@ export async function benchmarkHistory(limit = 12) {
           latest.approvalFrictionExecPolicyMarkerCount - oldest.approvalFrictionExecPolicyMarkerCount,
         approvalFrictionHighFrictionFileCount:
           latest.approvalFrictionHighFrictionFileCount - oldest.approvalFrictionHighFrictionFileCount,
+        permissionsProfileCount: latest.permissionsProfileCount - oldest.permissionsProfileCount,
+        permissionsProfileActiveCustom: Number(latest.permissionsProfileActiveCustom) - Number(oldest.permissionsProfileActiveCustom),
+        permissionsProfileUnknownDefault: Number(latest.permissionsProfileUnknownDefault) - Number(oldest.permissionsProfileUnknownDefault),
+        permissionsProfileDangerDefault: Number(latest.permissionsProfileDangerDefault) - Number(oldest.permissionsProfileDangerDefault),
+        permissionsProfileActiveWithoutExtends:
+          Number(latest.permissionsProfileActiveWithoutExtends) - Number(oldest.permissionsProfileActiveWithoutExtends),
+        permissionsProfileWorkspaceRootCount: latest.permissionsProfileWorkspaceRootCount - oldest.permissionsProfileWorkspaceRootCount,
+        permissionsProfileDenyRuleCount: latest.permissionsProfileDenyRuleCount - oldest.permissionsProfileDenyRuleCount,
+        permissionsProfileNetworkDomainRuleCount:
+          latest.permissionsProfileNetworkDomainRuleCount - oldest.permissionsProfileNetworkDomainRuleCount,
+        permissionsProfileNetworkGlobalAllow:
+          Number(latest.permissionsProfileNetworkGlobalAllow) - Number(oldest.permissionsProfileNetworkGlobalAllow),
         cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(oldest.cloudHandoffReady),
         cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(oldest.cloudHandoffHasGithubRemote),
         cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - oldest.cloudHandoffDirtyCount,
@@ -14161,6 +14607,18 @@ export async function benchmarkHistory(limit = 12) {
           latest.approvalFrictionExecPolicyMarkerCount - previous.approvalFrictionExecPolicyMarkerCount,
         approvalFrictionHighFrictionFileCount:
           latest.approvalFrictionHighFrictionFileCount - previous.approvalFrictionHighFrictionFileCount,
+        permissionsProfileCount: latest.permissionsProfileCount - previous.permissionsProfileCount,
+        permissionsProfileActiveCustom: Number(latest.permissionsProfileActiveCustom) - Number(previous.permissionsProfileActiveCustom),
+        permissionsProfileUnknownDefault: Number(latest.permissionsProfileUnknownDefault) - Number(previous.permissionsProfileUnknownDefault),
+        permissionsProfileDangerDefault: Number(latest.permissionsProfileDangerDefault) - Number(previous.permissionsProfileDangerDefault),
+        permissionsProfileActiveWithoutExtends:
+          Number(latest.permissionsProfileActiveWithoutExtends) - Number(previous.permissionsProfileActiveWithoutExtends),
+        permissionsProfileWorkspaceRootCount: latest.permissionsProfileWorkspaceRootCount - previous.permissionsProfileWorkspaceRootCount,
+        permissionsProfileDenyRuleCount: latest.permissionsProfileDenyRuleCount - previous.permissionsProfileDenyRuleCount,
+        permissionsProfileNetworkDomainRuleCount:
+          latest.permissionsProfileNetworkDomainRuleCount - previous.permissionsProfileNetworkDomainRuleCount,
+        permissionsProfileNetworkGlobalAllow:
+          Number(latest.permissionsProfileNetworkGlobalAllow) - Number(previous.permissionsProfileNetworkGlobalAllow),
         cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(previous.cloudHandoffReady),
         cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(previous.cloudHandoffHasGithubRemote),
         cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - previous.cloudHandoffDirtyCount,
@@ -14377,6 +14835,7 @@ export async function runBenchmark() {
   const remoteHosts = scan.codexConfig?.remoteHosts || emptyRemoteHostSummary();
   const shellStartup = scan.codexConfig?.shellStartup || emptyShellStartupSummary();
   const appServerTransport = scan.processes?.appServerTransport || emptyAppServerTransportSummary();
+  const permissionsProfile = scan.codexConfig?.permissionsProfile || emptyPermissionsProfileSummary();
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
   const modelEffort = scan.codexConfig?.reasoningEffort || "default";
@@ -14389,7 +14848,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v23",
+    scoreModel: "local-state-v24",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -14605,6 +15064,31 @@ export async function runBenchmark() {
     approvalAutoReview: Boolean(scan.codexConfig?.approvalFlow?.autoReviewApplies),
     approvalInteractive: scan.codexConfig?.approvalFlow?.interactiveApprovals !== false,
     approvalGranularPolicy: Boolean(scan.codexConfig?.approvalFlow?.granularPolicy),
+    permissionsProfileTone: permissionsProfile.tone || "low",
+    permissionsProfileLabel: permissionsProfile.label || "Default",
+    permissionsProfileDefault: permissionsProfile.defaultPermissions || null,
+    permissionsProfileActiveName: permissionsProfile.activeProfileName || null,
+    permissionsProfileActiveBuiltIn: permissionsProfile.activeBuiltInProfile || null,
+    permissionsProfileCount: permissionsProfile.profileCount || 0,
+    permissionsProfileActiveCustom: Boolean(permissionsProfile.activeCustomProfile),
+    permissionsProfileUnknownDefault: Boolean(permissionsProfile.unknownDefaultProfile),
+    permissionsProfileDangerDefault: Boolean(permissionsProfile.dangerFullAccessDefault),
+    permissionsProfileReadOnlyDefault: Boolean(permissionsProfile.readOnlyDefault),
+    permissionsProfileWorkspaceDefault: Boolean(permissionsProfile.workspaceDefault),
+    permissionsProfileWithoutExtendsCount: permissionsProfile.profileWithoutExtendsCount || 0,
+    permissionsProfileActiveWithoutExtends: Boolean(permissionsProfile.activeProfileWithoutExtends),
+    permissionsProfileExtendsDangerCount: permissionsProfile.profileExtendsDangerCount || 0,
+    permissionsProfileWorkspaceRootCount: permissionsProfile.workspaceRootCount || 0,
+    permissionsProfileRelativeWorkspaceRootCount: permissionsProfile.relativeWorkspaceRootCount || 0,
+    permissionsProfileFilesystemRuleCount: permissionsProfile.filesystemRuleCount || 0,
+    permissionsProfileWorkspaceRootRuleCount: permissionsProfile.workspaceRootRuleCount || 0,
+    permissionsProfileWriteRuleCount: permissionsProfile.writeRuleCount || 0,
+    permissionsProfileDenyRuleCount: permissionsProfile.denyRuleCount || 0,
+    permissionsProfileEnvDenyRuleCount: permissionsProfile.envDenyRuleCount || 0,
+    permissionsProfileNetworkEnabled: Boolean(permissionsProfile.networkEnabled),
+    permissionsProfileNetworkDomainRuleCount: permissionsProfile.networkDomainRuleCount || 0,
+    permissionsProfileNetworkGlobalAllow: Boolean(permissionsProfile.networkGlobalAllow),
+    permissionsProfileNetworkNoDomainRules: Boolean(permissionsProfile.networkNoDomainRules),
     mcpEnabledCount: scan.codexConfig?.mcpSummary?.enabledCount || 0,
     mcpRequiredCount: scan.codexConfig?.mcpSummary?.requiredCount || 0,
     mcpMissingEnvVarCount: scan.codexConfig?.mcpSummary?.missingEnvVarCount || 0,
