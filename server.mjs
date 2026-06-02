@@ -42,6 +42,8 @@ const largeSkillFileBytes = 24 * 1024;
 const maxSkillCatalogFiles = 600;
 const maxSkillCatalogDirs = 4000;
 const maxSkillCatalogDepth = 10;
+const defaultProjectDocMaxBytes = 32 * 1024;
+const largeInstructionFileBytes = 12 * 1024;
 
 const paths = {
   codexHome,
@@ -59,6 +61,7 @@ const paths = {
   pluginCache: path.join(codexHome, "plugins", "cache"),
   configToml: path.join(codexHome, "config.toml"),
   authJson: path.join(codexHome, "auth.json"),
+  globalAgentsOverride: path.join(codexHome, "AGENTS.override.md"),
   globalAgents: path.join(codexHome, "AGENTS.md"),
   globalHooks: path.join(codexHome, "hooks.json"),
   stateDb: path.join(codexHome, "state_5.sqlite"),
@@ -841,6 +844,248 @@ async function getSkillCatalogSummary() {
     truncated,
     roots: rootsSummary,
     longestSkills,
+  };
+}
+
+function emptyInstructionStackSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "No guidance",
+    action: "Add only useful rules",
+    detail: "No non-empty global or current-project instruction files were found.",
+    globalBytes: 0,
+    projectBytes: 0,
+    projectCandidateBytes: 0,
+    totalBytes: 0,
+    selectedFileCount: 0,
+    emptyFileCount: 0,
+    overrideFileCount: 0,
+    fallbackFileCount: 0,
+    largeFileCount: 0,
+    projectDocMaxBytes: defaultProjectDocMaxBytes,
+    projectDocMaxConfigured: false,
+    projectBytesRatio: 0,
+    projectNearCap: false,
+    projectOverCap: false,
+    fallbackNames: [],
+    currentProjectPath: null,
+    currentWorkPath: null,
+    files: [],
+  };
+}
+
+async function gitRootFor(startPath) {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", startPath, "rev-parse", "--show-toplevel"], {
+      timeout: 2500,
+      maxBuffer: 128 * 1024,
+    });
+    const resolved = path.resolve(stdout.trim());
+    return resolved || null;
+  } catch {
+    return null;
+  }
+}
+
+function directoryChain(rootPath, targetPath) {
+  const root = path.resolve(rootPath || "");
+  let target = path.resolve(targetPath || root);
+  if (!pathContains(root, target)) target = root;
+
+  const chain = [];
+  let current = target;
+  while (pathContains(root, current)) {
+    chain.unshift(current);
+    if (current === root) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  return chain.length ? chain : [root];
+}
+
+function instructionCandidateNames(fallbackNames = []) {
+  return ["AGENTS.override.md", "AGENTS.md", ...fallbackNames.filter(Boolean)];
+}
+
+async function instructionFileInfo(filePath, { scope, source, selected = false, reason = null } = {}) {
+  const stats = await statOrNull(filePath);
+  if (!stats?.isFile()) return null;
+  return {
+    scope,
+    source,
+    path: displayPath(filePath),
+    bytes: stats.size,
+    mtime: stats.mtime.toISOString(),
+    selected,
+    empty: stats.size === 0,
+    override: path.basename(filePath) === "AGENTS.override.md",
+    fallback: !["AGENTS.override.md", "AGENTS.md"].includes(path.basename(filePath)),
+    reason,
+  };
+}
+
+async function selectInstructionFile(directory, { scope, fallbackNames = [] } = {}) {
+  const all = [];
+  for (const name of instructionCandidateNames(fallbackNames)) {
+    const filePath = path.join(directory, name);
+    const info = await instructionFileInfo(filePath, { scope, source: name });
+    if (!info) continue;
+    all.push(info);
+    if (!info.empty) return { selected: { ...info, selected: true }, all };
+  }
+  return { selected: null, all };
+}
+
+async function resolveInstructionProjectRoot(currentProject = null) {
+  const candidates = [
+    currentProject?.exists ? currentProject.path : null,
+    await gitRootFor(process.cwd()),
+    await gitRootFor(rootDir),
+    path.resolve(rootDir),
+  ].filter(Boolean);
+
+  return path.resolve(candidates[0]);
+}
+
+function resolveInstructionWorkPath(projectRoot) {
+  const candidates = [process.cwd(), rootDir].map((candidate) => path.resolve(candidate));
+  return (
+    candidates
+      .filter((candidate) => pathContains(projectRoot, candidate))
+      .sort((a, b) => b.length - a.length)[0] || projectRoot
+  );
+}
+
+async function getInstructionStackSummary({ values = {}, currentProject = null } = {}) {
+  const fallbackNames = tomlArrayStringNames(values.project_doc_fallback_filenames);
+  const projectDocMaxBytes = configNumber(values.project_doc_max_bytes) || defaultProjectDocMaxBytes;
+  const projectRoot = await resolveInstructionProjectRoot(currentProject);
+  const workPath = resolveInstructionWorkPath(projectRoot);
+  const projectDirs = directoryChain(projectRoot, workPath);
+  const files = [];
+
+  const globalSelection = await selectInstructionFile(paths.codexHome, {
+    scope: "global",
+    fallbackNames: [],
+  });
+  if (globalSelection.selected) files.push(globalSelection.selected);
+  for (const info of globalSelection.all) {
+    if (!info.selected) files.push({ ...info, reason: info.empty ? "Skipped empty global guidance" : "Not active at global scope" });
+  }
+
+  const projectSelections = [];
+  for (const dir of projectDirs) {
+    projectSelections.push({ dir, ...(await selectInstructionFile(dir, { scope: "project", fallbackNames })) });
+  }
+
+  let projectBytes = 0;
+  let projectCandidateBytes = 0;
+  let projectOverCap = false;
+  for (const selection of projectSelections) {
+    if (!selection.selected) {
+      files.push(
+        ...selection.all.map((info) => ({
+          ...info,
+          reason: info.empty ? "Skipped empty project guidance" : "Not selected for this directory",
+        })),
+      );
+      continue;
+    }
+
+    const selected = selection.selected;
+    projectCandidateBytes += selected.bytes;
+    const wouldExceed = projectBytes + selected.bytes > projectDocMaxBytes;
+    if (wouldExceed) {
+      projectOverCap = true;
+      files.push({ ...selected, selected: false, reason: "Past project_doc_max_bytes cap" });
+    } else {
+      projectBytes += selected.bytes;
+      files.push(selected);
+    }
+
+    for (const info of selection.all) {
+      if (info.path === selected.path) continue;
+      files.push({
+        ...info,
+        reason: info.empty ? "Skipped empty project guidance" : "Lower priority in this directory",
+      });
+    }
+  }
+
+  const selectedFiles = files.filter((file) => file.selected);
+  const globalBytes = selectedFiles.filter((file) => file.scope === "global").reduce((total, file) => total + file.bytes, 0);
+  const totalBytes = globalBytes + projectBytes;
+  const emptyFileCount = files.filter((file) => file.empty).length;
+  const overrideFileCount = selectedFiles.filter((file) => file.override).length;
+  const fallbackFileCount = selectedFiles.filter((file) => file.fallback).length;
+  const largeFileCount = selectedFiles.filter((file) => file.bytes >= largeInstructionFileBytes).length;
+  const projectBytesRatio = projectDocMaxBytes ? projectBytes / projectDocMaxBytes : 0;
+  const projectNearCap = projectBytesRatio >= 0.75;
+
+  if (!selectedFiles.length && !projectOverCap) {
+    return {
+      ...emptyInstructionStackSummary(),
+      emptyFileCount,
+      projectDocMaxBytes,
+      projectDocMaxConfigured: values.project_doc_max_bytes !== undefined,
+      fallbackNames,
+      currentProjectPath: displayPath(projectRoot),
+      currentWorkPath: displayPath(workPath),
+      files,
+    };
+  }
+
+  const highLoad = projectOverCap || projectBytesRatio >= 0.95 || totalBytes >= 80 * 1024 || largeFileCount >= 4;
+  const mediumLoad = highLoad || projectNearCap || totalBytes >= 24 * 1024 || globalBytes >= 12 * 1024 || selectedFiles.length >= 5 || largeFileCount > 0;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = projectOverCap && !selectedFiles.length
+    ? "Capped"
+    : `${selectedFiles.length.toLocaleString()} file${selectedFiles.length === 1 ? "" : "s"}`;
+  const action = tone === "low" ? "Keep practical" : projectOverCap || projectNearCap ? "Split or trim" : "Review guidance";
+  const projectDocMaxLabel =
+    values.project_doc_max_bytes !== undefined
+      ? `configured to ${formatBytesServer(projectDocMaxBytes)}`
+      : `${formatBytesServer(projectDocMaxBytes)} by default`;
+  const detail =
+    tone === "low"
+      ? `Instruction stack is concise: ${formatBytesServer(totalBytes)} selected across ${selectedFiles.length.toLocaleString()} file${selectedFiles.length === 1 ? "" : "s"}.`
+      : [
+          `Codex reads global and project AGENTS guidance before work, then concatenates project files from root to current directory until project_doc_max_bytes (${projectDocMaxLabel}).`,
+          `Refit found ${formatBytesServer(totalBytes)} selected guidance: ${formatBytesServer(globalBytes)} global and ${formatBytesServer(projectBytes)} project.`,
+          projectCandidateBytes > projectBytes ? `${formatBytesServer(projectCandidateBytes)} of project guidance was available before the cap was applied.` : null,
+          projectOverCap ? "Some project guidance would land past the configured project instruction cap." : null,
+          largeFileCount ? `${largeFileCount.toLocaleString()} selected instruction file${largeFileCount === 1 ? "" : "s"} ${pluralVerb(largeFileCount)} at least ${formatBytesServer(largeInstructionFileBytes)}.` : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    globalBytes,
+    projectBytes,
+    projectCandidateBytes,
+    totalBytes,
+    selectedFileCount: selectedFiles.length,
+    emptyFileCount,
+    overrideFileCount,
+    fallbackFileCount,
+    largeFileCount,
+    projectDocMaxBytes,
+    projectDocMaxConfigured: values.project_doc_max_bytes !== undefined,
+    projectBytesRatio,
+    projectNearCap,
+    projectOverCap,
+    fallbackNames,
+    currentProjectPath: displayPath(projectRoot),
+    currentWorkPath: displayPath(workPath),
+    files,
   };
 }
 
@@ -2561,7 +2806,13 @@ async function getAuthCacheSummary(values = {}) {
 }
 
 async function getCodexConfigSummary() {
-  const globalAgentsBytes = await fileSize(paths.globalAgents);
+  const [globalAgentsBaseBytes, globalAgentsOverrideBytes, globalAgentsFileExists, globalAgentsOverrideExists] = await Promise.all([
+    fileSize(paths.globalAgents),
+    fileSize(paths.globalAgentsOverride),
+    exists(paths.globalAgents),
+    exists(paths.globalAgentsOverride),
+  ]);
+  const globalAgentsBytes = globalAgentsOverrideBytes || globalAgentsBaseBytes;
   const summary = {
     path: paths.configToml,
     exists: false,
@@ -2582,6 +2833,7 @@ async function getCodexConfigSummary() {
     shellSnapshot: true,
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
+    instructionStack: emptyInstructionStackSummary(),
     goalsFeature: false,
     hooksFeature: true,
     hookSummary: {
@@ -2647,14 +2899,17 @@ async function getCodexConfigSummary() {
     deepWorkProfileNames: [],
     legacyProfileConfig: false,
     globalAgentsExists: globalAgentsBytes > 0,
-    globalAgentsFileExists: await exists(paths.globalAgents),
+    globalAgentsFileExists: globalAgentsFileExists || globalAgentsOverrideExists,
     globalAgentsBytes,
+    globalAgentsBaseBytes,
+    globalAgentsOverrideBytes,
   };
 
   Object.assign(summary, await getCodexProfileSummaries());
 
   if (!(await exists(paths.configToml))) {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
+    summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
     return summary;
   }
   summary.exists = true;
@@ -2730,6 +2985,10 @@ async function getCodexConfigSummary() {
         // Keep MCP diagnostics available from the user config even if project config is unreadable.
       }
     }
+    summary.instructionStack = await getInstructionStackSummary({
+      values: mcpValues,
+      currentProject: summary.projectReadiness.currentProject,
+    });
     summary.mcpSummary = buildMcpConfigSummary(mcpValues, mcpSections);
     summary.enabledMcpCount = summary.mcpSummary.enabledCount;
     summary.disabledMcpCount = summary.mcpSummary.disabledCount;
@@ -2825,6 +3084,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -2875,6 +3135,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "enabled = false",
         "",
         "# Also shorten long SKILL.md descriptions: front-load the trigger words, then stop.",
+      ].join("\n"),
+    });
+  }
+
+  if (instructionStack.status === "ready" && instructionStack.tone !== "low") {
+    addFix({
+      id: "instruction-stack",
+      label: "Instruction Stack",
+      value: formatBytesServer(instructionStack.projectCandidateBytes || instructionStack.totalBytes || 0),
+      tone: instructionStack.tone === "high" ? "high" : "medium",
+      action: instructionStack.action || "Review guidance",
+      detail:
+        "Codex loads durable AGENTS guidance before work. Keep always-on instructions short, concrete, and scoped so every task starts with useful context instead of stale bulk.",
+      snippet: [
+        "# Review active guidance without changing files:",
+        'codex --ask-for-approval never "Show which instruction files are active and summarize the rules in priority order."',
+        "",
+        "# Keep AGENTS.md concise. Move deep background docs into linked markdown files,",
+        "# and put directory-specific rules in the closest subdirectory AGENTS.md.",
+        "",
+        "# Optional ~/.codex/config.toml if critical project guidance is being truncated:",
+        `project_doc_max_bytes = ${Number(instructionStack.projectDocMaxBytes || defaultProjectDocMaxBytes)}`,
       ].join("\n"),
     });
   }
@@ -3271,6 +3553,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
+  const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -3499,6 +3782,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: contextBudgetSummary.action,
       priority: contextBudgetSummary.tone === "high" ? 85 : contextBudgetSummary.tone === "medium" ? 63 : 21,
       detail: contextBudgetSummary.detail,
+    },
+    {
+      id: "instruction-stack",
+      label: "Instruction Stack",
+      value: instructionStack.selectedFileCount
+        ? `${formatBytesServer(instructionStack.totalBytes)}`
+        : instructionStack.projectOverCap
+          ? "Capped"
+        : instructionStack.emptyFileCount
+          ? "Empty files"
+          : "None",
+      tone: instructionStack.tone || "low",
+      action: instructionStack.action || "Keep practical",
+      priority: instructionStack.tone === "high" ? 87 : instructionStack.tone === "medium" ? 65 : instructionStack.emptyFileCount ? 38 : 19,
+      detail: instructionStack.detail,
     },
     {
       id: "hooks",
@@ -3916,6 +4214,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (instructionStack.status === "ready" && instructionStack.tone !== "low") {
+    addRecommendation({
+      id: "instruction-stack",
+      label: "Instruction Stack",
+      value: formatBytesServer(instructionStack.projectCandidateBytes || instructionStack.totalBytes || 0),
+      action: instructionStack.action || "Review guidance",
+      tone: instructionStack.tone === "high" ? "high" : "medium",
+      priority: instructionStack.tone === "high" ? 83 : 59,
+      detail:
+        instructionStack.projectOverCap
+          ? `${instructionStack.detail} Keep the always-loaded files concise or split guidance closer to the directories where it applies.`
+          : instructionStack.detail,
+    });
+  }
+
   if (currentProject && !currentProject.ready) {
     addRecommendation({
       id: "project-playbook",
@@ -4077,6 +4390,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellSnapshot,
     shellEnvironmentSummary,
     contextBudgetSummary,
+    instructionStack,
     goalsFeature,
     webSearchMode,
     hooksFeature,
@@ -4551,6 +4865,9 @@ function benchmarkLiveScore(metrics) {
   if (metrics.compactTooLate) score -= 4;
   if (metrics.compactEarly) score -= 2;
   if (metrics.smallContextWindow) score -= 3;
+  score -= Math.min(5, Math.max(0, Number(metrics.instructionTotalBytes || 0) - 24 * 1024) / 8192);
+  if (metrics.instructionProjectOverCap) score -= 5;
+  if (metrics.instructionProjectNearCap) score -= 2;
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   score -= Math.min(5, Math.max(0, Number(metrics.skillEstimatedCatalogChars || 0) - skillCatalogBudgetChars) / 4000);
   score -= Math.min(4, Math.max(0, Number(metrics.skillCount || 0) - 40) * 0.08);
@@ -4655,6 +4972,15 @@ function benchmarkGuidance(metrics) {
     guidance.push("Auto-compact is set very late relative to the context window. Review model_auto_compact_token_limit if long threads get noisy.");
   } else if (metrics.smallContextWindow) {
     guidance.push("Configured context window is small for long work. Expect more frequent compaction or use shorter threads.");
+  }
+  if (metrics.instructionProjectOverCap) {
+    guidance.push(
+      `Project guidance is past the configured instruction cap${metrics.instructionProjectCandidateBytes ? ` (${formatBytesServer(metrics.instructionProjectCandidateBytes)} available)` : ""}. Trim AGENTS.md or split rules closer to the directories where they apply.`,
+    );
+  } else if (metrics.instructionTotalBytes >= 24 * 1024) {
+    guidance.push(`Review AGENTS guidance; Codex starts with ${formatBytesServer(metrics.instructionTotalBytes)} of selected instruction files.`);
+  } else if (metrics.instructionEmptyFileCount > 0) {
+    guidance.push(`Fill in or remove ${Number(metrics.instructionEmptyFileCount).toLocaleString()} empty AGENTS instruction file${metrics.instructionEmptyFileCount === 1 ? "" : "s"}.`);
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -5310,6 +5636,12 @@ function benchmarkDeltas(current, previous) {
     "contextWindow",
     "autoCompactTokenLimit",
     "toolOutputTokenLimit",
+    "instructionTotalBytes",
+    "instructionGlobalBytes",
+    "instructionProjectBytes",
+    "instructionProjectCandidateBytes",
+    "instructionSelectedFileCount",
+    "instructionEmptyFileCount",
     "hookCommandCount",
     "hookTurnScopedCommandCount",
     "hookBroadMatcherCount",
@@ -5368,6 +5700,17 @@ function summarizeBenchmarkEntry(entry) {
     compactTooLate: Boolean(entry.metrics.compactTooLate),
     compactEarly: Boolean(entry.metrics.compactEarly),
     smallContextWindow: Boolean(entry.metrics.smallContextWindow),
+    instructionTotalBytes: entry.metrics.instructionTotalBytes || 0,
+    instructionGlobalBytes: entry.metrics.instructionGlobalBytes || 0,
+    instructionProjectBytes: entry.metrics.instructionProjectBytes || 0,
+    instructionProjectCandidateBytes: entry.metrics.instructionProjectCandidateBytes || 0,
+    instructionSelectedFileCount: entry.metrics.instructionSelectedFileCount || 0,
+    instructionEmptyFileCount: entry.metrics.instructionEmptyFileCount || 0,
+    instructionOverrideFileCount: entry.metrics.instructionOverrideFileCount || 0,
+    instructionLargeFileCount: entry.metrics.instructionLargeFileCount || 0,
+    instructionProjectDocMaxBytes: entry.metrics.instructionProjectDocMaxBytes || defaultProjectDocMaxBytes,
+    instructionProjectNearCap: Boolean(entry.metrics.instructionProjectNearCap),
+    instructionProjectOverCap: Boolean(entry.metrics.instructionProjectOverCap),
     hooksFeature: entry.metrics.hooksFeature !== false,
     hookCommandCount: entry.metrics.hookCommandCount || 0,
     hookTurnScopedCommandCount: entry.metrics.hookTurnScopedCommandCount || 0,
@@ -5422,6 +5765,9 @@ export async function benchmarkHistory(limit = 12) {
         shellEnvVarCount: latest.shellEnvVarCount - oldest.shellEnvVarCount,
         shellEnvSecretLikeNameCount: latest.shellEnvSecretLikeNameCount - oldest.shellEnvSecretLikeNameCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - oldest.toolOutputTokenLimit,
+        instructionTotalBytes: latest.instructionTotalBytes - oldest.instructionTotalBytes,
+        instructionProjectCandidateBytes: latest.instructionProjectCandidateBytes - oldest.instructionProjectCandidateBytes,
+        instructionSelectedFileCount: latest.instructionSelectedFileCount - oldest.instructionSelectedFileCount,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
         skillCount: latest.skillCount - oldest.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - oldest.skillEstimatedCatalogChars,
@@ -5441,6 +5787,8 @@ export async function benchmarkHistory(limit = 12) {
         mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
         shellEnvVarCount: latest.shellEnvVarCount - previous.shellEnvVarCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - previous.toolOutputTokenLimit,
+        instructionTotalBytes: latest.instructionTotalBytes - previous.instructionTotalBytes,
+        instructionProjectCandidateBytes: latest.instructionProjectCandidateBytes - previous.instructionProjectCandidateBytes,
         skillCount: latest.skillCount - previous.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - previous.skillEstimatedCatalogChars,
       }
@@ -5546,6 +5894,17 @@ export async function runBenchmark() {
     compactTooLate: Boolean(scan.codexConfig?.contextBudgetSummary?.compactTooLate),
     compactEarly: Boolean(scan.codexConfig?.contextBudgetSummary?.compactEarly),
     smallContextWindow: Boolean(scan.codexConfig?.contextBudgetSummary?.smallWindow),
+    instructionTotalBytes: scan.codexConfig?.instructionStack?.totalBytes || 0,
+    instructionGlobalBytes: scan.codexConfig?.instructionStack?.globalBytes || 0,
+    instructionProjectBytes: scan.codexConfig?.instructionStack?.projectBytes || 0,
+    instructionProjectCandidateBytes: scan.codexConfig?.instructionStack?.projectCandidateBytes || 0,
+    instructionSelectedFileCount: scan.codexConfig?.instructionStack?.selectedFileCount || 0,
+    instructionEmptyFileCount: scan.codexConfig?.instructionStack?.emptyFileCount || 0,
+    instructionOverrideFileCount: scan.codexConfig?.instructionStack?.overrideFileCount || 0,
+    instructionLargeFileCount: scan.codexConfig?.instructionStack?.largeFileCount || 0,
+    instructionProjectDocMaxBytes: scan.codexConfig?.instructionStack?.projectDocMaxBytes || defaultProjectDocMaxBytes,
+    instructionProjectNearCap: Boolean(scan.codexConfig?.instructionStack?.projectNearCap),
+    instructionProjectOverCap: Boolean(scan.codexConfig?.instructionStack?.projectOverCap),
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
