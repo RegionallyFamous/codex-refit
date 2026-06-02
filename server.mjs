@@ -191,9 +191,20 @@ function buildApprovalFlowSummary(values = {}) {
 function effectiveWebSearchMode(values = {}) {
   const configured = normalizeConfigKey(values.web_search || "");
   if (["live", "cached", "disabled"].includes(configured)) return configured;
+  if (values.web_search === false) return "disabled";
+  if (values.web_search_request === true) return "live";
+  if (values.web_search_cached === true || values.web_search === true) return "cached";
   const sandboxMode = normalizeConfigKey(values.sandbox_mode || "workspace-write");
   const fullAccess = sandboxMode === "danger_full_access" || sandboxMode === "dangerously_bypass_approvals_and_sandbox";
   return fullAccess ? "live" : "cached";
+}
+
+function legacyWebSearchKeys(values = {}) {
+  return [
+    typeof values.web_search === "boolean" ? "web_search" : null,
+    values.web_search_cached !== undefined ? "web_search_cached" : null,
+    values.web_search_request !== undefined ? "web_search_request" : null,
+  ].filter(Boolean);
 }
 
 function webSearchModeLabel(mode, configured = false) {
@@ -410,6 +421,8 @@ const managedSpeedKeys = new Set([
   "approvals_reviewer",
   "sandbox_mode",
   "web_search",
+  "web_search_cached",
+  "web_search_request",
   "model_context_window",
   "model_auto_compact_token_limit",
   "tool_output_token_limit",
@@ -552,6 +565,20 @@ function allowedValueConflict(values, requirementKey, userKey, userValues) {
   return Boolean(configured && !allowed.includes(configured));
 }
 
+function allowedWebSearchModeConflict(requirementValues = {}, userValues = {}) {
+  if (requirementValues.allowed_web_search_modes === undefined) return false;
+  const configuredByAnyKey =
+    userValues.web_search !== undefined ||
+    userValues.web_search_cached !== undefined ||
+    userValues.web_search_request !== undefined;
+  if (!configuredByAnyKey) return false;
+  const configured = effectiveWebSearchMode(userValues);
+  if (configured === "disabled") return false;
+  const allowed = tomlArrayStringNames(requirementValues.allowed_web_search_modes).map((value) => normalizeConfigKey(value));
+  if (!allowed.length) return true;
+  return !allowed.includes(configured);
+}
+
 function managedMcpBlockedNames(requirementSections, userSections) {
   const requirementDescriptors = mcpServerDescriptors(requirementSections);
   const mcpAllowlistPresent = requirementSections.some((section) => section.startsWith("mcp_servers."));
@@ -589,7 +616,10 @@ async function getManagedConfigSummary({ userValues = {}, userSections = [] } = 
   if (allowedValueConflict(requirementValues, "allowed_sandbox_modes", "sandbox_mode", userValues)) {
     requirementConflictKeys.add("sandbox_mode");
   }
-  if (allowedValueConflict(requirementValues, "allowed_web_search_modes", "web_search", userValues)) {
+  if (
+    allowedValueConflict(requirementValues, "allowed_web_search_modes", "web_search", userValues) ||
+    allowedWebSearchModeConflict(requirementValues, userValues)
+  ) {
     requirementConflictKeys.add("web_search");
   }
 
@@ -4914,6 +4944,8 @@ async function getCodexConfigSummary() {
     webSearchConfigured: false,
     webSearchEffectiveMode: "cached",
     webSearchLabel: "Cached default",
+    webSearchLegacyKeyCount: 0,
+    webSearchLegacyKeys: [],
     maxConcurrentThreadsPerSession: null,
     agentMaxThreads: null,
     agentMaxThreadsEffective: 6,
@@ -5009,10 +5041,16 @@ async function getCodexConfigSummary() {
     summary.memoriesMinRateLimitRemainingPercent = configNumber(values["memories.min_rate_limit_remaining_percent"]);
     summary.memoriesExtractModel = values["memories.extract_model"] || null;
     summary.memoriesConsolidationModel = values["memories.consolidation_model"] || null;
-    summary.webSearchMode = values.web_search || null;
+    summary.webSearchMode = values.web_search ?? null;
     summary.webSearchConfigured = values.web_search !== undefined;
     summary.webSearchEffectiveMode = effectiveWebSearchMode(values);
-    summary.webSearchLabel = webSearchModeLabel(summary.webSearchEffectiveMode, summary.webSearchConfigured);
+    summary.webSearchLegacyKeys = legacyWebSearchKeys(values);
+    summary.webSearchLegacyKeyCount = summary.webSearchLegacyKeys.length;
+    summary.webSearchLabel = summary.webSearchConfigured
+      ? webSearchModeLabel(summary.webSearchEffectiveMode, true)
+      : summary.webSearchLegacyKeyCount
+        ? `${webSearchModeLabel(summary.webSearchEffectiveMode, true)} legacy`
+        : webSearchModeLabel(summary.webSearchEffectiveMode, false);
     summary.maxConcurrentThreadsPerSession = values.max_concurrent_threads_per_session || null;
     summary.agentMaxThreads = configNumber(values["agents.max_threads"]);
     summary.agentMaxThreadsEffective = summary.agentMaxThreads ?? 6;
@@ -5174,6 +5212,8 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const webSearchEffectiveMode = codexConfig?.webSearchEffectiveMode || codexConfig?.webSearchMode || "cached";
   const webSearchLabel = codexConfig?.webSearchLabel || webSearchModeLabel(webSearchEffectiveMode, Boolean(codexConfig?.webSearchConfigured));
   const webSearchLive = webSearchEffectiveMode === "live";
+  const webSearchLegacyKeys = codexConfig?.webSearchLegacyKeys || [];
+  const webSearchLegacyKeyCount = Number(codexConfig?.webSearchLegacyKeyCount || webSearchLegacyKeys.length || 0);
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
@@ -5454,6 +5494,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Use live only when current external facts matter:",
         '# web_search = "live"',
+      ].join("\n"),
+    });
+  }
+
+  if (webSearchLegacyKeyCount) {
+    addFix({
+      id: "legacy-web-search",
+      label: "Web Search Config",
+      value: `${webSearchLegacyKeyCount.toLocaleString()} legacy`,
+      tone: "medium",
+      action: "Use web_search",
+      detail:
+        "Codex still maps deprecated web-search toggles, but the modern setting is clearer and avoids surprises when profiles or managed config are layered.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "# Replace deprecated keys:",
+        ...webSearchLegacyKeys.map((key) => `# ${key} = ...`),
+        "",
+        "# Use one modern mode instead:",
+        `web_search = "${webSearchEffectiveMode}"`,
+        "",
+        "# cached is the usual local-task baseline; live is for current external facts; disabled is for fully local work.",
       ].join("\n"),
     });
   }
@@ -5890,6 +5952,8 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const webSearchEffectiveMode = codexConfig?.webSearchEffectiveMode || codexConfig?.webSearchMode || "cached";
   const webSearchLabel = codexConfig?.webSearchLabel || webSearchModeLabel(webSearchEffectiveMode, Boolean(codexConfig?.webSearchConfigured));
   const webSearchLive = webSearchEffectiveMode === "live";
+  const webSearchLegacyKeys = codexConfig?.webSearchLegacyKeys || [];
+  const webSearchLegacyKeyCount = Number(codexConfig?.webSearchLegacyKeyCount || webSearchLegacyKeys.length || 0);
   const memoryBytes = categories.memoryState?.bytes || 0;
   const memoryFiles = categories.memoryState?.fileCount || 0;
   const memoriesFeature = Boolean(codexConfig?.memoriesFeature);
@@ -6205,6 +6269,8 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail:
         webSearchLive
           ? "Live web search is useful for current facts, but cached or disabled search can make local coding runs more predictable. Full-access sandboxes can default to live search even when web_search is unset."
+          : webSearchLegacyKeyCount
+            ? `Effective mode is ${webSearchEffectiveMode}. Replace deprecated ${webSearchLegacyKeys.join(", ")} with the modern web_search setting so behavior is easier to reason about.`
           : "Cached/default web search is a good baseline. Disable it only for fully local tasks that should never look outward.",
     },
     {
@@ -6805,6 +6871,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (webSearchLegacyKeyCount) {
+    addRecommendation({
+      id: "legacy-web-search",
+      label: "Web Search",
+      value: "Legacy keys",
+      action: "Use web_search",
+      tone: "medium",
+      priority: 49,
+      detail: `Replace deprecated ${webSearchLegacyKeys.join(", ")} with web_search = "${webSearchEffectiveMode}" so profiles and managed config resolve predictably.`,
+    });
+  }
+
   if (hooksFeature && hookSummary.status === "ready" && hookTone !== "low") {
     addRecommendation({
       id: "hook-load",
@@ -6910,6 +6988,8 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     goalsFeature,
     webSearchMode: webSearchEffectiveMode,
     webSearchLabel,
+    webSearchLegacyKeyCount,
+    webSearchLegacyKeys,
     hooksFeature,
     rulesFeature: codexConfig?.rulesFeature !== false,
     hookSummary,
@@ -7415,6 +7495,7 @@ function benchmarkLiveScore(metrics) {
   if (metrics.networkGlobalAllow) score -= 2;
   if (metrics.networkDangerousSettingCount) score -= Math.min(4, Number(metrics.networkDangerousSettingCount || 0) * 2);
   if (metrics.webSearchLive) score -= 2;
+  if (metrics.webSearchLegacyKeyCount) score -= Math.min(2, Number(metrics.webSearchLegacyKeyCount || 0));
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasSetupScript) score -= 2;
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasActions) score -= 2;
   score -= Math.min(3, Number(metrics.localEnvironmentParseWarningCount || 0) * 1.5);
@@ -7541,6 +7622,11 @@ function benchmarkGuidance(metrics) {
   if (metrics.webSearchLive) {
     guidance.push("Switch web_search to cached for most local coding runs; keep live search for tasks that truly need current external facts.");
   }
+  if (metrics.webSearchLegacyKeyCount > 0) {
+    guidance.push(
+      `Replace ${Number(metrics.webSearchLegacyKeyCount).toLocaleString()} deprecated web-search key${metrics.webSearchLegacyKeyCount === 1 ? "" : "s"} with the modern web_search mode.`,
+    );
+  }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
     guidance.push(
       `Review ${Number(metrics.hookTurnScopedCommandCount).toLocaleString()} turn/tool-scope lifecycle hook command${metrics.hookTurnScopedCommandCount === 1 ? "" : "s"} with /hooks if Codex commands feel slow.`,
@@ -7639,7 +7725,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v4",
+    scoreModel: "local-state-v5",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -8304,6 +8390,7 @@ function benchmarkDeltas(current, previous) {
     "networkWritableRootCount",
     "webSearchLive",
     "webSearchDisabled",
+    "webSearchLegacyKeyCount",
     "localEnvironmentConfigCount",
     "localEnvironmentCandidateFileCount",
     "localEnvironmentSetupCount",
@@ -8464,6 +8551,7 @@ function summarizeBenchmarkEntry(entry) {
     webSearchConfigured: Boolean(entry.metrics.webSearchConfigured),
     webSearchLive: Boolean(entry.metrics.webSearchLive),
     webSearchDisabled: Boolean(entry.metrics.webSearchDisabled),
+    webSearchLegacyKeyCount: entry.metrics.webSearchLegacyKeyCount || 0,
     projectHasPackageJson: Boolean(entry.metrics.projectHasPackageJson),
     projectHasUsefulScripts: Boolean(entry.metrics.projectHasUsefulScripts),
     localEnvironmentConfigCount: entry.metrics.localEnvironmentConfigCount || 0,
@@ -8534,6 +8622,7 @@ export async function benchmarkHistory(limit = 12) {
         networkWritableRootCount: latest.networkWritableRootCount - oldest.networkWritableRootCount,
         webSearchLive: Number(latest.webSearchLive) - Number(oldest.webSearchLive),
         webSearchDisabled: Number(latest.webSearchDisabled) - Number(oldest.webSearchDisabled),
+        webSearchLegacyKeyCount: latest.webSearchLegacyKeyCount - oldest.webSearchLegacyKeyCount,
         localEnvironmentConfigCount: latest.localEnvironmentConfigCount - oldest.localEnvironmentConfigCount,
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - oldest.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - oldest.localEnvironmentActionCount,
@@ -8569,6 +8658,7 @@ export async function benchmarkHistory(limit = 12) {
         networkDangerousSettingCount: latest.networkDangerousSettingCount - previous.networkDangerousSettingCount,
         webSearchLive: Number(latest.webSearchLive) - Number(previous.webSearchLive),
         webSearchDisabled: Number(latest.webSearchDisabled) - Number(previous.webSearchDisabled),
+        webSearchLegacyKeyCount: latest.webSearchLegacyKeyCount - previous.webSearchLegacyKeyCount,
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - previous.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - previous.localEnvironmentActionCount,
         localEnvironmentParseWarningCount: latest.localEnvironmentParseWarningCount - previous.localEnvironmentParseWarningCount,
@@ -8634,7 +8724,7 @@ export async function runBenchmark() {
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
 
   const metrics = {
-    scoreModel: "local-state-v4",
+    scoreModel: "local-state-v5",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -8768,6 +8858,7 @@ export async function runBenchmark() {
     webSearchConfigured: Boolean(scan.codexConfig?.webSearchConfigured),
     webSearchLive: webSearchEffectiveMode === "live",
     webSearchDisabled: webSearchEffectiveMode === "disabled",
+    webSearchLegacyKeyCount: scan.codexConfig?.webSearchLegacyKeyCount || 0,
     projectHasPackageJson: Boolean(currentProject?.hasPackageJson),
     projectHasUsefulScripts: Boolean(
       currentProject?.hasPackageJson &&
