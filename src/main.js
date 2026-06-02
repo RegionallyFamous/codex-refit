@@ -52,6 +52,7 @@ const elements = {
   doctorProfiles: $("#doctorProfiles"),
   doctorConfig: $("#doctorConfig"),
   doctorWorkflow: $("#doctorWorkflow"),
+  doctorFixKit: $("#doctorFixKit"),
   refitOutcome: $("#refitOutcome"),
   refitOutcomeTitle: $("#refitOutcomeTitle"),
   refitOutcomeActive: $("#refitOutcomeActive"),
@@ -453,6 +454,33 @@ function renderCodexDoctor(doctor) {
           .join("")
       : `<article><span>Workflow</span><strong>Waiting</strong><small>Run a scan to check concurrency and tool surface.</small></article>`;
   }
+  if (elements.doctorFixKit) {
+    const fixes = doctor.fixKit || [];
+    elements.doctorFixKit.innerHTML = fixes.length
+      ? fixes
+          .slice(0, 4)
+          .map((fix) => {
+            const snippet = fix.snippet ? escapeHtml(fix.snippet) : "";
+            const copyValue = fix.snippet ? encodeURIComponent(fix.snippet) : "";
+            const copyButton = fix.snippet
+              ? `<button class="copy-fix" type="button" data-copy="${copyValue}">Copy</button>`
+              : "";
+            return `
+              <article class="${escapeHtml(fix.tone || "low")}" title="${escapeHtml(fix.detail || "")}">
+                <div>
+                  <span>${escapeHtml(fix.label || "Fix")}</span>
+                  <strong>${escapeHtml(fix.value || "--")}</strong>
+                  <small>${escapeHtml(fix.action || fix.detail || "")}</small>
+                </div>
+                ${snippet ? `<pre><code>${snippet}</code></pre>` : ""}
+                ${!snippet && fix.detail ? `<p>${escapeHtml(fix.detail)}</p>` : ""}
+                ${copyButton}
+              </article>
+            `;
+          })
+          .join("")
+      : `<article><span>Fix Kit</span><strong>Waiting</strong><small>Run a scan to build next steps.</small></article>`;
+  }
 }
 
 function renderScan(scan) {
@@ -832,6 +860,22 @@ async function runAction(action, options = {}) {
   }
 }
 
+async function copyDoctorSnippet(button) {
+  const text = decodeURIComponent(button.dataset.copy || "");
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    const originalText = button.textContent;
+    button.textContent = "Copied";
+    logOperation("Copied Fix Kit snippet", "Snippet copied to the clipboard.", "success");
+    setTimeout(() => {
+      button.textContent = originalText;
+    }, 1400);
+  } catch (error) {
+    logOperation("Copy failed", error.message || "Clipboard access was not available.", "danger");
+  }
+}
+
 elements.refreshScan.addEventListener("click", refreshScan);
 elements.safeSweep.addEventListener("click", () =>
   runAction("safeSweep", {
@@ -869,6 +913,13 @@ elements.smartDeleteArm?.addEventListener("change", () => setDeleteArmed(element
 
 document.querySelectorAll("[data-action]").forEach((button) => {
   button.addEventListener("click", () => runAction(button.dataset.action, optionsForAction(button.dataset.action)));
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-copy]");
+  if (!button) return;
+  event.preventDefault();
+  copyDoctorSnippet(button);
 });
 
 window.codexRefit?.onRescan(() => refreshScan());

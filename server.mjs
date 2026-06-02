@@ -800,6 +800,8 @@ async function getCodexConfigSummary() {
     trustedProjectCount: 0,
     staleTrustedProjectCount: 0,
     trustedProjectPaths: [],
+    trustedProjectStatuses: [],
+    staleTrustedProjectPaths: [],
     enabledPluginCount: 0,
     enabledMcpCount: 0,
     disabledMcpCount: 0,
@@ -831,7 +833,12 @@ async function getCodexConfigSummary() {
     summary.trustedProjectPaths = extractTrustedProjectPaths(sections, values);
     summary.trustedProjectCount = summary.trustedProjectPaths.length;
     const trustedProjectExists = await Promise.all(summary.trustedProjectPaths.map((projectPath) => exists(projectPath)));
-    summary.staleTrustedProjectCount = trustedProjectExists.filter((projectExists) => !projectExists).length;
+    summary.trustedProjectStatuses = summary.trustedProjectPaths.map((projectPath, index) => ({
+      path: projectPath,
+      exists: trustedProjectExists[index],
+    }));
+    summary.staleTrustedProjectPaths = summary.trustedProjectStatuses.filter((project) => !project.exists).map((project) => project.path);
+    summary.staleTrustedProjectCount = summary.staleTrustedProjectPaths.length;
     summary.enabledPluginCount = sections.filter((section) => section.startsWith('plugins."') && values[`${section}.enabled`] === true).length;
     const mcpSections = sections.filter(isTopLevelMcpSection);
     summary.enabledMcpCount = mcpSections.filter((section) => values[`${section}.enabled`] !== false).length;
@@ -842,6 +849,161 @@ async function getCodexConfigSummary() {
   }
 
   return summary;
+}
+
+function projectTableForPath(projectPath) {
+  return `[projects."${String(projectPath || "").replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"]`;
+}
+
+function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
+  const fixes = [];
+  const addFix = (fix) => {
+    if (!fix?.id || fixes.some((existing) => existing.id === fix.id)) return;
+    fixes.push(fix);
+  };
+
+  const activeReliefBytes = context.activeReliefBytes || 0;
+  const logBytes = context.logBytes || 0;
+  const logWalBytes = context.logWalBytes || 0;
+  const staleProjectPaths = codexConfig?.staleTrustedProjectPaths || [];
+  const highEffort = ["high", "xhigh", "extra-high", "extra_high"].includes(String(codexConfig?.reasoningEffort || "").toLowerCase());
+  const hasGuidance = Boolean(codexConfig?.globalAgentsExists);
+  const emptyGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
+  const fastMode = Boolean(codexConfig?.fastMode);
+  const fastModeFeature = codexConfig?.fastModeFeature !== false;
+
+  if (activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2 || logBytes > 1024 ** 3) {
+    addFix({
+      id: "run-smart-optimize",
+      label: "Run Refit First",
+      value: activeReliefBytes > 0 ? formatBytesServer(activeReliefBytes) : formatBytesServer(logBytes + logWalBytes),
+      tone: "high",
+      action: "Smart Optimize, then Run Check",
+      detail:
+        "Best local win: move stale active history, prune logs, checkpoint WAL, and compact databases with backups. This does not delete generated images.",
+    });
+  }
+
+  if (runtime?.versionMismatch) {
+    addFix({
+      id: "runtime-check",
+      label: "Runtime Check",
+      value: `${runtime.cliVersion} / ${runtime.appVersion}`,
+      tone: "medium",
+      action: "Compare versions",
+      detail: "If the app and terminal feel different, confirm which Codex binary each surface is using before changing settings.",
+      snippet: [
+        "which codex",
+        "codex --version",
+        `${runtime.appCliPath || codexAppCli} --version`,
+      ].join("\n"),
+    });
+  }
+
+  if (!hasGuidance) {
+    addFix({
+      id: "agents-guidance",
+      label: "AGENTS Guidance",
+      value: emptyGuidance ? "Empty" : "Missing",
+      tone: "medium",
+      action: "Add only repeated rules",
+      detail:
+        emptyGuidance
+          ? "Codex skips empty AGENTS files. Add recurring preferences that save future correction loops."
+          : "Durable guidance can keep repeated preferences out of every prompt.",
+      snippet: [
+        "# ~/.codex/AGENTS.md",
+        "",
+        "## Working Agreements",
+        "- Keep changes scoped to the requested task.",
+        "- Inspect the existing code style before editing.",
+        "- Run the relevant build or test command after code changes.",
+        "- Preserve user-created files and generated assets unless explicitly asked.",
+      ].join("\n"),
+    });
+  }
+
+  if (staleProjectPaths.length) {
+    addFix({
+      id: "stale-trust",
+      label: "Stale Trust",
+      value: `${staleProjectPaths.length}/${codexConfig?.trustedProjectCount || staleProjectPaths.length}`,
+      tone: "medium",
+      action: "Remove missing project tables",
+      detail: "These trusted project paths no longer exist. Remove their tables from config.toml after confirming you do not need the entries.",
+      snippet: [
+        `# ${paths.configToml}`,
+        ...staleProjectPaths.slice(0, 8).map(projectTableForPath),
+        ...(staleProjectPaths.length > 8 ? [`# plus ${staleProjectPaths.length - 8} more missing project table${staleProjectPaths.length - 8 === 1 ? "" : "s"}`] : []),
+      ].join("\n"),
+    });
+  }
+
+  if (highEffort) {
+    addFix({
+      id: "small-task-profile",
+      label: "Small Task Profile",
+      value: codexConfig?.reasoningEffort || "High",
+      tone: "medium",
+      action: "Use mini or lower effort",
+      detail: "For small, well-scoped tasks, use a lighter model or lower reasoning. Keep gpt-5.5 with high/xhigh for hard debugging.",
+      snippet: [
+        'codex --model gpt-5.4-mini "small, scoped task"',
+        'codex --config model_reasoning_effort=\'"low"\' "small, scoped task"',
+      ].join("\n"),
+    });
+  }
+
+  if (!fastMode && fastModeFeature) {
+    addFix({
+      id: "fast-mode-check",
+      label: "Fast Mode",
+      value: codexConfig?.serviceTier || codexConfig?.desktopServiceTier || "standard",
+      tone: "medium",
+      action: "/fast status",
+      detail: "Fast Mode can accelerate supported models at higher credit use. Check access before making it the default.",
+      snippet: [
+        "/fast status",
+        "",
+        "# Optional ~/.codex/config.toml default after confirming access:",
+        'service_tier = "fast"',
+        "",
+        "[features]",
+        "fast_mode = true",
+      ].join("\n"),
+    });
+  }
+
+  if (!codexConfig?.goalsFeature) {
+    addFix({
+      id: "goal-mode-config",
+      label: "Long Work",
+      value: "Goal Mode",
+      tone: "low",
+      action: "Use for persistent objectives",
+      detail: "Goal mode helps long optimization and refactor work keep an explicit completion target across turns.",
+      snippet: [
+        "# Add under the existing [features] table in ~/.codex/config.toml",
+        "goals = true",
+      ].join("\n"),
+    });
+  }
+
+  if (!fixes.length) {
+    addFix({
+      id: "speed-check",
+      label: "Baseline",
+      value: "Ready",
+      tone: "low",
+      action: "Run Check",
+      detail: "No major actionable Doctor issue is showing. Refresh the local benchmark before changing config.",
+    });
+  }
+
+  return fixes.sort((a, b) => {
+    const weight = { high: 3, medium: 2, low: 1, danger: 4 };
+    return (weight[b.tone] || 0) - (weight[a.tone] || 0);
+  });
 }
 
 function buildCodexDoctor(scan, codexConfig, runtime = {}) {
@@ -1267,6 +1429,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
   }
 
   recommendations.sort((a, b) => b.priority - a.priority);
+  const fixKit = buildDoctorFixKit(scan, codexConfig, runtime, {
+    activeReliefBytes,
+    logBytes,
+    logWalBytes,
+  });
 
   const headline =
     runtime?.versionMismatch
@@ -1302,6 +1469,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}) {
     configAdvice,
     workflowAdvice,
     recommendations,
+    fixKit,
   };
 }
 

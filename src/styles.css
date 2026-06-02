@@ -1025,14 +1025,16 @@ body[data-hard-mode] .benchmark-guidance span:nth-child(n + 2) {
 
 .doctor-profiles,
 .doctor-config,
-.doctor-workflow {
+.doctor-workflow,
+.doctor-fix-kit {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.48rem;
 }
 
 .doctor-config,
-.doctor-workflow {
+.doctor-workflow,
+.doctor-fix-kit {
   display: none;
 }
 
@@ -1045,7 +1047,8 @@ body[data-hard-mode] .benchmark-guidance span:nth-child(n + 2) {
 }
 
 body[data-hard-mode] .doctor-config,
-body[data-hard-mode] .doctor-workflow {
+body[data-hard-mode] .doctor-workflow,
+body[data-hard-mode] .doctor-fix-kit {
   display: grid;
 }
 
@@ -1053,7 +1056,8 @@ body[data-hard-mode] .doctor-workflow {
 .doctor-queue article,
 .doctor-profiles article,
 .doctor-config article,
-.doctor-workflow article {
+.doctor-workflow article,
+.doctor-fix-kit article {
   display: grid;
   gap: 0.22rem;
   min-height: 86px;
@@ -1072,7 +1076,8 @@ body[data-hard-mode] .doctor-workflow {
 
 .doctor-profiles article,
 .doctor-config article,
-.doctor-workflow article {
+.doctor-workflow article,
+.doctor-fix-kit article {
   min-height: 72px;
   border-top-width: 6px;
   background: rgba(255, 242, 210, 0.045);
@@ -1082,7 +1087,8 @@ body[data-hard-mode] .doctor-workflow {
 .doctor-queue article.medium,
 .doctor-profiles article.medium,
 .doctor-config article.medium,
-.doctor-workflow article.medium {
+.doctor-workflow article.medium,
+.doctor-fix-kit article.medium {
   border-top-color: var(--gold);
 }
 
@@ -1090,7 +1096,8 @@ body[data-hard-mode] .doctor-workflow {
 .doctor-queue article.high,
 .doctor-profiles article.high,
 .doctor-config article.high,
-.doctor-workflow article.high {
+.doctor-workflow article.high,
+.doctor-fix-kit article.high {
   border-top-color: var(--coral);
 }
 
@@ -1103,7 +1110,9 @@ body[data-hard-mode] .doctor-workflow {
 .doctor-config span,
 .doctor-config small,
 .doctor-workflow span,
-.doctor-workflow small {
+.doctor-workflow small,
+.doctor-fix-kit span,
+.doctor-fix-kit small {
   color: var(--muted);
   font-size: 0.68rem;
   font-weight: 850;
@@ -1119,7 +1128,9 @@ body[data-hard-mode] .doctor-workflow {
 .doctor-config span,
 .doctor-config strong,
 .doctor-workflow span,
-.doctor-workflow strong {
+.doctor-workflow strong,
+.doctor-fix-kit span,
+.doctor-fix-kit strong {
   text-transform: uppercase;
 }
 
@@ -1127,7 +1138,8 @@ body[data-hard-mode] .doctor-workflow {
 .doctor-queue strong,
 .doctor-profiles strong,
 .doctor-config strong,
-.doctor-workflow strong {
+.doctor-workflow strong,
+.doctor-fix-kit strong {
   overflow: hidden;
   color: var(--cream);
   font-size: 0.9rem;
@@ -1142,8 +1154,47 @@ body[data-hard-mode] .doctor-workflow {
 
 .doctor-profiles strong,
 .doctor-config strong,
-.doctor-workflow strong {
+.doctor-workflow strong,
+.doctor-fix-kit strong {
   font-size: 0.82rem;
+}
+
+.doctor-fix-kit article {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.doctor-fix-kit article pre {
+  grid-column: 1 / -1;
+  max-height: 112px;
+  margin: 0.2rem 0 0;
+  overflow: auto;
+  border: 1px solid rgba(255, 242, 210, 0.14);
+  border-radius: 6px;
+  padding: 0.44rem;
+  background: rgba(0, 0, 0, 0.44);
+  color: var(--cream);
+  font: 700 0.66rem/1.28 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
+.doctor-fix-kit article p {
+  grid-column: 1 / -1;
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1.3;
+}
+
+.doctor-fix-kit article button {
+  min-width: 58px;
+  min-height: 30px;
+  border-color: rgba(81, 214, 199, 0.4);
+  padding: 0.32rem 0.52rem;
+  background: rgba(81, 214, 199, 0.18);
+  color: var(--teal);
+  font-size: 0.64rem;
 }
 
 .outcome-strip {
@@ -1837,7 +1888,8 @@ body[data-busy] .app-shell {
   .doctor-queue,
   .doctor-profiles,
   .doctor-config,
-  .doctor-workflow {
+  .doctor-workflow,
+  .doctor-fix-kit {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1930,6 +1982,7 @@ body[data-busy] .app-shell {
   .doctor-profiles,
   .doctor-config,
   .doctor-workflow,
+  .doctor-fix-kit,
   .control-row,
   .target-card,
   .log-item {
