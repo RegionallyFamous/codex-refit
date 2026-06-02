@@ -14,6 +14,7 @@ const homeDir = os.homedir();
 const appSupport = path.join(homeDir, "Library", "Application Support");
 const codexHome = path.resolve(process.env.CODEX_HOME || path.join(homeDir, ".codex"));
 const codexAppCli = "/Applications/Codex.app/Contents/Resources/codex";
+const adminConfigRoot = path.resolve(process.env.CODEX_REFIT_ADMIN_CONFIG_DIR || "/etc/codex");
 const hookEvents = [
   "PreToolUse",
   "PermissionRequest",
@@ -60,7 +61,10 @@ const paths = {
   codexSkills: path.join(codexHome, "skills"),
   codexSystemSkills: path.join(codexHome, "skills", ".system"),
   userAgentSkills: path.join(homeDir, ".agents", "skills"),
-  adminSkills: "/etc/codex/skills",
+  adminConfigRoot,
+  adminSkills: path.join(adminConfigRoot, "skills"),
+  managedConfigToml: path.join(adminConfigRoot, "managed_config.toml"),
+  requirementsToml: path.join(adminConfigRoot, "requirements.toml"),
   pluginCache: path.join(codexHome, "plugins", "cache"),
   configToml: path.join(codexHome, "config.toml"),
   authJson: path.join(codexHome, "auth.json"),
@@ -199,7 +203,7 @@ function parseTomlSummary(text) {
   for (const rawLine of String(text || "").split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
-    const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+    const sectionMatch = line.match(/^\[\[?([^\]]+)\]?\]$/);
     if (sectionMatch) {
       section = sectionMatch[1];
       sections.push(section);
@@ -376,6 +380,315 @@ function tomlInlineTableValues(value) {
 function tomlInlineTableKeys(value) {
   if (value === undefined || value === null) return [];
   return [...String(value).matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=/g)].map((match) => match[1]).filter(Boolean);
+}
+
+const managedSpeedKeys = new Set([
+  "model",
+  "model_reasoning_effort",
+  "reasoning_effort",
+  "model_verbosity",
+  "service_tier",
+  "desktop.default-service-tier",
+  "approval_policy",
+  "approvals_reviewer",
+  "sandbox_mode",
+  "web_search",
+  "model_context_window",
+  "model_auto_compact_token_limit",
+  "tool_output_token_limit",
+  "project_doc_max_bytes",
+  "max_concurrent_threads_per_session",
+  "agents.max_threads",
+  "agents.max_depth",
+  "agents.job_max_runtime_seconds",
+  "features.fast_mode",
+  "features.shell_snapshot",
+  "features.hooks",
+  "features.codex_hooks",
+  "features.memories",
+  "features.in_app_browser",
+  "features.browser_use",
+  "features.computer_use",
+]);
+
+const requirementControlKeys = new Set([
+  "allowed_approval_policies",
+  "allowed_approvals_reviewers",
+  "allowed_sandbox_modes",
+  "allowed_web_search_modes",
+  "guardian_policy_config",
+  "enforce_residency",
+  "plugin_sharing",
+  "allow_managed_hooks_only",
+]);
+
+function emptyManagedConfigSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "None",
+    action: "No override",
+    detail:
+      "No file-based Codex managed requirements or managed defaults were found in the documented local system paths. Cloud-managed and MDM settings are not decoded by Refit.",
+    active: false,
+    managedDefaultExists: false,
+    requirementsExists: false,
+    managedKeyCount: 0,
+    requirementKeyCount: 0,
+    managedSpeedKeyCount: 0,
+    requirementSpeedKeyCount: 0,
+    conflictCount: 0,
+    managedDefaultConflictCount: 0,
+    requirementConflictCount: 0,
+    managedMcpCount: 0,
+    managedMcpBlockedCount: 0,
+    managedHookCount: 0,
+    featurePinCount: 0,
+    legacyRequirementKeyCount: 0,
+    impactedKeys: [],
+    conflictKeys: [],
+    blockedMcpNames: [],
+    sources: [],
+  };
+}
+
+function isManagedSpeedKey(key) {
+  const normalized = String(key || "");
+  return (
+    managedSpeedKeys.has(normalized) ||
+    requirementControlKeys.has(normalized) ||
+    normalized.startsWith("shell_environment_policy.") ||
+    normalized.startsWith("mcp_servers.") ||
+    normalized.startsWith("hooks.") ||
+    normalized.startsWith("features.") ||
+    normalized.startsWith("auto_review.") ||
+    normalized.startsWith("experimental_network.") ||
+    normalized.startsWith("permissions.filesystem.") ||
+    normalized.startsWith("rules.")
+  );
+}
+
+function sameConfigValue(left, right) {
+  return String(left ?? "").trim() === String(right ?? "").trim();
+}
+
+function sanitizeConfigKeys(keys, limit = 10) {
+  return [...new Set(keys.filter(Boolean).map(String))]
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, limit);
+}
+
+async function readManagedTomlSource(filePath, kind, label) {
+  const source = {
+    kind,
+    label,
+    path: displayPath(filePath),
+    exists: false,
+    readable: false,
+    bytes: 0,
+    modifiedAt: null,
+    keyCount: 0,
+    sectionCount: 0,
+    speedKeyCount: 0,
+    mcpServerCount: 0,
+    hookCount: 0,
+    featurePinCount: 0,
+    error: null,
+    values: {},
+    sections: [],
+  };
+
+  const stats = await statOrNull(filePath);
+  if (!stats?.isFile()) return source;
+
+  source.exists = true;
+  source.bytes = stats.size || 0;
+  source.modifiedAt = stats.mtime?.toISOString?.() || null;
+
+  try {
+    const parsed = parseTomlSummary(await fs.readFile(filePath, "utf8"));
+    const keys = Object.keys(parsed.values);
+    source.readable = true;
+    source.keyCount = keys.length;
+    source.sectionCount = parsed.sections.length;
+    source.speedKeyCount = keys.filter(isManagedSpeedKey).length;
+    source.mcpServerCount = mcpServerDescriptors(parsed.sections).length;
+    source.hookCount =
+      keys.filter((key) => key.startsWith("hooks.")).length +
+      parsed.sections.filter((section) => section.startsWith("hooks.")).length;
+    source.featurePinCount = keys.filter((key) => key.startsWith("features.")).length;
+    source.values = parsed.values;
+    source.sections = parsed.sections;
+  } catch (error) {
+    source.error = error.message;
+  }
+
+  return source;
+}
+
+function allowedValueConflict(values, requirementKey, userKey, userValues) {
+  if (userValues[userKey] === undefined || values[requirementKey] === undefined) return false;
+  const allowed = tomlArrayStringNames(values[requirementKey]).map((value) => normalizeConfigKey(value));
+  const configured = normalizeConfigKey(userValues[userKey]);
+  if (requirementKey === "allowed_web_search_modes" && configured === "disabled") return false;
+  if (!allowed.length) return Boolean(configured);
+  return Boolean(configured && !allowed.includes(configured));
+}
+
+function managedMcpBlockedNames(requirementSections, userSections) {
+  const requirementDescriptors = mcpServerDescriptors(requirementSections);
+  const mcpAllowlistPresent = requirementSections.some((section) => section.startsWith("mcp_servers."));
+  if (!mcpAllowlistPresent) return [];
+
+  const allowedNames = new Set(requirementDescriptors.map((descriptor) => descriptor.name));
+  const userNames = mcpServerDescriptors(userSections)
+    .filter((descriptor) => descriptor.scope === "user")
+    .map((descriptor) => descriptor.name);
+  return sanitizeConfigKeys(userNames.filter((name) => !allowedNames.has(name)), 8);
+}
+
+async function getManagedConfigSummary({ userValues = {}, userSections = [] } = {}) {
+  const [managedSource, requirementsSource] = await Promise.all([
+    readManagedTomlSource(paths.managedConfigToml, "managed-defaults", "Managed defaults"),
+    readManagedTomlSource(paths.requirementsToml, "requirements", "Requirements"),
+  ]);
+  const managedValues = managedSource.values || {};
+  const requirementValues = requirementsSource.values || {};
+  const managedKeys = Object.keys(managedValues);
+  const requirementKeys = Object.keys(requirementValues);
+  const managedDefaultConflictKeys = managedKeys.filter(
+    (key) => userValues[key] !== undefined && !sameConfigValue(managedValues[key], userValues[key]),
+  );
+  const requirementConflictKeys = new Set(
+    requirementKeys.filter((key) => userValues[key] !== undefined && !sameConfigValue(requirementValues[key], userValues[key])),
+  );
+
+  if (allowedValueConflict(requirementValues, "allowed_approval_policies", "approval_policy", userValues)) {
+    requirementConflictKeys.add("approval_policy");
+  }
+  if (allowedValueConflict(requirementValues, "allowed_approvals_reviewers", "approvals_reviewer", userValues)) {
+    requirementConflictKeys.add("approvals_reviewer");
+  }
+  if (allowedValueConflict(requirementValues, "allowed_sandbox_modes", "sandbox_mode", userValues)) {
+    requirementConflictKeys.add("sandbox_mode");
+  }
+  if (allowedValueConflict(requirementValues, "allowed_web_search_modes", "web_search", userValues)) {
+    requirementConflictKeys.add("web_search");
+  }
+
+  const legacyRequirementKeys = ["approval_policy", "sandbox_mode"].filter((key) => managedValues[key] !== undefined);
+  for (const key of legacyRequirementKeys) {
+    if (userValues[key] !== undefined && !sameConfigValue(managedValues[key], userValues[key])) requirementConflictKeys.add(key);
+  }
+
+  const blockedMcpNames = managedMcpBlockedNames(requirementsSource.sections || [], userSections || []);
+  if (blockedMcpNames.length) requirementConflictKeys.add("mcp_servers");
+
+  const managedSpeedKeyCount = managedKeys.filter(isManagedSpeedKey).length;
+  const requirementSpeedKeyCount = requirementKeys.filter(isManagedSpeedKey).length;
+  const managedMcpCount = mcpServerDescriptors(requirementsSource.sections || []).length;
+  const managedHookCount =
+    Number(requirementsSource.hookCount || 0) +
+    Number(managedSource.hookCount || 0) +
+    (requirementValues.allow_managed_hooks_only === true ? 1 : 0);
+  const featurePinCount = Number(requirementsSource.featurePinCount || 0);
+  const conflictKeys = sanitizeConfigKeys([...managedDefaultConflictKeys, ...requirementConflictKeys], 12);
+  const impactedKeys = sanitizeConfigKeys(
+    [...managedKeys, ...requirementKeys, ...legacyRequirementKeys, ...conflictKeys].filter(isManagedSpeedKey),
+    14,
+  );
+  const conflictCount = managedDefaultConflictKeys.length + requirementConflictKeys.size;
+  const active = managedSource.exists || requirementsSource.exists;
+  const highLoad = conflictCount > 0 || blockedMcpNames.length > 0 || managedHookCount >= 3;
+  const mediumLoad =
+    highLoad ||
+    active ||
+    managedSpeedKeyCount + requirementSpeedKeyCount > 0 ||
+    managedMcpCount > 0 ||
+    featurePinCount > 0 ||
+    legacyRequirementKeys.length > 0;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = !active
+    ? "None"
+    : requirementsSource.exists && managedSource.exists
+      ? "Defaults + rules"
+      : requirementsSource.exists
+        ? "Requirements"
+        : "Managed defaults";
+  const action =
+    tone === "low"
+      ? "No override"
+      : conflictCount
+        ? "Check admin settings"
+        : managedHookCount
+          ? "Review managed hooks"
+          : "Know the layer";
+  const detail =
+    tone === "low"
+      ? emptyManagedConfigSummary().detail
+      : [
+          "Codex can apply organization or device-managed settings before your local config takes effect.",
+          managedSource.exists
+            ? `Managed defaults are present at ${displayPath(paths.managedConfigToml)} with ${managedKeys.length.toLocaleString()} key${managedKeys.length === 1 ? "" : "s"}.`
+            : null,
+          requirementsSource.exists
+            ? `Requirements are present at ${displayPath(paths.requirementsToml)} with ${requirementKeys.length.toLocaleString()} key${requirementKeys.length === 1 ? "" : "s"}.`
+            : null,
+          conflictCount
+            ? `${conflictCount.toLocaleString()} local setting${conflictCount === 1 ? "" : "s"} appear to disagree with managed defaults or requirements.`
+            : "No local conflicts were found from the file-based managed layer.",
+          blockedMcpNames.length
+            ? `${blockedMcpNames.length.toLocaleString()} configured MCP server${blockedMcpNames.length === 1 ? "" : "s"} may be outside the managed allowlist.`
+            : null,
+          managedHookCount
+            ? `${managedHookCount.toLocaleString()} managed hook signal${managedHookCount === 1 ? "" : "s"} found; hooks can add latency around frequent actions.`
+            : null,
+          "Refit reports key names and counts only; it does not expose managed TOML values.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    active,
+    managedDefaultExists: managedSource.exists,
+    requirementsExists: requirementsSource.exists,
+    managedKeyCount: managedKeys.length,
+    requirementKeyCount: requirementKeys.length,
+    managedSpeedKeyCount,
+    requirementSpeedKeyCount,
+    conflictCount,
+    managedDefaultConflictCount: managedDefaultConflictKeys.length,
+    requirementConflictCount: requirementConflictKeys.size,
+    managedMcpCount,
+    managedMcpBlockedCount: blockedMcpNames.length,
+    managedHookCount,
+    featurePinCount,
+    legacyRequirementKeyCount: legacyRequirementKeys.length,
+    impactedKeys,
+    conflictKeys,
+    blockedMcpNames,
+    sources: [managedSource, requirementsSource].map((source) => ({
+      kind: source.kind,
+      label: source.label,
+      path: source.path,
+      exists: source.exists,
+      readable: source.readable,
+      bytes: source.bytes,
+      modifiedAt: source.modifiedAt,
+      keyCount: source.keyCount,
+      sectionCount: source.sectionCount,
+      speedKeyCount: source.speedKeyCount,
+      mcpServerCount: source.mcpServerCount,
+      hookCount: source.hookCount,
+      featurePinCount: source.featurePinCount,
+      error: source.error,
+    })),
+  };
 }
 
 function shellEnvSecretNameCount() {
@@ -3509,6 +3822,7 @@ async function getCodexConfigSummary() {
     instructionOverrides: emptyInstructionOverrideSummary(),
     customAgents: emptyCustomAgentSummary(),
     customPrompts: emptyCustomPromptSummary(),
+    managedConfig: emptyManagedConfigSummary(),
     goalsFeature: false,
     hooksFeature: true,
     hookSummary: {
@@ -3588,6 +3902,7 @@ async function getCodexConfigSummary() {
     summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
     summary.customAgents = await getCustomAgentSummary(null);
     summary.customPrompts = await getCustomPromptSummary();
+    summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     return summary;
   }
   summary.exists = true;
@@ -3677,8 +3992,10 @@ async function getCodexConfigSummary() {
     summary.enabledMcpCount = summary.mcpSummary.enabledCount;
     summary.disabledMcpCount = summary.mcpSummary.disabledCount;
     summary.requiredMcpCount = summary.mcpSummary.requiredCount;
+    summary.managedConfig = await getManagedConfigSummary({ userValues: mcpValues, userSections: mcpSections });
   } catch (error) {
     summary.error = error.message;
+    summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
   }
 
   return summary;
@@ -3772,6 +4089,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
   const customPrompts = codexConfig?.customPrompts || emptyCustomPromptSummary();
+  const managedConfig = codexConfig?.managedConfig || emptyManagedConfigSummary();
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -3921,6 +4239,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "description: Short command summary",
         "argument-hint: [FILES=]",
         "---",
+      ].join("\n"),
+    });
+  }
+
+  if (managedConfig.status === "ready" && managedConfig.tone !== "low") {
+    addFix({
+      id: "managed-config",
+      label: "Managed Config",
+      value: managedConfig.label,
+      tone: managedConfig.tone === "high" ? "high" : "medium",
+      action: managedConfig.action || "Check admin settings",
+      detail:
+        "Managed Codex requirements and defaults can override local config at startup. Review the policy layer before repeatedly changing ~/.codex/config.toml.",
+      snippet: [
+        "codex doctor --summary",
+        "",
+        "# Documented local/system managed Codex files:",
+        `# ${displayPath(paths.requirementsToml)}`,
+        `# ${displayPath(paths.managedConfigToml)}`,
+        "",
+        "# On managed Macs, an MDM profile can also set com.openai.codex payloads.",
+        "# Cloud-managed requirements can be assigned by ChatGPT Business/Enterprise admins.",
       ].join("\n"),
     });
   }
@@ -4321,6 +4661,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
   const customPrompts = codexConfig?.customPrompts || emptyCustomPromptSummary();
+  const managedConfig = codexConfig?.managedConfig || emptyManagedConfigSummary();
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -4520,6 +4861,22 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: approvalFlow.action || "Review prompts",
       priority: approvalFlow.priority || 72,
       detail: approvalFlow.detail || "Approval prompts can interrupt fast runs. Use /permissions or config only when the trust/safety tradeoff is right.",
+    },
+    {
+      id: "managed-config",
+      label: "Managed Config",
+      value: managedConfig.label,
+      tone: managedConfig.tone,
+      action: managedConfig.action,
+      priority:
+        managedConfig.tone === "high"
+          ? 90
+          : managedConfig.tone === "medium"
+            ? managedConfig.conflictCount
+              ? 78
+              : 55
+            : 16,
+      detail: managedConfig.detail,
     },
     {
       id: "shell-snapshot",
@@ -4924,6 +5281,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (managedConfig.status === "ready" && managedConfig.tone !== "low") {
+    addRecommendation({
+      id: "managed-config",
+      label: "Managed Config",
+      value: managedConfig.label,
+      action: managedConfig.action || "Check admin settings",
+      tone: managedConfig.tone === "high" ? "high" : "medium",
+      priority: managedConfig.conflictCount || managedConfig.managedMcpBlockedCount ? 88 : 57,
+      detail:
+        managedConfig.conflictCount || managedConfig.managedMcpBlockedCount
+          ? `${managedConfig.detail} Check this before changing local config again.`
+          : managedConfig.detail,
+    });
+  }
+
   if (threadLimit >= 128) {
     addRecommendation({
       id: "thread-discipline",
@@ -5251,6 +5623,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     agentJobMaxRuntimeSeconds: codexConfig?.agentJobMaxRuntimeSeconds ?? null,
     customAgents,
     customPrompts,
+    managedConfig,
     authCache,
     projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
@@ -5723,6 +6096,9 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(5, Math.max(0, Number(metrics.skillEstimatedCatalogChars || 0) - skillCatalogBudgetChars) / 4000);
   score -= Math.min(4, Math.max(0, Number(metrics.skillCount || 0) - 40) * 0.08);
   if (metrics.skillCatalogTruncated) score -= 2;
+  score -= Math.min(5, Number(metrics.managedConfigConflictCount || 0) * 2);
+  score -= Math.min(3, Number(metrics.managedMcpBlockedCount || 0) * 1.5);
+  score -= Math.min(3, Number(metrics.managedHookCount || 0) * 0.75);
   return Math.round(clampNumber(score, 0, 100));
 }
 
@@ -5805,6 +6181,18 @@ function benchmarkGuidance(metrics) {
   if (metrics.customPromptCount > 0) {
     guidance.push(
       `Review ${Number(metrics.customPromptCount).toLocaleString()} deprecated custom prompt${metrics.customPromptCount === 1 ? "" : "s"}; use skills for reusable workflows as you update them.`,
+    );
+  }
+  if (metrics.managedConfigConflictCount > 0) {
+    guidance.push(
+      `Review managed Codex config before editing local settings again; ${Number(metrics.managedConfigConflictCount).toLocaleString()} local setting${metrics.managedConfigConflictCount === 1 ? "" : "s"} appear to disagree with managed defaults or requirements.`,
+    );
+  } else if (metrics.managedRequirementKeyCount > 0 || metrics.managedConfigKeyCount > 0) {
+    guidance.push("Managed Codex defaults or requirements are active. Keep that layer in mind when speed settings seem to reset.");
+  }
+  if (metrics.managedMcpBlockedCount > 0) {
+    guidance.push(
+      `${Number(metrics.managedMcpBlockedCount).toLocaleString()} MCP server${metrics.managedMcpBlockedCount === 1 ? "" : "s"} may be outside the managed allowlist; check admin policy before debugging MCP startup.`,
     );
   }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
@@ -6543,6 +6931,11 @@ function benchmarkDeltas(current, previous) {
     "skillLongDescriptionCount",
     "customPromptCount",
     "customPromptBytes",
+    "managedConfigKeyCount",
+    "managedRequirementKeyCount",
+    "managedConfigConflictCount",
+    "managedMcpBlockedCount",
+    "managedHookCount",
   ];
   return Object.fromEntries(keys.map((key) => [key, current[key] - (previous.metrics[key] || 0)]));
 }
@@ -6649,6 +7042,18 @@ function summarizeBenchmarkEntry(entry) {
     customPromptMissingDescriptionCount: entry.metrics.customPromptMissingDescriptionCount || 0,
     customPromptPlaceholderCount: entry.metrics.customPromptPlaceholderCount || 0,
     customPromptNestedMarkdownCount: entry.metrics.customPromptNestedMarkdownCount || 0,
+    managedConfigPresent: Boolean(entry.metrics.managedConfigPresent),
+    managedConfigKeyCount: entry.metrics.managedConfigKeyCount || 0,
+    managedRequirementKeyCount: entry.metrics.managedRequirementKeyCount || 0,
+    managedSpeedKeyCount: entry.metrics.managedSpeedKeyCount || 0,
+    managedRequirementSpeedKeyCount: entry.metrics.managedRequirementSpeedKeyCount || 0,
+    managedConfigConflictCount: entry.metrics.managedConfigConflictCount || 0,
+    managedDefaultConflictCount: entry.metrics.managedDefaultConflictCount || 0,
+    managedRequirementConflictCount: entry.metrics.managedRequirementConflictCount || 0,
+    managedMcpCount: entry.metrics.managedMcpCount || 0,
+    managedMcpBlockedCount: entry.metrics.managedMcpBlockedCount || 0,
+    managedHookCount: entry.metrics.managedHookCount || 0,
+    managedFeaturePinCount: entry.metrics.managedFeaturePinCount || 0,
     scoreModel: entry.metrics.scoreModel,
     scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
@@ -6696,6 +7101,10 @@ export async function benchmarkHistory(limit = 12) {
         skillLongDescriptionCount: latest.skillLongDescriptionCount - oldest.skillLongDescriptionCount,
         customPromptCount: latest.customPromptCount - oldest.customPromptCount,
         customPromptBytes: latest.customPromptBytes - oldest.customPromptBytes,
+        managedConfigKeyCount: latest.managedConfigKeyCount - oldest.managedConfigKeyCount,
+        managedRequirementKeyCount: latest.managedRequirementKeyCount - oldest.managedRequirementKeyCount,
+        managedConfigConflictCount: latest.managedConfigConflictCount - oldest.managedConfigConflictCount,
+        managedMcpBlockedCount: latest.managedMcpBlockedCount - oldest.managedMcpBlockedCount,
       }
     : null;
   const previousDeltas = latest && previous
@@ -6718,6 +7127,8 @@ export async function benchmarkHistory(limit = 12) {
         skillCount: latest.skillCount - previous.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - previous.skillEstimatedCatalogChars,
         customPromptCount: latest.customPromptCount - previous.customPromptCount,
+        managedConfigConflictCount: latest.managedConfigConflictCount - previous.managedConfigConflictCount,
+        managedMcpBlockedCount: latest.managedMcpBlockedCount - previous.managedMcpBlockedCount,
       }
     : null;
   const trend =
@@ -6772,6 +7183,7 @@ export async function runBenchmark() {
     (scan.categories.crashDumps?.bytes || 0) +
     (scan.categories.browserCaches?.bytes || 0) +
     (scan.categories.archivedSessionsInActiveTree?.bytes || 0);
+  const managedConfigSummary = scan.codexConfig?.managedConfig || emptyManagedConfigSummary();
 
   const metrics = {
     scoreModel: "local-state-v2",
@@ -6860,6 +7272,18 @@ export async function runBenchmark() {
     customPromptMissingDescriptionCount: scan.codexConfig?.customPrompts?.missingDescriptionCount || 0,
     customPromptPlaceholderCount: scan.codexConfig?.customPrompts?.placeholderCount || 0,
     customPromptNestedMarkdownCount: scan.codexConfig?.customPrompts?.nestedMarkdownCount || 0,
+    managedConfigPresent: Boolean(managedConfigSummary.active),
+    managedConfigKeyCount: managedConfigSummary.managedKeyCount || 0,
+    managedRequirementKeyCount: managedConfigSummary.requirementKeyCount || 0,
+    managedSpeedKeyCount: managedConfigSummary.managedSpeedKeyCount || 0,
+    managedRequirementSpeedKeyCount: managedConfigSummary.requirementSpeedKeyCount || 0,
+    managedConfigConflictCount: managedConfigSummary.conflictCount || 0,
+    managedDefaultConflictCount: managedConfigSummary.managedDefaultConflictCount || 0,
+    managedRequirementConflictCount: managedConfigSummary.requirementConflictCount || 0,
+    managedMcpCount: managedConfigSummary.managedMcpCount || 0,
+    managedMcpBlockedCount: managedConfigSummary.managedMcpBlockedCount || 0,
+    managedHookCount: managedConfigSummary.managedHookCount || 0,
+    managedFeaturePinCount: managedConfigSummary.featurePinCount || 0,
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
