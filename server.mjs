@@ -360,6 +360,98 @@ function codexProcessLabel(kind) {
   }[kind] || "Codex helper";
 }
 
+function processCommandLabel(command) {
+  const text = String(command || "").trim();
+  if (!text) return "command";
+  const lower = text.toLowerCase();
+  if (lower.includes("npm ")) return "npm";
+  if (lower.includes("pnpm ")) return "pnpm";
+  if (lower.includes("yarn ")) return "yarn";
+  if (lower.includes("vite")) return "vite";
+  if (lower.includes("sqlite3")) return "sqlite3";
+  if (lower.includes("python")) return "python";
+  if (lower.includes("node")) return "node";
+  if (lower.includes("zsh")) return "shell";
+  if (lower.includes("bash")) return "shell";
+  const first = text.match(/^"([^"]+)"|^'([^']+)'|^(\S+)/)?.slice(1).find(Boolean) || "command";
+  return path.basename(first).replace(/[^\w.-]/g, "").slice(0, 24) || "command";
+}
+
+function shouldCountBackgroundCommand(processInfo) {
+  if (processInfo.kind) return false;
+  const label = processInfo.commandLabel;
+  if (["ps", "rg", "sed", "awk", "curl"].includes(label)) return false;
+  if (/server\.mjs|codex-refit|Codex Refit/i.test(processInfo.command)) return false;
+  if (processInfo.ageSeconds >= 30) return true;
+  if (processInfo.cpuPercent >= 5) return true;
+  return processInfo.rssBytes >= 100 * 1024 ** 2;
+}
+
+function summarizeBackgroundCommands(allProcesses, codexRoots) {
+  const childrenByParent = new Map();
+  for (const processInfo of allProcesses) {
+    const list = childrenByParent.get(processInfo.ppid) || [];
+    list.push(processInfo);
+    childrenByParent.set(processInfo.ppid, list);
+  }
+
+  const seen = new Set(codexRoots);
+  const queue = [...codexRoots];
+  const descendants = [];
+  while (queue.length) {
+    const pid = queue.shift();
+    for (const child of childrenByParent.get(pid) || []) {
+      if (seen.has(child.pid)) continue;
+      seen.add(child.pid);
+      if (!child.kind) descendants.push(child);
+      queue.push(child.pid);
+    }
+  }
+
+  const commands = descendants.filter(shouldCountBackgroundCommand);
+  const rssBytes = commands.reduce((total, processInfo) => total + processInfo.rssBytes, 0);
+  const cpuPercent = commands.reduce((total, processInfo) => total + processInfo.cpuPercent, 0);
+  const longestAgeSeconds = commands.reduce((max, processInfo) => Math.max(max, processInfo.ageSeconds || 0), 0);
+  const countByLabel = commands.reduce((counts, processInfo) => {
+    counts[processInfo.commandLabel] = (counts[processInfo.commandLabel] || 0) + 1;
+    return counts;
+  }, {});
+  const largest = [...commands]
+    .sort((a, b) => b.rssBytes + b.cpuPercent * 20 * 1024 ** 2 - (a.rssBytes + a.cpuPercent * 20 * 1024 ** 2))
+    .slice(0, 4)
+    .map((processInfo) => ({
+      label: processInfo.commandLabel,
+      rssBytes: processInfo.rssBytes,
+      cpuPercent: Number(processInfo.cpuPercent.toFixed(1)),
+      ageSeconds: processInfo.ageSeconds,
+    }));
+
+  const highLoad = commands.length >= 4 || cpuPercent >= 50 || rssBytes >= 2 * 1024 ** 3;
+  const mediumLoad = commands.length >= 1 || cpuPercent >= 10 || rssBytes >= 512 * 1024 ** 2;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const detail =
+    commands.length === 0
+      ? "No long-running background terminal commands were found under Codex."
+      : tone === "high"
+        ? `Refit sees ${commands.length.toLocaleString()} background command${commands.length === 1 ? "" : "s"} under Codex using ${formatBytesServer(rssBytes)} and about ${cpuPercent.toFixed(0)}% CPU. Use /ps to inspect and /stop when the work is no longer needed.`
+        : `Refit sees ${commands.length.toLocaleString()} background command${commands.length === 1 ? "" : "s"} under Codex using ${formatBytesServer(rssBytes)}. Use /ps before judging local cleanup.`;
+
+  return {
+    status: "ready",
+    tone,
+    label: tone === "high" ? "Busy" : tone === "medium" ? "Running" : "Quiet",
+    processCount: commands.length,
+    rssBytes,
+    cpuPercent: Number(cpuPercent.toFixed(1)),
+    longestAgeSeconds,
+    longestAgeLabel: longestAgeSeconds ? formatAgeServer(longestAgeSeconds) : "None",
+    detail,
+    action: tone === "low" ? "Keep current" : "Use /ps",
+    largest,
+    counts: countByLabel,
+  };
+}
+
 function buildProcessLoadSnippet() {
   return [
     "# Read-only Codex load check. Counts processes and memory without printing auth contents.",
@@ -370,37 +462,53 @@ function buildProcessLoadSnippet() {
   ].join("\n");
 }
 
+function buildBackgroundTerminalSnippet() {
+  return [
+    "# In the active Codex thread:",
+    "/ps",
+    "",
+    "# Stop background terminal work only after confirming it is no longer needed:",
+    "/stop",
+  ].join("\n");
+}
+
 async function getCodexProcessSummary() {
   try {
-    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,rss=,etime=,command="], {
+    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,rss=,pcpu=,etime=,command="], {
       timeout: 3000,
       maxBuffer: 2 * 1024 * 1024,
     });
-    const processes = String(stdout || "")
+    const allProcesses = String(stdout || "")
       .split(/\r?\n/)
       .map((line) => {
-        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+([0-9.]+)\s+(\S+)\s+(.+)$/);
         if (!match) return null;
-        const command = match[5];
+        const command = match[6];
         const kind = codexProcessKind(command);
-        if (!kind) return null;
         return {
           pid: Number(match[1]),
           ppid: Number(match[2]),
           kind,
-          label: codexProcessLabel(kind),
+          label: kind ? codexProcessLabel(kind) : processCommandLabel(command),
+          commandLabel: processCommandLabel(command),
+          command,
           rssBytes: (Number(match[3]) || 0) * 1024,
-          ageSeconds: parsePsElapsedSeconds(match[4]),
+          cpuPercent: Number(match[4]) || 0,
+          ageSeconds: parsePsElapsedSeconds(match[5]),
         };
       })
       .filter(Boolean);
 
+    const processes = allProcesses.filter((processInfo) => processInfo.kind);
     const pressureProcesses = processes.filter((processInfo) => !["refit", "crashpad"].includes(processInfo.kind));
+    const pressurePids = new Set(pressureProcesses.map((processInfo) => processInfo.pid));
+    const background = summarizeBackgroundCommands(allProcesses, pressurePids);
     const countByKind = pressureProcesses.reduce((counts, processInfo) => {
       counts[processInfo.kind] = (counts[processInfo.kind] || 0) + 1;
       return counts;
     }, {});
     const rssBytes = pressureProcesses.reduce((total, processInfo) => total + processInfo.rssBytes, 0);
+    const cpuPercent = pressureProcesses.reduce((total, processInfo) => total + processInfo.cpuPercent, 0);
     const helperCount =
       (countByKind.threadServer || 0) +
       (countByKind.nodeRepl || 0) +
@@ -443,12 +551,14 @@ async function getCodexProcessSummary() {
       threadServerCount: countByKind.threadServer || 0,
       refitCount: processes.filter((processInfo) => processInfo.kind === "refit").length,
       rssBytes,
+      cpuPercent: Number(cpuPercent.toFixed(1)),
       longestAgeSeconds,
       longestAgeLabel: longestAgeSeconds ? formatAgeServer(longestAgeSeconds) : "None",
       detail,
       action: tone === "low" ? "Keep current" : tone === "medium" ? "Close idle threads" : "Restart after active work",
       largest,
       counts: countByKind,
+      background,
     };
   } catch (error) {
     return {
@@ -464,12 +574,27 @@ async function getCodexProcessSummary() {
       threadServerCount: 0,
       refitCount: 0,
       rssBytes: 0,
+      cpuPercent: 0,
       longestAgeSeconds: 0,
       longestAgeLabel: "Unknown",
       detail: `Refit could not read live process load: ${error.message}`,
       action: "Run ps manually",
       largest: [],
       counts: {},
+      background: {
+        status: "unavailable",
+        tone: "medium",
+        label: "Unknown",
+        processCount: 0,
+        rssBytes: 0,
+        cpuPercent: 0,
+        longestAgeSeconds: 0,
+        longestAgeLabel: "Unknown",
+        detail: `Refit could not read background terminal load: ${error.message}`,
+        action: "Run /ps",
+        largest: [],
+        counts: {},
+      },
     };
   }
 }
@@ -1769,6 +1894,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const currentProject = projectReadiness.currentProject;
   const authCache = codexConfig?.authCache || {};
   const processSummary = context.processSummary || {};
+  const backgroundSummary = processSummary.background || {};
   const agentMaxThreads = Number(codexConfig?.agentMaxThreadsEffective ?? 6);
   const agentMaxDepth = Number(codexConfig?.agentMaxDepthEffective ?? 1);
   const agentFanoutRisk = agentMaxDepth > 1 || agentMaxThreads >= 12;
@@ -1800,6 +1926,19 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
       detail:
         "Many live Codex helpers can make the app feel slow even after local cleanup. Finish or archive idle threads, close extra terminals, then restart Codex after active runs are done.",
       snippet: buildProcessLoadSnippet(),
+    });
+  }
+
+  if (backgroundSummary.status === "ready" && backgroundSummary.tone !== "low") {
+    addFix({
+      id: "background-terminal-load",
+      label: "Background Work",
+      value: `${Number(backgroundSummary.processCount || 0).toLocaleString()} cmds`,
+      tone: backgroundSummary.tone === "high" ? "high" : "medium",
+      action: "/ps, then /stop",
+      detail:
+        "Long-running terminal commands under Codex can make everything feel slow. Use /ps to inspect them and /stop only after confirming the work is no longer needed.",
+      snippet: buildBackgroundTerminalSnippet(),
     });
   }
 
@@ -2101,6 +2240,12 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const processLoaded = processReady && processSummary.tone !== "low";
   const processCount = Number(processSummary?.processCount || 0);
   const processRssBytes = Number(processSummary?.rssBytes || 0);
+  const backgroundSummary = processSummary?.background || {};
+  const backgroundReady = backgroundSummary.status === "ready";
+  const backgroundLoaded = backgroundReady && backgroundSummary.tone !== "low";
+  const backgroundCount = Number(backgroundSummary.processCount || 0);
+  const backgroundRssBytes = Number(backgroundSummary.rssBytes || 0);
+  const backgroundCpuPercent = Number(backgroundSummary.cpuPercent || 0);
 
   const localDetail =
     activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2
@@ -2140,6 +2285,10 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     processReady
       ? `${processSummary.detail} Oldest live Codex process: ${processSummary.longestAgeLabel || "unknown"}.`
       : processSummary?.detail || "Live Codex process load was not available for this scan.";
+  const backgroundDetail =
+    backgroundReady
+      ? `${backgroundSummary.detail} Longest background command: ${backgroundSummary.longestAgeLabel || "unknown"}.`
+      : backgroundSummary?.detail || "Background terminal load was not available for this scan.";
 
   const cards = [
     {
@@ -2334,6 +2483,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: processDetail,
     },
     {
+      id: "background-terminal-load",
+      label: "Background Work",
+      value: backgroundReady ? `${backgroundCount.toLocaleString()} cmds` : "Unknown",
+      tone: backgroundSummary?.tone || "medium",
+      action: backgroundReady ? backgroundSummary.action || "Use /ps" : "Run /ps",
+      priority: backgroundLoaded ? (backgroundSummary.tone === "high" ? 96 : 80) : 25,
+      detail: backgroundDetail,
+    },
+    {
       id: "agent-fanout",
       label: "Agent Fan-out",
       value: `${agentMaxThreads.toLocaleString()} / depth ${agentMaxDepth.toLocaleString()}`,
@@ -2452,6 +2610,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         processSummary.tone === "high"
           ? `Codex currently has ${processCount.toLocaleString()} live processes using ${formatBytesServer(processRssBytes)}. Finish/archive idle threads and restart Codex after active work before judging deeper cleanup.`
           : `Codex currently has ${processCount.toLocaleString()} live processes using ${formatBytesServer(processRssBytes)}. Close idle threads or extra terminals if the app feels slow.`,
+    });
+  }
+
+  if (backgroundLoaded) {
+    addRecommendation({
+      id: "background-terminal-load",
+      label: "Background Work",
+      value: `${backgroundCount.toLocaleString()} cmds`,
+      action: "/ps, then /stop",
+      tone: backgroundSummary.tone === "high" ? "high" : "medium",
+      priority: backgroundSummary.tone === "high" ? 97 : 83,
+      detail:
+        backgroundSummary.tone === "high"
+          ? `Codex has ${backgroundCount.toLocaleString()} background command${backgroundCount === 1 ? "" : "s"} using ${formatBytesServer(backgroundRssBytes)} and about ${backgroundCpuPercent.toFixed(0)}% CPU. Inspect with /ps before stopping anything.`
+          : `Codex has ${backgroundCount.toLocaleString()} background command${backgroundCount === 1 ? "" : "s"} still running. Use /ps before judging cleanup results.`,
     });
   }
 
@@ -3128,6 +3301,9 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(12, metrics.logQueryMs / 80);
   score -= Math.min(14, Math.max(0, Number(metrics.processCount || 0) - 10) * 0.3);
   score -= Math.min(8, ((Number(metrics.processRssBytes || 0) / 1024 ** 3) || 0) * 1.2);
+  score -= Math.min(12, Math.max(0, Number(metrics.backgroundProcessCount || 0)) * 2);
+  score -= Math.min(10, Math.max(0, Number(metrics.backgroundCpuPercent || 0)) * 0.18);
+  score -= Math.min(8, ((Number(metrics.backgroundRssBytes || 0) / 1024 ** 3) || 0) * 2);
   score -= Math.min(8, Math.max(0, Number(metrics.agentMaxDepth || 1) - 1) * 4);
   score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
@@ -3174,6 +3350,11 @@ function benchmarkGuidance(metrics) {
     );
   } else if (metrics.processCount >= 12) {
     guidance.push(`Codex has ${Number(metrics.processCount).toLocaleString()} live processes; close idle threads before judging cleanup.`);
+  }
+  if (metrics.backgroundProcessCount > 0) {
+    guidance.push(
+      `Use /ps to inspect ${Number(metrics.backgroundProcessCount).toLocaleString()} Codex background command${metrics.backgroundProcessCount === 1 ? "" : "s"} before using /stop.`,
+    );
   }
   if (metrics.agentMaxDepth > 1) {
     guidance.push(
@@ -3823,6 +4004,9 @@ function benchmarkDeltas(current, previous) {
     "processCount",
     "processRssBytes",
     "processHelperCount",
+    "backgroundProcessCount",
+    "backgroundRssBytes",
+    "backgroundCpuPercent",
     "agentMaxThreads",
     "agentMaxDepth",
     "memoryBytes",
@@ -3850,6 +4034,9 @@ function summarizeBenchmarkEntry(entry) {
     processCount: entry.metrics.processCount || 0,
     processHelperCount: entry.metrics.processHelperCount || 0,
     processRssBytes: entry.metrics.processRssBytes || 0,
+    backgroundProcessCount: entry.metrics.backgroundProcessCount || 0,
+    backgroundRssBytes: entry.metrics.backgroundRssBytes || 0,
+    backgroundCpuPercent: entry.metrics.backgroundCpuPercent || 0,
     agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
     agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
     memoryBytes: entry.metrics.memoryBytes || 0,
@@ -3882,6 +4069,8 @@ export async function benchmarkHistory(limit = 12) {
         staleThreads: latest.staleThreads - oldest.staleThreads,
         processCount: latest.processCount - oldest.processCount,
         processRssBytes: latest.processRssBytes - oldest.processRssBytes,
+        backgroundProcessCount: latest.backgroundProcessCount - oldest.backgroundProcessCount,
+        backgroundRssBytes: latest.backgroundRssBytes - oldest.backgroundRssBytes,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
       }
     : null;
@@ -3893,6 +4082,7 @@ export async function benchmarkHistory(limit = 12) {
         stateQueryMs: latest.stateQueryMs - previous.stateQueryMs,
         logQueryMs: latest.logQueryMs - previous.logQueryMs,
         processCount: latest.processCount - previous.processCount,
+        backgroundProcessCount: latest.backgroundProcessCount - previous.backgroundProcessCount,
       }
     : null;
   const trend =
@@ -3972,6 +4162,9 @@ export async function runBenchmark() {
     processCount: scan.processes?.processCount || 0,
     processHelperCount: scan.processes?.helperCount || 0,
     processRssBytes: scan.processes?.rssBytes || 0,
+    backgroundProcessCount: scan.processes?.background?.processCount || 0,
+    backgroundRssBytes: scan.processes?.background?.rssBytes || 0,
+    backgroundCpuPercent: scan.processes?.background?.cpuPercent || 0,
     agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
     agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
     memoryBytes: scan.categories.memoryState?.bytes || 0,
