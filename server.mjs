@@ -586,6 +586,105 @@ function projectIgnoredConfigKeys(values = {}, sections = []) {
   return [...ignored].sort((a, b) => a.localeCompare(b));
 }
 
+function buildNotificationFlowSummary(values = {}, projectConfig = null) {
+  const tuiNotificationsValue = values["tui.notifications"];
+  const notificationsConfigured = tuiNotificationsValue !== undefined;
+  const tuiNotificationsDisabled = tuiNotificationsValue === false || normalizeConfigKey(tuiNotificationsValue) === "false";
+  const notificationFilters = notificationsConfigured && !tuiNotificationsDisabled ? tomlArrayStringNames(tuiNotificationsValue) : [];
+  const filteredNotifications = notificationFilters.length > 0;
+  const notificationMethod = normalizeConfigKey(values["tui.notification_method"] || "auto");
+  const notificationCondition = normalizeConfigKey(values["tui.notification_condition"] || "unfocused");
+  const notificationAlways = notificationCondition === "always";
+  const notificationMethodInvalid = Boolean(values["tui.notification_method"] && !["auto", "osc9", "bel"].includes(notificationMethod));
+  const notificationConditionInvalid = Boolean(values["tui.notification_condition"] && !["unfocused", "always"].includes(notificationCondition));
+  const notifyArgs = tomlArrayStringNames(values.notify);
+  const externalNotifyConfigured = values.notify !== undefined && notifyArgs.length > 0;
+  const externalNotifyEmpty = values.notify !== undefined && notifyArgs.length === 0;
+  const notifyProgram = notifyArgs[0] || null;
+  const notifyProgramName = notifyProgram ? path.basename(String(notifyProgram)) : null;
+  const notifyText = notifyArgs.join(" ");
+  const externalNotifyShellLike = Boolean(notifyProgramName && /^(sh|bash|zsh|fish|python|python3|node|ruby|perl|osascript)$/i.test(notifyProgramName));
+  const externalNotifyNetworkLike = /\b(curl|wget|http[s]?:|slack|discord|webhook)\b/i.test(notifyText);
+  const externalNotifySlowRisk = externalNotifyShellLike || externalNotifyNetworkLike || /\bsleep\b/i.test(notifyText);
+  const projectIgnoredKeys = projectConfig ? projectIgnoredConfigKeys(projectConfig.values || {}, projectConfig.sections || []) : [];
+  const projectIgnoredNotify = projectIgnoredKeys.includes("notify");
+  const highLoad = notificationMethodInvalid || notificationConditionInvalid || externalNotifyEmpty || projectIgnoredNotify;
+  const mediumLoad = highLoad || tuiNotificationsDisabled || notificationAlways || externalNotifySlowRisk || externalNotifyConfigured;
+  const label = tuiNotificationsDisabled
+    ? "Off"
+    : filteredNotifications
+      ? `${notificationFilters.length.toLocaleString()} filters`
+      : notificationAlways
+        ? "Always"
+        : externalNotifyConfigured
+          ? "External"
+          : "Default";
+  const action = highLoad
+    ? projectIgnoredNotify
+      ? "Move user config"
+      : "Fix notification config"
+    : tuiNotificationsDisabled
+      ? "Enable when useful"
+      : notificationAlways
+        ? "Use unfocused"
+        : externalNotifySlowRisk
+          ? "Keep lightweight"
+          : externalNotifyConfigured
+            ? "Keep simple"
+            : "Keep default";
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const detail =
+    tone === "low"
+      ? "Codex notification settings are using the documented defaults: TUI notifications enabled, auto terminal method, and unfocused-only delivery."
+      : [
+          tuiNotificationsDisabled
+            ? "TUI completion notifications are disabled. That can make long or background Codex work easier to miss."
+            : filteredNotifications
+              ? `TUI notifications are filtered to ${notificationFilters.join(", ")}.`
+              : "TUI completion notifications are enabled.",
+          notificationAlways ? "Notifications fire even when Codex is focused; unfocused-only is quieter for fast local iteration." : null,
+          notificationMethodInvalid ? `notification_method is ${values["tui.notification_method"]}; the documented values are auto, osc9, and bel.` : null,
+          notificationConditionInvalid ? `notification_condition is ${values["tui.notification_condition"]}; the documented values are unfocused and always.` : null,
+          externalNotifyConfigured
+            ? `External notify command is configured as ${notifyProgramName || "custom command"} with ${notifyArgs.length.toLocaleString()} argv part${notifyArgs.length === 1 ? "" : "s"}.`
+            : externalNotifyEmpty
+              ? "notify is configured but Refit could not parse an argv array."
+              : "No external notify command is configured.",
+          externalNotifySlowRisk ? "Keep external notify commands lightweight; shell, network, or sleep-heavy notifiers can add avoidable delay around turn completion." : null,
+          projectIgnoredNotify ? "A project .codex/config.toml contains notify, but Codex ignores notification keys in project config. Move it to ~/.codex/config.toml." : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    tuiNotificationsConfigured: notificationsConfigured,
+    tuiNotificationsDisabled,
+    tuiNotificationsEnabled: !tuiNotificationsDisabled,
+    filteredNotifications,
+    notificationFilterCount: notificationFilters.length,
+    notificationFilters,
+    notificationMethod: notificationMethod || "auto",
+    notificationCondition: notificationCondition || "unfocused",
+    notificationAlways,
+    notificationMethodInvalid,
+    notificationConditionInvalid,
+    externalNotifyConfigured,
+    externalNotifyEmpty,
+    externalNotifyArgCount: notifyArgs.length,
+    externalNotifyProgram: notifyProgramName,
+    externalNotifyShellLike,
+    externalNotifyNetworkLike,
+    externalNotifySlowRisk,
+    projectIgnoredNotify,
+    projectIgnoredNotifyCount: projectIgnoredNotify ? 1 : 0,
+  };
+}
+
 function emptyModelProviderSummary() {
   return {
     status: "ready",
@@ -6518,6 +6617,7 @@ async function getCodexConfigSummary() {
     fastModeFeature: true,
     shellSnapshot: true,
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
+    notificationFlow: buildNotificationFlowSummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
     networkSandbox: emptyNetworkSandboxSummary(),
     instructionStack: emptyInstructionStackSummary(),
@@ -6610,6 +6710,7 @@ async function getCodexConfigSummary() {
   if (!(await exists(paths.configToml))) {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
     summary.networkSandbox = buildNetworkSandboxSummary({}, []);
+    summary.notificationFlow = buildNotificationFlowSummary({});
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
     summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
     summary.customAgents = await getCustomAgentSummary(null);
@@ -6648,6 +6749,7 @@ async function getCodexConfigSummary() {
     summary.fastMode = summary.fastModeFeature && summary.serviceTier === "fast";
     summary.shellSnapshot = values["features.shell_snapshot"] !== false;
     summary.shellEnvironmentSummary = buildShellEnvironmentSummary(values);
+    summary.notificationFlow = buildNotificationFlowSummary(values);
     summary.contextBudgetSummary = buildContextBudgetSummary(values);
     summary.goalsFeature = values["features.goals"] === true;
     summary.hooksFeature = (values["features.hooks"] ?? values["features.codex_hooks"]) !== false;
@@ -6711,6 +6813,7 @@ async function getCodexConfigSummary() {
         // Keep MCP diagnostics available from the user config even if project config is unreadable.
       }
     }
+    summary.notificationFlow = buildNotificationFlowSummary(values, currentProjectConfig);
     summary.modelProvider = buildModelProviderSummary(values, sections, currentProjectConfig);
     summary.instructionStack = await getInstructionStackSummary({
       values: mcpValues,
@@ -6844,6 +6947,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const webSearchLegacyKeys = codexConfig?.webSearchLegacyKeys || [];
   const webSearchLegacyKeyCount = Number(codexConfig?.webSearchLegacyKeyCount || webSearchLegacyKeys.length || 0);
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
+  const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
@@ -6957,6 +7061,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# If rate limits are low:",
         "# - Wait for the limit to recover, use a lighter profile, or move independent heavy work to cloud when the repo is ready.",
+      ].join("\n"),
+    });
+  }
+
+  if (notificationFlow.status === "ready" && notificationFlow.tone !== "low") {
+    addFix({
+      id: "notification-flow",
+      label: "Notifications",
+      value: notificationFlow.label,
+      tone: notificationFlow.tone === "high" ? "high" : "medium",
+      action: notificationFlow.action,
+      detail:
+        "Codex can notify you when long turns finish. Keep notifications enabled for hands-off work, but keep external notify commands lightweight so completion alerts do not add friction.",
+      snippet: [
+        "# ~/.codex/config.toml",
+        "[tui]",
+        "notifications = true",
+        'notification_method = "auto"',
+        'notification_condition = "unfocused"',
+        "",
+        "# Optional external notifier. Keep it lightweight and user-level, not project-level:",
+        '# notify = ["terminal-notifier", "-title", "Codex", "-message", "Turn complete"]',
       ].join("\n"),
     });
   }
@@ -7762,6 +7888,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const fastModeFeature = codexConfig?.fastModeFeature !== false;
   const shellSnapshot = codexConfig?.shellSnapshot !== false;
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
+  const notificationFlow = codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const responseShapeSummary = codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const networkSandbox = codexConfig?.networkSandbox || emptyNetworkSandboxSummary();
@@ -8061,6 +8188,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: shellEnvironmentSummary.action,
       priority: shellEnvironmentSummary.tone === "high" ? 86 : shellEnvironmentSummary.tone === "medium" ? 64 : 24,
       detail: shellEnvironmentSummary.detail,
+    },
+    {
+      id: "notification-flow",
+      label: "Notifications",
+      value: notificationFlow.label,
+      tone: notificationFlow.tone,
+      action: notificationFlow.action,
+      priority: notificationFlow.tone === "high" ? 82 : notificationFlow.tone === "medium" ? 58 : 19,
+      detail: notificationFlow.detail,
     },
     {
       id: "context-budget",
@@ -8950,6 +9086,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (notificationFlow.status === "ready" && notificationFlow.tone !== "low") {
+    addRecommendation({
+      id: "notification-flow",
+      label: "Notifications",
+      value: notificationFlow.label,
+      action: notificationFlow.action,
+      tone: notificationFlow.tone === "high" ? "high" : "medium",
+      priority: notificationFlow.tone === "high" ? 75 : 48,
+      detail: notificationFlow.detail,
+    });
+  }
+
   if (hooksFeature && hookSummary.status === "ready" && hookTone !== "low") {
     addRecommendation({
       id: "hook-load",
@@ -9048,6 +9196,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     fastModeFeature,
     shellSnapshot,
     shellEnvironmentSummary,
+    notificationFlow,
     contextBudgetSummary,
     responseShapeSummary,
     networkSandbox,
@@ -9684,6 +9833,11 @@ function benchmarkLiveScore(metrics) {
   if (metrics.networkDangerousSettingCount) score -= Math.min(4, Number(metrics.networkDangerousSettingCount || 0) * 2);
   if (metrics.webSearchLive) score -= 2;
   if (metrics.webSearchLegacyKeyCount) score -= Math.min(2, Number(metrics.webSearchLegacyKeyCount || 0));
+  if (metrics.notificationMethodInvalid || metrics.notificationConditionInvalid || metrics.notificationExternalEmpty) score -= 2;
+  if (metrics.notificationProjectIgnoredNotify) score -= 2;
+  if (metrics.notificationDisabled && (metrics.backgroundProcessCount > 0 || metrics.turnTelemetrySlowTurnCount > 0)) score -= 2;
+  if (metrics.notificationExternalSlowRisk) score -= 1;
+  if (metrics.notificationAlways) score -= 1;
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasSetupScript) score -= 2;
   if (metrics.projectHasUsefulScripts && !metrics.localEnvironmentHasActions) score -= 2;
   score -= Math.min(3, Number(metrics.localEnvironmentParseWarningCount || 0) * 1.5);
@@ -9903,6 +10057,17 @@ function benchmarkGuidance(metrics) {
       `Replace ${Number(metrics.webSearchLegacyKeyCount).toLocaleString()} deprecated web-search key${metrics.webSearchLegacyKeyCount === 1 ? "" : "s"} with the modern web_search mode.`,
     );
   }
+  if (metrics.notificationProjectIgnoredNotify) {
+    guidance.push("Move notify out of project .codex/config.toml; Codex ignores notification commands there, so put it in ~/.codex/config.toml.");
+  } else if (metrics.notificationDisabled && (metrics.backgroundProcessCount > 0 || metrics.turnTelemetrySlowTurnCount > 0)) {
+    guidance.push("Enable unfocused Codex notifications for long or background work so you do not have to babysit slow turns.");
+  } else if (metrics.notificationExternalSlowRisk) {
+    guidance.push("Keep the external notify command lightweight; shell, network, or sleep-heavy completion hooks can add avoidable delay.");
+  } else if (metrics.notificationAlways) {
+    guidance.push("Set notification_condition to unfocused for quieter fast local iteration.");
+  } else if (metrics.notificationMethodInvalid || metrics.notificationConditionInvalid || metrics.notificationExternalEmpty) {
+    guidance.push("Fix notification config values; use notification_method auto/osc9/bel, notification_condition unfocused/always, and an argv array for notify.");
+  }
   if (metrics.hooksFeature !== false && metrics.hookTurnScopedCommandCount >= 2) {
     guidance.push(
       `Review ${Number(metrics.hookTurnScopedCommandCount).toLocaleString()} turn/tool-scope lifecycle hook command${metrics.hookTurnScopedCommandCount === 1 ? "" : "s"} with /hooks if Codex commands feel slow.`,
@@ -10007,7 +10172,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v14",
+    scoreModel: "local-state-v15",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -10838,6 +11003,20 @@ function benchmarkDeltas(current, previous) {
     "webSearchLive",
     "webSearchDisabled",
     "webSearchLegacyKeyCount",
+    "notificationDisabled",
+    "notificationFiltered",
+    "notificationFilterCount",
+    "notificationAlways",
+    "notificationMethodInvalid",
+    "notificationConditionInvalid",
+    "notificationExternalConfigured",
+    "notificationExternalEmpty",
+    "notificationExternalArgCount",
+    "notificationExternalShellLike",
+    "notificationExternalNetworkLike",
+    "notificationExternalSlowRisk",
+    "notificationProjectIgnoredNotify",
+    "notificationProjectIgnoredNotifyCount",
     "localEnvironmentConfigCount",
     "localEnvironmentCandidateFileCount",
     "localEnvironmentSetupCount",
@@ -11129,6 +11308,25 @@ function summarizeBenchmarkEntry(entry) {
     webSearchLive: Boolean(entry.metrics.webSearchLive),
     webSearchDisabled: Boolean(entry.metrics.webSearchDisabled),
     webSearchLegacyKeyCount: entry.metrics.webSearchLegacyKeyCount || 0,
+    notificationTone: entry.metrics.notificationTone || "low",
+    notificationLabel: entry.metrics.notificationLabel || "Default",
+    notificationTuiEnabled: entry.metrics.notificationTuiEnabled !== false,
+    notificationDisabled: Boolean(entry.metrics.notificationDisabled),
+    notificationFiltered: Boolean(entry.metrics.notificationFiltered),
+    notificationFilterCount: entry.metrics.notificationFilterCount || 0,
+    notificationMethod: entry.metrics.notificationMethod || "auto",
+    notificationCondition: entry.metrics.notificationCondition || "unfocused",
+    notificationAlways: Boolean(entry.metrics.notificationAlways),
+    notificationMethodInvalid: Boolean(entry.metrics.notificationMethodInvalid),
+    notificationConditionInvalid: Boolean(entry.metrics.notificationConditionInvalid),
+    notificationExternalConfigured: Boolean(entry.metrics.notificationExternalConfigured),
+    notificationExternalEmpty: Boolean(entry.metrics.notificationExternalEmpty),
+    notificationExternalArgCount: entry.metrics.notificationExternalArgCount || 0,
+    notificationExternalShellLike: Boolean(entry.metrics.notificationExternalShellLike),
+    notificationExternalNetworkLike: Boolean(entry.metrics.notificationExternalNetworkLike),
+    notificationExternalSlowRisk: Boolean(entry.metrics.notificationExternalSlowRisk),
+    notificationProjectIgnoredNotify: Boolean(entry.metrics.notificationProjectIgnoredNotify),
+    notificationProjectIgnoredNotifyCount: entry.metrics.notificationProjectIgnoredNotifyCount || 0,
     projectHasPackageJson: Boolean(entry.metrics.projectHasPackageJson),
     projectHasUsefulScripts: Boolean(entry.metrics.projectHasUsefulScripts),
     localEnvironmentConfigCount: entry.metrics.localEnvironmentConfigCount || 0,
@@ -11273,6 +11471,14 @@ export async function benchmarkHistory(limit = 12) {
         webSearchLive: Number(latest.webSearchLive) - Number(oldest.webSearchLive),
         webSearchDisabled: Number(latest.webSearchDisabled) - Number(oldest.webSearchDisabled),
         webSearchLegacyKeyCount: latest.webSearchLegacyKeyCount - oldest.webSearchLegacyKeyCount,
+        notificationDisabled: Number(latest.notificationDisabled) - Number(oldest.notificationDisabled),
+        notificationFiltered: Number(latest.notificationFiltered) - Number(oldest.notificationFiltered),
+        notificationFilterCount: latest.notificationFilterCount - oldest.notificationFilterCount,
+        notificationAlways: Number(latest.notificationAlways) - Number(oldest.notificationAlways),
+        notificationExternalConfigured: Number(latest.notificationExternalConfigured) - Number(oldest.notificationExternalConfigured),
+        notificationExternalArgCount: latest.notificationExternalArgCount - oldest.notificationExternalArgCount,
+        notificationExternalSlowRisk: Number(latest.notificationExternalSlowRisk) - Number(oldest.notificationExternalSlowRisk),
+        notificationProjectIgnoredNotify: Number(latest.notificationProjectIgnoredNotify) - Number(oldest.notificationProjectIgnoredNotify),
         localEnvironmentConfigCount: latest.localEnvironmentConfigCount - oldest.localEnvironmentConfigCount,
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - oldest.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - oldest.localEnvironmentActionCount,
@@ -11381,6 +11587,14 @@ export async function benchmarkHistory(limit = 12) {
         webSearchLive: Number(latest.webSearchLive) - Number(previous.webSearchLive),
         webSearchDisabled: Number(latest.webSearchDisabled) - Number(previous.webSearchDisabled),
         webSearchLegacyKeyCount: latest.webSearchLegacyKeyCount - previous.webSearchLegacyKeyCount,
+        notificationDisabled: Number(latest.notificationDisabled) - Number(previous.notificationDisabled),
+        notificationFiltered: Number(latest.notificationFiltered) - Number(previous.notificationFiltered),
+        notificationFilterCount: latest.notificationFilterCount - previous.notificationFilterCount,
+        notificationAlways: Number(latest.notificationAlways) - Number(previous.notificationAlways),
+        notificationExternalConfigured: Number(latest.notificationExternalConfigured) - Number(previous.notificationExternalConfigured),
+        notificationExternalArgCount: latest.notificationExternalArgCount - previous.notificationExternalArgCount,
+        notificationExternalSlowRisk: Number(latest.notificationExternalSlowRisk) - Number(previous.notificationExternalSlowRisk),
+        notificationProjectIgnoredNotify: Number(latest.notificationProjectIgnoredNotify) - Number(previous.notificationProjectIgnoredNotify),
         localEnvironmentSetupCount: latest.localEnvironmentSetupCount - previous.localEnvironmentSetupCount,
         localEnvironmentActionCount: latest.localEnvironmentActionCount - previous.localEnvironmentActionCount,
         localEnvironmentParseWarningCount: latest.localEnvironmentParseWarningCount - previous.localEnvironmentParseWarningCount,
@@ -11445,6 +11659,7 @@ export async function runBenchmark() {
   const localEnvironment = currentProject?.localEnvironment || emptyLocalEnvironmentSummary({ hasCodexDir: Boolean(currentProject?.hasCodexDir) });
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
+  const notificationFlow = scan.codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
@@ -11462,7 +11677,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v14",
+    scoreModel: "local-state-v15",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -11727,6 +11942,25 @@ export async function runBenchmark() {
     webSearchLive: webSearchEffectiveMode === "live",
     webSearchDisabled: webSearchEffectiveMode === "disabled",
     webSearchLegacyKeyCount: scan.codexConfig?.webSearchLegacyKeyCount || 0,
+    notificationTone: notificationFlow.tone || "low",
+    notificationLabel: notificationFlow.label || "Default",
+    notificationTuiEnabled: notificationFlow.tuiNotificationsEnabled !== false,
+    notificationDisabled: Boolean(notificationFlow.tuiNotificationsDisabled),
+    notificationFiltered: Boolean(notificationFlow.filteredNotifications),
+    notificationFilterCount: notificationFlow.notificationFilterCount || 0,
+    notificationMethod: notificationFlow.notificationMethod || "auto",
+    notificationCondition: notificationFlow.notificationCondition || "unfocused",
+    notificationAlways: Boolean(notificationFlow.notificationAlways),
+    notificationMethodInvalid: Boolean(notificationFlow.notificationMethodInvalid),
+    notificationConditionInvalid: Boolean(notificationFlow.notificationConditionInvalid),
+    notificationExternalConfigured: Boolean(notificationFlow.externalNotifyConfigured),
+    notificationExternalEmpty: Boolean(notificationFlow.externalNotifyEmpty),
+    notificationExternalArgCount: notificationFlow.externalNotifyArgCount || 0,
+    notificationExternalShellLike: Boolean(notificationFlow.externalNotifyShellLike),
+    notificationExternalNetworkLike: Boolean(notificationFlow.externalNotifyNetworkLike),
+    notificationExternalSlowRisk: Boolean(notificationFlow.externalNotifySlowRisk),
+    notificationProjectIgnoredNotify: Boolean(notificationFlow.projectIgnoredNotify),
+    notificationProjectIgnoredNotifyCount: notificationFlow.projectIgnoredNotifyCount || 0,
     projectHasPackageJson: Boolean(currentProject?.hasPackageJson),
     projectHasUsefulScripts: Boolean(
       currentProject?.hasPackageJson &&
