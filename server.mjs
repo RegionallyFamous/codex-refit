@@ -4258,6 +4258,139 @@ function codexProcessLabel(kind) {
   }[kind] || "Codex helper";
 }
 
+function parseArgValue(command, flag) {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(command || "").match(new RegExp(`${escaped}(?:=|\\s+)(?:"([^"]+)"|'([^']+)'|(\\S+))`));
+  return match?.[1] || match?.[2] || match?.[3] || null;
+}
+
+function isLoopbackHost(host) {
+  const normalized = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return ["", "localhost", "127.0.0.1", "::1"].includes(normalized) || /^127\./.test(normalized);
+}
+
+function parseAppServerTransport(processInfo) {
+  const command = String(processInfo?.command || "");
+  const listen = parseArgValue(command, "--listen") || (command.includes("app-server") ? "stdio://" : null);
+  const listenText = String(listen || "").trim();
+  const transport = /^ws:\/\//i.test(listenText)
+    ? "websocket"
+    : /^unix:\/\//i.test(listenText)
+      ? "unix"
+      : /^off$/i.test(listenText)
+        ? "off"
+        : /^stdio:\/\//i.test(listenText) || listenText === ""
+          ? "stdio"
+          : "unknown";
+  let host = null;
+  let port = null;
+  if (transport === "websocket") {
+    try {
+      const parsed = new URL(listenText);
+      host = parsed.hostname;
+      port = parsed.port || null;
+    } catch {
+      const match = listenText.match(/^ws:\/\/\[?([^\]/:]+|\:\:1)\]?:?(\d+)?/i);
+      host = match?.[1] || null;
+      port = match?.[2] || null;
+    }
+  }
+  const websocketAuthConfigured =
+    command.includes("--ws-auth") &&
+    (command.includes("--ws-token-file") || command.includes("--ws-token-sha256") || command.includes("--ws-shared-secret-file"));
+  const loopback = transport !== "websocket" || isLoopbackHost(host);
+  return {
+    pid: processInfo.pid,
+    kind: processInfo.kind,
+    transport,
+    listen: listenText || "stdio://",
+    host,
+    port,
+    loopback,
+    websocketAuthConfigured,
+    nonLoopbackWebsocket: transport === "websocket" && !loopback,
+    unauthenticatedWebsocket: transport === "websocket" && !websocketAuthConfigured,
+    ageSeconds: processInfo.ageSeconds || 0,
+    rssBytes: processInfo.rssBytes || 0,
+  };
+}
+
+function emptyAppServerTransportSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "No app-server",
+    action: "Keep default",
+    detail: "No live Codex app-server listener was found.",
+    appServerCount: 0,
+    websocketCount: 0,
+    unixCount: 0,
+    stdioCount: 0,
+    offCount: 0,
+    unknownTransportCount: 0,
+    localWebsocketCount: 0,
+    nonLoopbackWebsocketCount: 0,
+    websocketAuthCount: 0,
+    unauthenticatedWebsocketCount: 0,
+    nonLoopbackUnauthenticatedCount: 0,
+    processes: [],
+  };
+}
+
+function buildAppServerTransportSummary(processes = []) {
+  const appServers = processes
+    .filter((processInfo) => ["threadServer", "backgroundServer"].includes(processInfo.kind) || /\bapp-server\b/.test(processInfo.command || ""))
+    .map(parseAppServerTransport);
+  const summary = emptyAppServerTransportSummary();
+  if (!appServers.length) return summary;
+
+  summary.processes = appServers.slice(0, 12);
+  summary.appServerCount = appServers.length;
+  summary.websocketCount = appServers.filter((server) => server.transport === "websocket").length;
+  summary.unixCount = appServers.filter((server) => server.transport === "unix").length;
+  summary.stdioCount = appServers.filter((server) => server.transport === "stdio").length;
+  summary.offCount = appServers.filter((server) => server.transport === "off").length;
+  summary.unknownTransportCount = appServers.filter((server) => server.transport === "unknown").length;
+  summary.localWebsocketCount = appServers.filter((server) => server.transport === "websocket" && server.loopback).length;
+  summary.nonLoopbackWebsocketCount = appServers.filter((server) => server.nonLoopbackWebsocket).length;
+  summary.websocketAuthCount = appServers.filter((server) => server.websocketAuthConfigured).length;
+  summary.unauthenticatedWebsocketCount = appServers.filter((server) => server.unauthenticatedWebsocket).length;
+  summary.nonLoopbackUnauthenticatedCount = appServers.filter(
+    (server) => server.nonLoopbackWebsocket && server.unauthenticatedWebsocket,
+  ).length;
+  const highLoad = summary.nonLoopbackUnauthenticatedCount > 0 || summary.unknownTransportCount > 0;
+  const mediumLoad = highLoad || summary.websocketCount > 0 || summary.appServerCount >= 6;
+  summary.tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  summary.label = highLoad
+    ? "Exposed WS"
+    : summary.websocketCount
+      ? `${summary.websocketCount.toLocaleString()} WS`
+      : `${summary.appServerCount.toLocaleString()} app-server${summary.appServerCount === 1 ? "" : "s"}`;
+  summary.action = highLoad
+    ? "Add WS auth"
+    : summary.websocketCount
+      ? "Keep local/auth"
+      : summary.appServerCount >= 6
+        ? "Close idle clients"
+        : "Keep default";
+  summary.detail =
+    summary.tone === "low"
+      ? `${summary.appServerCount.toLocaleString()} live Codex app-server process${summary.appServerCount === 1 ? "" : "es"} ${pluralVerb(summary.appServerCount)} using stdio, unix, or off transport.`
+      : [
+          `Refit found ${summary.appServerCount.toLocaleString()} live Codex app-server process${summary.appServerCount === 1 ? "" : "es"}: ${summary.stdioCount.toLocaleString()} stdio, ${summary.unixCount.toLocaleString()} unix, ${summary.websocketCount.toLocaleString()} websocket.`,
+          summary.websocketCount
+            ? "The Codex manual says WebSocket app-server transport is experimental and unsupported; loopback listeners are the intended localhost/SSH-forwarding shape."
+            : null,
+          summary.nonLoopbackUnauthenticatedCount
+            ? `${summary.nonLoopbackUnauthenticatedCount.toLocaleString()} non-loopback WebSocket listener${summary.nonLoopbackUnauthenticatedCount === 1 ? " appears" : "s appear"} to lack WebSocket auth flags.`
+            : null,
+          summary.appServerCount >= 6 ? "Many app-server processes can mean extra rich clients or stale integrations are still connected." : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+  return summary;
+}
+
 function processCommandLabel(command) {
   const text = String(command || "").trim();
   if (!text) return "command";
@@ -4401,6 +4534,7 @@ async function getCodexProcessSummary() {
     const pressureProcesses = processes.filter((processInfo) => !["refit", "crashpad"].includes(processInfo.kind));
     const pressurePids = new Set(pressureProcesses.map((processInfo) => processInfo.pid));
     const background = summarizeBackgroundCommands(allProcesses, pressurePids);
+    const appServerTransport = buildAppServerTransportSummary(pressureProcesses);
     const countByKind = pressureProcesses.reduce((counts, processInfo) => {
       counts[processInfo.kind] = (counts[processInfo.kind] || 0) + 1;
       return counts;
@@ -4456,6 +4590,7 @@ async function getCodexProcessSummary() {
       action: tone === "low" ? "Keep current" : tone === "medium" ? "Close idle threads" : "Restart after active work",
       largest,
       counts: countByKind,
+      appServerTransport,
       background,
     };
   } catch (error) {
@@ -4479,6 +4614,7 @@ async function getCodexProcessSummary() {
       action: "Run ps manually",
       largest: [],
       counts: {},
+      appServerTransport: emptyAppServerTransportSummary(),
       background: {
         status: "unavailable",
         tone: "medium",
@@ -7678,6 +7814,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const mcpSummary = codexConfig?.mcpSummary || buildMcpConfigSummary({}, []);
   const processSummary = context.processSummary || {};
   const backgroundSummary = processSummary.background || {};
+  const appServerTransport = processSummary.appServerTransport || emptyAppServerTransportSummary();
   const hookSummary = codexConfig?.hookSummary || {};
   const agentMaxThreads = Number(codexConfig?.agentMaxThreadsEffective ?? 6);
   const agentMaxDepth = Number(codexConfig?.agentMaxDepthEffective ?? 1);
@@ -8200,6 +8337,28 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# For a trusted, scoped speed run only, you can also choose fewer approval prompts:",
         '# approval_policy = "never"',
+      ].join("\n"),
+    });
+  }
+
+  if (appServerTransport.status === "ready" && appServerTransport.tone !== "low") {
+    addFix({
+      id: "app-server-transport",
+      label: "App Server",
+      value: appServerTransport.label,
+      tone: appServerTransport.tone === "high" ? "high" : "medium",
+      action: appServerTransport.action,
+      detail:
+        "Codex app-server powers rich clients and integrations. Keep WebSocket listeners loopback-only or authenticated, and close stale rich clients before blaming database cleanup.",
+      snippet: [
+        "# Read-only app-server transport check:",
+        "ps -axo pid=,command= | grep 'codex app-server' | grep -v grep",
+        "",
+        "# Manual guidance:",
+        "# - Default stdio and unix:// are the normal local transports.",
+        "# - ws://127.0.0.1:PORT is for localhost or SSH-forwarding workflows.",
+        "# - Non-loopback ws:// listeners should use --ws-auth plus token/secret file flags.",
+        "# - Use --listen off when a local transport should not be exposed.",
       ].join("\n"),
     });
   }
@@ -8786,6 +8945,8 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const backgroundCount = Number(backgroundSummary.processCount || 0);
   const backgroundRssBytes = Number(backgroundSummary.rssBytes || 0);
   const backgroundCpuPercent = Number(backgroundSummary.cpuPercent || 0);
+  const appServerTransport = processSummary?.appServerTransport || emptyAppServerTransportSummary();
+  const appServerLoaded = appServerTransport.status === "ready" && appServerTransport.tone !== "low";
 
   const localDetail =
     activeReliefBytes > 0 || logWalBytes > 128 * 1024 ** 2
@@ -9252,6 +9413,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: backgroundDetail,
     },
     {
+      id: "app-server-transport",
+      label: "App Server",
+      value: appServerTransport.label,
+      tone: appServerTransport.tone,
+      action: appServerTransport.action,
+      priority: appServerLoaded ? (appServerTransport.tone === "high" ? 87 : 58) : appServerTransport.appServerCount ? 24 : 10,
+      detail: appServerTransport.detail,
+    },
+    {
       id: "task-clarity",
       label: "Task Clarity",
       value: taskClarity.label,
@@ -9523,6 +9693,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         backgroundSummary.tone === "high"
           ? `Codex has ${backgroundCount.toLocaleString()} background command${backgroundCount === 1 ? "" : "s"} using ${formatBytesServer(backgroundRssBytes)} and about ${backgroundCpuPercent.toFixed(0)}% CPU. Inspect with /ps before stopping anything.`
           : `Codex has ${backgroundCount.toLocaleString()} background command${backgroundCount === 1 ? "" : "s"} still running. Use /ps before judging cleanup results.`,
+    });
+  }
+
+  if (appServerLoaded) {
+    addRecommendation({
+      id: "app-server-transport",
+      label: "App Server",
+      value: appServerTransport.label,
+      action: appServerTransport.action,
+      tone: appServerTransport.tone === "high" ? "high" : "medium",
+      priority: appServerTransport.tone === "high" ? 82 : 55,
+      detail:
+        appServerTransport.nonLoopbackUnauthenticatedCount > 0
+          ? `${appServerTransport.detail} Add WebSocket auth or switch to loopback/unix/stdout before debugging speed.`
+          : appServerTransport.detail,
     });
   }
 
@@ -10615,6 +10800,19 @@ function localScoreBreakdown(metrics) {
       detail: "Codex exec and GitHub Action hygiene for scripted, CI, and machine-readable runs.",
     },
     {
+      id: "app-server-transport",
+      label: "App Server",
+      points: Math.min(
+        5,
+        Number(metrics.appServerNonLoopbackUnauthenticatedCount || 0) * 3 +
+          Number(metrics.appServerUnknownTransportCount || 0) * 2 +
+          Number(metrics.appServerWebsocketCount || 0) * 0.8 +
+          Math.max(0, Number(metrics.appServerTransportCount || 0) - 5) * 0.5,
+      ),
+      value: metrics.appServerTransportLabel || "No app-server",
+      detail: "Live Codex app-server listener transport, WebSocket auth, and extra rich-client process pressure.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -10806,6 +11004,9 @@ function benchmarkLiveScore(metrics) {
   if (metrics.automationDeprecatedFullAutoCount) score -= Math.min(3, Number(metrics.automationDeprecatedFullAutoCount || 0) * 2);
   if (metrics.automationSkipGitRepoCheckCount) score -= Math.min(3, Number(metrics.automationSkipGitRepoCheckCount || 0) * 2);
   score -= Math.min(3, Number(metrics.automationNonEphemeralExecCount || 0) * 0.5);
+  if (metrics.appServerNonLoopbackUnauthenticatedCount) score -= Math.min(5, Number(metrics.appServerNonLoopbackUnauthenticatedCount || 0) * 3);
+  if (metrics.appServerUnknownTransportCount) score -= Math.min(3, Number(metrics.appServerUnknownTransportCount || 0) * 2);
+  score -= Math.min(2, Number(metrics.appServerWebsocketCount || 0) * 0.5);
   if (metrics.historyInvalidConfig) score -= 2;
   if (metrics.historyFileHuge) score -= 4;
   else if (metrics.historyFileLarge) score -= 2;
@@ -10922,6 +11123,15 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Use /ps to inspect ${Number(metrics.backgroundProcessCount).toLocaleString()} Codex background command${metrics.backgroundProcessCount === 1 ? "" : "s"} before using /stop.`,
     );
+  }
+  if (metrics.appServerNonLoopbackUnauthenticatedCount > 0) {
+    guidance.push("Add WebSocket auth or switch app-server back to loopback/unix/stdout; non-loopback unauthenticated app-server listeners are not a good speed baseline.");
+  } else if (metrics.appServerUnknownTransportCount > 0) {
+    guidance.push("Review live codex app-server --listen flags; Refit found an unknown app-server transport.");
+  } else if (metrics.appServerWebsocketCount > 0) {
+    guidance.push("Keep app-server WebSocket listeners loopback-only or authenticated; the manual calls WebSocket transport experimental and unsupported.");
+  } else if (metrics.appServerTransportCount >= 6) {
+    guidance.push("Close stale rich clients or integrations; many live app-server processes can make local Codex load harder to reason about.");
   }
   if (metrics.modelXHighEffort && !metrics.hasFastTaskProfile) {
     guidance.push("Your default reasoning is xhigh/extra-high and no speed profile is recorded. Add a gpt-5.4-mini + low profile for small local tasks.");
@@ -11204,8 +11414,9 @@ function scoreMetricsFromScan(scan) {
   const storagePaths = scan?.codexConfig?.storagePaths || {};
   const telemetry = scan?.codexConfig?.telemetry || buildTelemetrySummary({});
   const automation = scan?.codexConfig?.automation || emptyAutomationSummary();
+  const appServerTransport = scan?.processes?.appServerTransport || emptyAppServerTransportSummary();
   return {
-    scoreModel: "local-state-v19",
+    scoreModel: "local-state-v20",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -11286,6 +11497,17 @@ function scoreMetricsFromScan(scan) {
     automationDangerFullAccessCount: automation.dangerFullAccessCount || 0,
     automationDeprecatedFullAutoCount: automation.deprecatedFullAutoCount || 0,
     automationSkipGitRepoCheckCount: automation.skipGitRepoCheckCount || 0,
+    appServerTransportTone: appServerTransport.tone || "low",
+    appServerTransportLabel: appServerTransport.label || "No app-server",
+    appServerTransportCount: appServerTransport.appServerCount || 0,
+    appServerWebsocketCount: appServerTransport.websocketCount || 0,
+    appServerUnixCount: appServerTransport.unixCount || 0,
+    appServerStdioCount: appServerTransport.stdioCount || 0,
+    appServerNonLoopbackWebsocketCount: appServerTransport.nonLoopbackWebsocketCount || 0,
+    appServerWebsocketAuthCount: appServerTransport.websocketAuthCount || 0,
+    appServerUnauthenticatedWebsocketCount: appServerTransport.unauthenticatedWebsocketCount || 0,
+    appServerNonLoopbackUnauthenticatedCount: appServerTransport.nonLoopbackUnauthenticatedCount || 0,
+    appServerUnknownTransportCount: appServerTransport.unknownTransportCount || 0,
   };
 }
 
@@ -11947,6 +12169,17 @@ function benchmarkDeltas(current, previous) {
     "backgroundProcessCount",
     "backgroundRssBytes",
     "backgroundCpuPercent",
+    "appServerTransportCount",
+    "appServerWebsocketCount",
+    "appServerUnixCount",
+    "appServerStdioCount",
+    "appServerOffCount",
+    "appServerUnknownTransportCount",
+    "appServerLocalWebsocketCount",
+    "appServerNonLoopbackWebsocketCount",
+    "appServerWebsocketAuthCount",
+    "appServerUnauthenticatedWebsocketCount",
+    "appServerNonLoopbackUnauthenticatedCount",
     "modelHighEffort",
     "modelXHighEffort",
     "modelLowEffort",
@@ -12271,6 +12504,19 @@ function summarizeBenchmarkEntry(entry) {
     backgroundProcessCount: entry.metrics.backgroundProcessCount || 0,
     backgroundRssBytes: entry.metrics.backgroundRssBytes || 0,
     backgroundCpuPercent: entry.metrics.backgroundCpuPercent || 0,
+    appServerTransportTone: entry.metrics.appServerTransportTone || "low",
+    appServerTransportLabel: entry.metrics.appServerTransportLabel || "No app-server",
+    appServerTransportCount: entry.metrics.appServerTransportCount || 0,
+    appServerWebsocketCount: entry.metrics.appServerWebsocketCount || 0,
+    appServerUnixCount: entry.metrics.appServerUnixCount || 0,
+    appServerStdioCount: entry.metrics.appServerStdioCount || 0,
+    appServerOffCount: entry.metrics.appServerOffCount || 0,
+    appServerUnknownTransportCount: entry.metrics.appServerUnknownTransportCount || 0,
+    appServerLocalWebsocketCount: entry.metrics.appServerLocalWebsocketCount || 0,
+    appServerNonLoopbackWebsocketCount: entry.metrics.appServerNonLoopbackWebsocketCount || 0,
+    appServerWebsocketAuthCount: entry.metrics.appServerWebsocketAuthCount || 0,
+    appServerUnauthenticatedWebsocketCount: entry.metrics.appServerUnauthenticatedWebsocketCount || 0,
+    appServerNonLoopbackUnauthenticatedCount: entry.metrics.appServerNonLoopbackUnauthenticatedCount || 0,
     modelDefault: entry.metrics.modelDefault || "default",
     modelReasoningEffort: entry.metrics.modelReasoningEffort || "default",
     modelHighEffort: Boolean(entry.metrics.modelHighEffort),
@@ -12625,6 +12871,14 @@ export async function benchmarkHistory(limit = 12) {
         processRssBytes: latest.processRssBytes - oldest.processRssBytes,
         backgroundProcessCount: latest.backgroundProcessCount - oldest.backgroundProcessCount,
         backgroundRssBytes: latest.backgroundRssBytes - oldest.backgroundRssBytes,
+        appServerTransportCount: latest.appServerTransportCount - oldest.appServerTransportCount,
+        appServerWebsocketCount: latest.appServerWebsocketCount - oldest.appServerWebsocketCount,
+        appServerUnknownTransportCount: latest.appServerUnknownTransportCount - oldest.appServerUnknownTransportCount,
+        appServerNonLoopbackWebsocketCount: latest.appServerNonLoopbackWebsocketCount - oldest.appServerNonLoopbackWebsocketCount,
+        appServerWebsocketAuthCount: latest.appServerWebsocketAuthCount - oldest.appServerWebsocketAuthCount,
+        appServerUnauthenticatedWebsocketCount: latest.appServerUnauthenticatedWebsocketCount - oldest.appServerUnauthenticatedWebsocketCount,
+        appServerNonLoopbackUnauthenticatedCount:
+          latest.appServerNonLoopbackUnauthenticatedCount - oldest.appServerNonLoopbackUnauthenticatedCount,
         modelHighEffort: Number(latest.modelHighEffort) - Number(oldest.modelHighEffort),
         modelXHighEffort: Number(latest.modelXHighEffort) - Number(oldest.modelXHighEffort),
         modelLowEffort: Number(latest.modelLowEffort) - Number(oldest.modelLowEffort),
@@ -12801,6 +13055,14 @@ export async function benchmarkHistory(limit = 12) {
         codexWorktreeOverDefaultKeepCount: latest.codexWorktreeOverDefaultKeepCount - previous.codexWorktreeOverDefaultKeepCount,
         processCount: latest.processCount - previous.processCount,
         backgroundProcessCount: latest.backgroundProcessCount - previous.backgroundProcessCount,
+        appServerTransportCount: latest.appServerTransportCount - previous.appServerTransportCount,
+        appServerWebsocketCount: latest.appServerWebsocketCount - previous.appServerWebsocketCount,
+        appServerUnknownTransportCount: latest.appServerUnknownTransportCount - previous.appServerUnknownTransportCount,
+        appServerNonLoopbackWebsocketCount: latest.appServerNonLoopbackWebsocketCount - previous.appServerNonLoopbackWebsocketCount,
+        appServerWebsocketAuthCount: latest.appServerWebsocketAuthCount - previous.appServerWebsocketAuthCount,
+        appServerUnauthenticatedWebsocketCount: latest.appServerUnauthenticatedWebsocketCount - previous.appServerUnauthenticatedWebsocketCount,
+        appServerNonLoopbackUnauthenticatedCount:
+          latest.appServerNonLoopbackUnauthenticatedCount - previous.appServerNonLoopbackUnauthenticatedCount,
         modelHighEffort: Number(latest.modelHighEffort) - Number(previous.modelHighEffort),
         modelXHighEffort: Number(latest.modelXHighEffort) - Number(previous.modelXHighEffort),
         modelLowEffort: Number(latest.modelLowEffort) - Number(previous.modelLowEffort),
@@ -12981,6 +13243,7 @@ export async function runBenchmark() {
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
   const turnTelemetry = scan.categories?.turnTelemetry || emptyTurnTelemetrySummary(scan.categories?.activeSessions || {});
   const cloudHandoff = scan.codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
+  const appServerTransport = scan.processes?.appServerTransport || emptyAppServerTransportSummary();
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
   const modelEffort = scan.codexConfig?.reasoningEffort || "default";
@@ -12993,7 +13256,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v19",
+    scoreModel: "local-state-v20",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -13099,6 +13362,19 @@ export async function runBenchmark() {
     backgroundProcessCount: scan.processes?.background?.processCount || 0,
     backgroundRssBytes: scan.processes?.background?.rssBytes || 0,
     backgroundCpuPercent: scan.processes?.background?.cpuPercent || 0,
+    appServerTransportTone: appServerTransport.tone || "low",
+    appServerTransportLabel: appServerTransport.label || "No app-server",
+    appServerTransportCount: appServerTransport.appServerCount || 0,
+    appServerWebsocketCount: appServerTransport.websocketCount || 0,
+    appServerUnixCount: appServerTransport.unixCount || 0,
+    appServerStdioCount: appServerTransport.stdioCount || 0,
+    appServerOffCount: appServerTransport.offCount || 0,
+    appServerUnknownTransportCount: appServerTransport.unknownTransportCount || 0,
+    appServerLocalWebsocketCount: appServerTransport.localWebsocketCount || 0,
+    appServerNonLoopbackWebsocketCount: appServerTransport.nonLoopbackWebsocketCount || 0,
+    appServerWebsocketAuthCount: appServerTransport.websocketAuthCount || 0,
+    appServerUnauthenticatedWebsocketCount: appServerTransport.unauthenticatedWebsocketCount || 0,
+    appServerNonLoopbackUnauthenticatedCount: appServerTransport.nonLoopbackUnauthenticatedCount || 0,
     modelDefault: modelName,
     modelReasoningEffort: modelEffort,
     modelHighEffort,
