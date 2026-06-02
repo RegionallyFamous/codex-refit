@@ -5296,7 +5296,8 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const logBytes = context.logBytes || 0;
   const logWalBytes = context.logWalBytes || 0;
   const staleProjectPaths = codexConfig?.staleTrustedProjectPaths || [];
-  const highEffort = ["high", "xhigh", "extra-high", "extra_high"].includes(String(codexConfig?.reasoningEffort || "").toLowerCase());
+  const defaultReasoningEffort = normalizedEffort(codexConfig?.reasoningEffort);
+  const highEffort = ["high", "xhigh", "extra-high"].includes(defaultReasoningEffort);
   const hasGuidance = Boolean(codexConfig?.globalAgentsExists);
   const emptyGuidance = Boolean(codexConfig?.globalAgentsFileExists && !codexConfig?.globalAgentsExists);
   const fastMode = Boolean(codexConfig?.fastMode);
@@ -6044,11 +6045,17 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
   const displayTier = codexConfig?.serviceTier || desktopTier || "standard";
-  const isHighEffort = ["high", "xhigh", "extra-high", "extra_high"].includes(String(effort).toLowerCase());
+  const effortText = normalizedEffort(effort);
+  const isHighEffort = ["high", "xhigh", "extra-high"].includes(effortText);
+  const isXHighEffort = ["xhigh", "extra-high"].includes(effortText);
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const fastTaskProfileNames = codexConfig?.fastTaskProfileNames || [];
+  const fastTaskProfileCount = fastTaskProfileNames.length;
   const hasSparkProfile = Boolean(codexConfig?.hasSparkProfile);
   const hasMiniProfile = Boolean(codexConfig?.hasMiniProfile);
+  const normalizedModel = String(model || "").toLowerCase();
+  const modelIsMini = normalizedModel.includes("mini");
+  const modelIsSpark = normalizedModel.includes("spark");
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject || null;
   const existingProjectCount = Number(projectReadiness.existingCount || 0);
@@ -6374,6 +6381,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: hookDetail,
     },
     {
+      id: "model-task-fit",
+      label: "Model Fit",
+      value: effort === "Not set" ? model : `${model} / ${effort}`,
+      tone: isHighEffort && !hasFastTaskProfile ? "medium" : "low",
+      action: isHighEffort && !hasFastTaskProfile ? "Add speed profile" : modelIsMini || modelIsSpark ? "Quick default" : "Match task size",
+      priority: isHighEffort && !hasFastTaskProfile ? 79 : isHighEffort ? 50 : 25,
+      detail: isHighEffort
+        ? `This default is good for deep work, but high reasoning makes light tasks slower. ${
+            fastTaskProfileCount
+              ? `Fast profile${fastTaskProfileCount === 1 ? "" : "s"} found: ${fastTaskProfileNames.slice(0, 3).join(", ")}.`
+              : "Create a gpt-5.4-mini/low profile for quick local work."
+          }`
+        : "Reasoning effort is not set high. Keep using gpt-5.5 for complex work, and mini or Spark profiles for quick iteration when available.",
+    },
+    {
       id: "fast-default",
       label: "Fast Default",
       value: fastMode ? "Fast" : fastModeFeature ? displayTier : "Feature off",
@@ -6688,9 +6710,11 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       label: "Small Tasks",
       value: effort,
       action: "Mini or lower effort",
-      tone: "medium",
-      priority: 82,
-      detail: "For quick, well-scoped work, use lower reasoning or gpt-5.4-mini. Keep gpt-5.5 with high/xhigh for hard debugging and long agentic tasks.",
+      tone: isXHighEffort && !hasFastTaskProfile ? "high" : "medium",
+      priority: isXHighEffort && !hasFastTaskProfile ? 88 : 82,
+      detail: hasFastTaskProfile
+        ? "For quick, well-scoped work, use your speed profile, lower reasoning, or gpt-5.4-mini. Keep gpt-5.5 with high/xhigh for hard debugging and long agentic tasks."
+        : "For quick, well-scoped work, create a speed profile with lower reasoning or gpt-5.4-mini. Keep gpt-5.5 with high/xhigh for hard debugging and long agentic tasks.",
     });
   }
 
@@ -7592,6 +7616,9 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(12, Math.max(0, Number(metrics.backgroundProcessCount || 0)) * 2);
   score -= Math.min(10, Math.max(0, Number(metrics.backgroundCpuPercent || 0)) * 0.18);
   score -= Math.min(8, ((Number(metrics.backgroundRssBytes || 0) / 1024 ** 3) || 0) * 2);
+  if (metrics.modelXHighEffort) score -= metrics.hasFastTaskProfile ? 3 : 6;
+  else if (metrics.modelHighEffort) score -= metrics.hasFastTaskProfile ? 2 : 4;
+  if (metrics.modelDeepDefault && !metrics.hasFastTaskProfile) score -= 2;
   score -= Math.min(8, Math.max(0, Number(metrics.agentMaxDepth || 1) - 1) * 4);
   score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
   score -= Math.min(8, Number(metrics.customAgentInvalidCount || 0) * 4);
@@ -7691,6 +7718,13 @@ function benchmarkGuidance(metrics) {
     guidance.push(
       `Use /ps to inspect ${Number(metrics.backgroundProcessCount).toLocaleString()} Codex background command${metrics.backgroundProcessCount === 1 ? "" : "s"} before using /stop.`,
     );
+  }
+  if (metrics.modelXHighEffort && !metrics.hasFastTaskProfile) {
+    guidance.push("Your default reasoning is xhigh/extra-high and no speed profile is recorded. Add a gpt-5.4-mini + low profile for small local tasks.");
+  } else if (metrics.modelHighEffort && !metrics.hasFastTaskProfile) {
+    guidance.push("Your default reasoning is high. Keep it for deep work, but add a mini/low speed profile for quick scoped runs.");
+  } else if (metrics.modelHighEffort) {
+    guidance.push("Use your speed profile for quick tasks so high-reasoning defaults stay reserved for deep work.");
   }
   if (metrics.agentMaxDepth > 1) {
     guidance.push(
@@ -7875,7 +7909,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v6",
+    scoreModel: "local-state-v7",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -8482,6 +8516,18 @@ function benchmarkDeltas(current, previous) {
     "backgroundProcessCount",
     "backgroundRssBytes",
     "backgroundCpuPercent",
+    "modelHighEffort",
+    "modelXHighEffort",
+    "modelLowEffort",
+    "modelMini",
+    "modelSpark",
+    "modelDeepDefault",
+    "fastModeEnabled",
+    "hasFastTaskProfile",
+    "fastTaskProfileCount",
+    "hasMiniProfile",
+    "hasSparkProfile",
+    "hasDeepWorkProfile",
     "agentMaxThreads",
     "agentMaxDepth",
     "customAgentCount",
@@ -8578,6 +8624,21 @@ function summarizeBenchmarkEntry(entry) {
     backgroundProcessCount: entry.metrics.backgroundProcessCount || 0,
     backgroundRssBytes: entry.metrics.backgroundRssBytes || 0,
     backgroundCpuPercent: entry.metrics.backgroundCpuPercent || 0,
+    modelDefault: entry.metrics.modelDefault || "default",
+    modelReasoningEffort: entry.metrics.modelReasoningEffort || "default",
+    modelHighEffort: Boolean(entry.metrics.modelHighEffort),
+    modelXHighEffort: Boolean(entry.metrics.modelXHighEffort),
+    modelLowEffort: Boolean(entry.metrics.modelLowEffort),
+    modelMini: Boolean(entry.metrics.modelMini),
+    modelSpark: Boolean(entry.metrics.modelSpark),
+    modelDeepDefault: Boolean(entry.metrics.modelDeepDefault),
+    fastModeEnabled: Boolean(entry.metrics.fastModeEnabled),
+    fastModeFeature: entry.metrics.fastModeFeature !== false,
+    hasFastTaskProfile: Boolean(entry.metrics.hasFastTaskProfile),
+    fastTaskProfileCount: entry.metrics.fastTaskProfileCount || 0,
+    hasMiniProfile: Boolean(entry.metrics.hasMiniProfile),
+    hasSparkProfile: Boolean(entry.metrics.hasSparkProfile),
+    hasDeepWorkProfile: Boolean(entry.metrics.hasDeepWorkProfile),
     agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
     agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
     customAgentCount: entry.metrics.customAgentCount || 0,
@@ -8755,6 +8816,18 @@ export async function benchmarkHistory(limit = 12) {
         processRssBytes: latest.processRssBytes - oldest.processRssBytes,
         backgroundProcessCount: latest.backgroundProcessCount - oldest.backgroundProcessCount,
         backgroundRssBytes: latest.backgroundRssBytes - oldest.backgroundRssBytes,
+        modelHighEffort: Number(latest.modelHighEffort) - Number(oldest.modelHighEffort),
+        modelXHighEffort: Number(latest.modelXHighEffort) - Number(oldest.modelXHighEffort),
+        modelLowEffort: Number(latest.modelLowEffort) - Number(oldest.modelLowEffort),
+        modelMini: Number(latest.modelMini) - Number(oldest.modelMini),
+        modelSpark: Number(latest.modelSpark) - Number(oldest.modelSpark),
+        modelDeepDefault: Number(latest.modelDeepDefault) - Number(oldest.modelDeepDefault),
+        fastModeEnabled: Number(latest.fastModeEnabled) - Number(oldest.fastModeEnabled),
+        hasFastTaskProfile: Number(latest.hasFastTaskProfile) - Number(oldest.hasFastTaskProfile),
+        fastTaskProfileCount: latest.fastTaskProfileCount - oldest.fastTaskProfileCount,
+        hasMiniProfile: Number(latest.hasMiniProfile) - Number(oldest.hasMiniProfile),
+        hasSparkProfile: Number(latest.hasSparkProfile) - Number(oldest.hasSparkProfile),
+        hasDeepWorkProfile: Number(latest.hasDeepWorkProfile) - Number(oldest.hasDeepWorkProfile),
         mcpEnabledCount: latest.mcpEnabledCount - oldest.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - oldest.mcpRequiredCount,
         mcpMissingEnvVarCount: latest.mcpMissingEnvVarCount - oldest.mcpMissingEnvVarCount,
@@ -8809,6 +8882,18 @@ export async function benchmarkHistory(limit = 12) {
         logQueryMs: latest.logQueryMs - previous.logQueryMs,
         processCount: latest.processCount - previous.processCount,
         backgroundProcessCount: latest.backgroundProcessCount - previous.backgroundProcessCount,
+        modelHighEffort: Number(latest.modelHighEffort) - Number(previous.modelHighEffort),
+        modelXHighEffort: Number(latest.modelXHighEffort) - Number(previous.modelXHighEffort),
+        modelLowEffort: Number(latest.modelLowEffort) - Number(previous.modelLowEffort),
+        modelMini: Number(latest.modelMini) - Number(previous.modelMini),
+        modelSpark: Number(latest.modelSpark) - Number(previous.modelSpark),
+        modelDeepDefault: Number(latest.modelDeepDefault) - Number(previous.modelDeepDefault),
+        fastModeEnabled: Number(latest.fastModeEnabled) - Number(previous.fastModeEnabled),
+        hasFastTaskProfile: Number(latest.hasFastTaskProfile) - Number(previous.hasFastTaskProfile),
+        fastTaskProfileCount: latest.fastTaskProfileCount - previous.fastTaskProfileCount,
+        hasMiniProfile: Number(latest.hasMiniProfile) - Number(previous.hasMiniProfile),
+        hasSparkProfile: Number(latest.hasSparkProfile) - Number(previous.hasSparkProfile),
+        hasDeepWorkProfile: Number(latest.hasDeepWorkProfile) - Number(previous.hasDeepWorkProfile),
         mcpEnabledCount: latest.mcpEnabledCount - previous.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
         customAgentCount: latest.customAgentCount - previous.customAgentCount,
@@ -8897,9 +8982,19 @@ export async function runBenchmark() {
   const localEnvironment = currentProject?.localEnvironment || emptyLocalEnvironmentSummary({ hasCodexDir: Boolean(currentProject?.hasCodexDir) });
   const webSearchEffectiveMode = scan.codexConfig?.webSearchEffectiveMode || scan.codexConfig?.webSearchMode || "cached";
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
+  const modelName = scan.codexConfig?.model || "default";
+  const modelNameText = String(modelName || "").toLowerCase();
+  const modelEffort = scan.codexConfig?.reasoningEffort || "default";
+  const modelEffortText = normalizedEffort(modelEffort);
+  const modelHighEffort = ["high", "xhigh", "extra-high"].includes(modelEffortText);
+  const modelXHighEffort = ["xhigh", "extra-high"].includes(modelEffortText);
+  const modelLowEffort = ["low", "minimal", "none"].includes(modelEffortText);
+  const modelMini = modelNameText.includes("mini");
+  const modelSpark = modelNameText.includes("spark");
+  const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v6",
+    scoreModel: "local-state-v7",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -8925,6 +9020,21 @@ export async function runBenchmark() {
     backgroundProcessCount: scan.processes?.background?.processCount || 0,
     backgroundRssBytes: scan.processes?.background?.rssBytes || 0,
     backgroundCpuPercent: scan.processes?.background?.cpuPercent || 0,
+    modelDefault: modelName,
+    modelReasoningEffort: modelEffort,
+    modelHighEffort,
+    modelXHighEffort,
+    modelLowEffort,
+    modelMini,
+    modelSpark,
+    modelDeepDefault: modelNameText === "gpt-5.5" && modelHighEffort,
+    fastModeEnabled: Boolean(scan.codexConfig?.fastMode),
+    fastModeFeature: scan.codexConfig?.fastModeFeature !== false,
+    hasFastTaskProfile: Boolean(scan.codexConfig?.hasFastTaskProfile),
+    fastTaskProfileCount,
+    hasMiniProfile: Boolean(scan.codexConfig?.hasMiniProfile),
+    hasSparkProfile: Boolean(scan.codexConfig?.hasSparkProfile),
+    hasDeepWorkProfile: Boolean(scan.codexConfig?.hasDeepWorkProfile),
     agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
     agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
     customAgentCount: scan.codexConfig?.customAgents?.agentCount || 0,
