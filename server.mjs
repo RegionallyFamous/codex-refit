@@ -4934,11 +4934,9 @@ function countMatches(text, pattern) {
   return matches ? matches.length : 0;
 }
 
-async function scanSessionMediaMarkers(file) {
-  const stats = await statOrNull(file.path);
+async function sampleTextFile(filePath, { maxHeadBytes = 6 * 1024 * 1024, maxTailBytes = 2 * 1024 * 1024 } = {}) {
+  const stats = await statOrNull(filePath);
   if (!stats?.isFile()) return null;
-  const maxHeadBytes = 6 * 1024 * 1024;
-  const maxTailBytes = 2 * 1024 * 1024;
   const headBytes = Math.min(stats.size, maxHeadBytes);
   const tailBytes = stats.size > headBytes ? Math.min(stats.size - headBytes, maxTailBytes) : 0;
   let sampledBytes = 0;
@@ -4946,7 +4944,7 @@ async function scanSessionMediaMarkers(file) {
   let handle = null;
 
   try {
-    handle = await fs.open(file.path, "r");
+    handle = await fs.open(filePath, "r");
     if (headBytes > 0) {
       const buffer = Buffer.alloc(headBytes);
       const { bytesRead } = await handle.read(buffer, 0, headBytes, 0);
@@ -4964,6 +4962,19 @@ async function scanSessionMediaMarkers(file) {
   } finally {
     if (handle) await handle.close().catch(() => {});
   }
+
+  return {
+    stats,
+    sample,
+    sampledBytes,
+    capped: sampledBytes < stats.size,
+  };
+}
+
+async function scanSessionMediaMarkers(file) {
+  const sampled = await sampleTextFile(file.path);
+  if (!sampled) return null;
+  const { stats, sample, sampledBytes, capped } = sampled;
 
   const appshotMarkers = countMatches(sample, /\bappshots?\b|\bapp_shot\b|frontmost app/gi);
   const imageMarkers = countMatches(
@@ -4992,8 +5003,248 @@ async function scanSessionMediaMarkers(file) {
     dataUrlMarkers,
     markerKinds,
     sampledBytes,
-    capped: sampledBytes < stats.size,
+    capped,
   };
+}
+
+function emptyTaskClaritySummary(activeSessions = {}) {
+  return {
+    label: "Task Clarity",
+    path: paths.sessions,
+    exists: Boolean(activeSessions.exists),
+    bytes: 0,
+    fileCount: 0,
+    scannedFileCount: 0,
+    sampledBytes: 0,
+    userTurnCount: 0,
+    assistantTurnCount: 0,
+    toolCallCount: 0,
+    toolOutputCount: 0,
+    compactMarkerCount: 0,
+    goalMarkerCount: 0,
+    contextMarkerCount: 0,
+    constraintMarkerCount: 0,
+    doneMarkerCount: 0,
+    verificationMarkerCount: 0,
+    structuredPromptFileCount: 0,
+    missingDoneMarkerFileCount: 0,
+    missingVerificationMarkerFileCount: 0,
+    highChurnFileCount: 0,
+    cappedFileCount: 0,
+    unparsedFileCount: 0,
+    largest: [],
+    risk: "scan",
+    tone: "low",
+    action: "Keep scoped",
+    detail:
+      "Largest active threads show enough goal, context, constraint, done-when, or verification markers for a quick local read.",
+    hotspots: ["Prompt structure looks scoped in the largest active transcript samples."],
+  };
+}
+
+function payloadText(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  if (typeof payload.text === "string") return payload.text;
+  if (typeof payload.message === "string") return payload.message;
+  if (typeof payload.input === "string") return payload.input;
+  if (typeof payload.output === "string") return payload.output;
+  if (typeof payload.summary === "string") return payload.summary;
+  if (!Array.isArray(payload.content)) return "";
+  return payload.content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.input_text === "string") return part.input_text;
+      if (typeof part.output_text === "string") return part.output_text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function taskMarkerCounts(text) {
+  return {
+    goal: countMatches(text, /\b(goal|objective|trying to|i want|we need|need to|make|build|fix|debug|implement|create)\b/gi),
+    context: countMatches(text, /\b(context|file|folder|repo|repository|screenshot|error|stack trace|log|current behavior|existing|see attached)\b/gi),
+    constraint: countMatches(text, /\b(constraint|must|do not|don't|avoid|only|never|keep|preserve|without|requirement|safe|guard|scope)\b/gi),
+    done: countMatches(text, /\b(done when|success criteria|acceptance criteria|complete when|finish when|ready when|definition of done)\b/gi),
+    verification: countMatches(text, /\b(verify|verification|test|tests pass|build passes|lint|typecheck|benchmark|proof|reproduce|regression|screenshot)\b/gi),
+  };
+}
+
+async function scanTaskClarityMarkers(file) {
+  const sampled = await sampleTextFile(file.path, { maxHeadBytes: 4 * 1024 * 1024, maxTailBytes: 2 * 1024 * 1024 });
+  if (!sampled) return null;
+  const { stats, sample, sampledBytes, capped } = sampled;
+  const result = {
+    name: path.basename(file.path),
+    path: file.path,
+    bytes: stats.size,
+    mtime: stats.mtime.toISOString(),
+    bucket: "Task Clarity",
+    sampledBytes,
+    capped,
+    parsedLineCount: 0,
+    userTurnCount: 0,
+    assistantTurnCount: 0,
+    toolCallCount: 0,
+    toolOutputCount: 0,
+    compactMarkerCount: 0,
+    goalMarkerCount: 0,
+    contextMarkerCount: 0,
+    constraintMarkerCount: 0,
+    doneMarkerCount: 0,
+    verificationMarkerCount: 0,
+    structuredPrompt: false,
+    missingDoneMarker: false,
+    missingVerificationMarker: false,
+    highChurn: false,
+  };
+
+  for (const line of sample.split("\n")) {
+    if (!line.trim()) continue;
+    let record = null;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    result.parsedLineCount += 1;
+    const payload = record?.payload && typeof record.payload === "object" ? record.payload : record;
+    const payloadType = payload?.type || record?.type || "";
+    const role = payload?.role || "";
+
+    if (payloadType === "compact" || payloadType === "agent_reasoning_compacted" || /compact/i.test(String(payloadType))) {
+      result.compactMarkerCount += 1;
+    }
+    if (payloadType === "function_call" || payload.name || payload.call_id && payload.arguments !== undefined) {
+      result.toolCallCount += 1;
+    }
+    if (payloadType === "function_call_output" || payload.output !== undefined && payload.call_id) {
+      result.toolOutputCount += 1;
+    }
+
+    if (payloadType === "message" && role === "assistant") result.assistantTurnCount += 1;
+    if (payloadType === "message" && role === "user") {
+      result.userTurnCount += 1;
+      const markers = taskMarkerCounts(payloadText(payload));
+      result.goalMarkerCount += markers.goal;
+      result.contextMarkerCount += markers.context;
+      result.constraintMarkerCount += markers.constraint;
+      result.doneMarkerCount += markers.done;
+      result.verificationMarkerCount += markers.verification;
+    }
+  }
+
+  result.structuredPrompt =
+    result.goalMarkerCount > 0 &&
+    result.contextMarkerCount > 0 &&
+    result.constraintMarkerCount > 0 &&
+    (result.doneMarkerCount > 0 || result.verificationMarkerCount > 0);
+  result.missingDoneMarker = result.userTurnCount > 0 && result.doneMarkerCount === 0;
+  result.missingVerificationMarker = result.userTurnCount > 0 && result.verificationMarkerCount === 0;
+  result.highChurn =
+    result.userTurnCount >= 12 ||
+    result.toolCallCount >= 80 ||
+    result.bytes >= 250 * 1024 * 1024 ||
+    result.compactMarkerCount >= 2;
+  return result;
+}
+
+async function summarizeTaskClarity(activeSessions = {}) {
+  const summary = emptyTaskClaritySummary(activeSessions);
+  if (!activeSessions.exists) return summary;
+  const candidates = (activeSessions.largest || [])
+    .filter((file) => file?.path && /\.(jsonl?|txt|md)$/i.test(file.path))
+    .slice(0, 10);
+  if (!candidates.length) {
+    summary.exists = true;
+    summary.detail = "No readable transcript candidates were found among the largest active session files.";
+    summary.hotspots = [summary.detail];
+    return summary;
+  }
+
+  const scanned = [];
+  for (const file of candidates) {
+    const result = await scanTaskClarityMarkers(file);
+    if (result) scanned.push(result);
+  }
+
+  summary.exists = true;
+  summary.scannedFileCount = candidates.length;
+  summary.largest = scanned.sort((a, b) => b.bytes - a.bytes).slice(0, 8);
+  summary.fileCount = summary.largest.length;
+  summary.bytes = summary.largest.reduce((total, file) => total + file.bytes, 0);
+  summary.sampledBytes = summary.largest.reduce((total, file) => total + file.sampledBytes, 0);
+  summary.userTurnCount = summary.largest.reduce((total, file) => total + file.userTurnCount, 0);
+  summary.assistantTurnCount = summary.largest.reduce((total, file) => total + file.assistantTurnCount, 0);
+  summary.toolCallCount = summary.largest.reduce((total, file) => total + file.toolCallCount, 0);
+  summary.toolOutputCount = summary.largest.reduce((total, file) => total + file.toolOutputCount, 0);
+  summary.compactMarkerCount = summary.largest.reduce((total, file) => total + file.compactMarkerCount, 0);
+  summary.goalMarkerCount = summary.largest.reduce((total, file) => total + file.goalMarkerCount, 0);
+  summary.contextMarkerCount = summary.largest.reduce((total, file) => total + file.contextMarkerCount, 0);
+  summary.constraintMarkerCount = summary.largest.reduce((total, file) => total + file.constraintMarkerCount, 0);
+  summary.doneMarkerCount = summary.largest.reduce((total, file) => total + file.doneMarkerCount, 0);
+  summary.verificationMarkerCount = summary.largest.reduce((total, file) => total + file.verificationMarkerCount, 0);
+  summary.structuredPromptFileCount = summary.largest.filter((file) => file.structuredPrompt).length;
+  summary.missingDoneMarkerFileCount = summary.largest.filter((file) => file.missingDoneMarker).length;
+  summary.missingVerificationMarkerFileCount = summary.largest.filter((file) => file.missingVerificationMarker).length;
+  summary.highChurnFileCount = summary.largest.filter((file) => file.highChurn).length;
+  summary.cappedFileCount = summary.largest.filter((file) => file.capped).length;
+  summary.unparsedFileCount = summary.largest.filter((file) => file.parsedLineCount === 0).length;
+  summary.label = summary.fileCount ? `${summary.userTurnCount.toLocaleString()} turns` : "No sample";
+  summary.tone =
+    summary.highChurnFileCount >= 4 ||
+    summary.missingVerificationMarkerFileCount >= 6 ||
+    summary.unparsedFileCount >= 3
+      ? "high"
+      : summary.highChurnFileCount >= 1 ||
+          summary.missingDoneMarkerFileCount >= 3 ||
+          summary.missingVerificationMarkerFileCount >= 3 ||
+          summary.userTurnCount >= 30
+        ? "medium"
+        : "low";
+  summary.risk = summary.tone === "high" ? "warn" : "scan";
+  summary.action =
+    summary.tone === "high"
+      ? "Split or compact"
+      : summary.tone === "medium"
+        ? "Tighten next prompt"
+        : summary.structuredPromptFileCount
+          ? "Keep structured"
+          : "Keep scoped";
+  summary.detail =
+    summary.fileCount === 0
+      ? "Refit could not parse task-shape metadata from the largest active transcript samples."
+      : [
+          `Refit sampled ${summary.fileCount.toLocaleString()} large active transcript${summary.fileCount === 1 ? "" : "s"} and counted ${summary.userTurnCount.toLocaleString()} user turn${summary.userTurnCount === 1 ? "" : "s"}, ${summary.toolCallCount.toLocaleString()} tool call${summary.toolCallCount === 1 ? "" : "s"}, and ${summary.compactMarkerCount.toLocaleString()} compact marker${summary.compactMarkerCount === 1 ? "" : "s"}.`,
+          summary.structuredPromptFileCount
+            ? `${summary.structuredPromptFileCount.toLocaleString()} sampled thread${summary.structuredPromptFileCount === 1 ? " has" : "s have"} goal, context, constraints, and done/verification markers.`
+            : "No sampled thread showed the full goal/context/constraints/done-when shape from the Codex best-practices guide.",
+          summary.highChurnFileCount
+            ? `${summary.highChurnFileCount.toLocaleString()} sampled thread${summary.highChurnFileCount === 1 ? " looks" : "s look"} broad enough to benefit from /compact, a fresh thread, or a clearer completion target.`
+            : null,
+          summary.missingVerificationMarkerFileCount
+            ? `${summary.missingVerificationMarkerFileCount.toLocaleString()} sampled thread${summary.missingVerificationMarkerFileCount === 1 ? " lacks" : "s lack"} an obvious verification marker.`
+            : null,
+          summary.cappedFileCount
+            ? `${summary.cappedFileCount.toLocaleString()} very large file${summary.cappedFileCount === 1 ? " was" : "s were"} sampled at the head and tail only.`
+            : null,
+          "Refit reports task-shape counts only, never prompt text.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+  summary.hotspots = [
+    `${summary.userTurnCount.toLocaleString()} sampled user turn${summary.userTurnCount === 1 ? "" : "s"}.`,
+    `${summary.toolCallCount.toLocaleString()} sampled tool call${summary.toolCallCount === 1 ? "" : "s"}.`,
+    summary.highChurnFileCount
+      ? `${summary.highChurnFileCount.toLocaleString()} high-churn active thread${summary.highChurnFileCount === 1 ? "" : "s"}; compact or split finished work.`
+      : "No high-churn task-shape sample detected.",
+    summary.missingDoneMarkerFileCount
+      ? `${summary.missingDoneMarkerFileCount.toLocaleString()} sampled thread${summary.missingDoneMarkerFileCount === 1 ? "" : "s"} without done-when markers.`
+      : "Done/verification markers are visible in the sampled active work.",
+  ].filter(Boolean);
+  return summary;
 }
 
 async function summarizeSessionMediaPressure(activeSessions = {}) {
@@ -5953,6 +6204,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const logBytes = context.logBytes || 0;
   const logWalBytes = context.logWalBytes || 0;
   const sessionMedia = scan?.categories?.sessionMedia || emptySessionMediaSummary(scan?.categories?.activeSessions || {});
+  const taskClarity = scan?.categories?.taskClarity || emptyTaskClaritySummary(scan?.categories?.activeSessions || {});
   const worktrees = scan?.categories?.codexWorktrees || emptyWorktreeSummary();
   const staleProjectPaths = codexConfig?.staleTrustedProjectPaths || [];
   const defaultReasoningEffort = normalizedEffort(codexConfig?.reasoningEffort);
@@ -6033,6 +6285,29 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "# - Archive finished threads that used Appshots or image attachments.",
         "# - Start a fresh thread after the image context has served its purpose.",
         "# - Use /compact on long active threads before they become transcript-heavy.",
+      ].join("\n"),
+    });
+  }
+
+  if (taskClarity.exists && taskClarity.tone !== "low") {
+    addFix({
+      id: "task-clarity",
+      label: "Task Clarity",
+      value: taskClarity.label || `${taskClarity.userTurnCount.toLocaleString()} turns`,
+      tone: taskClarity.tone === "high" ? "high" : "medium",
+      action: taskClarity.action,
+      detail:
+        "The Codex best-practices guide recommends goal, context, constraints, and done-when checks. Refit reports marker counts only, never prompt text.",
+      snippet: [
+        "# Use this shape for the next fresh or compacted Codex prompt:",
+        "Goal: <the one outcome Codex should optimize for>",
+        "Context: <files, errors, screenshots, or constraints that matter>",
+        "Constraints: <what to preserve, avoid, or keep scoped>",
+        "Done when: <tests, benchmark, visual check, or exact behavior that proves completion>",
+        "",
+        "# For active long threads:",
+        "/compact",
+        "# Then continue with the four-line shape above or start a fresh thread for the next focused task.",
       ].join("\n"),
     });
   }
@@ -6806,6 +7081,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const logWalBytes = scan.logs?.walBytes || 0;
   const generatedImageBytes = categories.generatedImages?.bytes || 0;
   const sessionMedia = categories.sessionMedia || emptySessionMediaSummary(categories.activeSessions || {});
+  const taskClarity = categories.taskClarity || emptyTaskClaritySummary(categories.activeSessions || {});
   const worktrees = categories.codexWorktrees || emptyWorktreeSummary();
   const staleThreads = Number(scan.state?.threads?.activeStale ?? scan.state?.threads?.activeOlder7d ?? 0);
   const model = codexConfig?.model || "Not set";
@@ -7334,6 +7610,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: backgroundDetail,
     },
     {
+      id: "task-clarity",
+      label: "Task Clarity",
+      value: taskClarity.label,
+      tone: taskClarity.tone,
+      action: taskClarity.action,
+      priority: taskClarity.tone === "high" ? 90 : taskClarity.tone === "medium" ? 72 : 21,
+      detail: taskClarity.detail,
+    },
+    {
       id: "agent-fanout",
       label: "Agent Fan-out",
       value: `${agentMaxThreads.toLocaleString()} / depth ${agentMaxDepth.toLocaleString()}`,
@@ -7501,6 +7786,18 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
         processSummary.tone === "high"
           ? `Codex currently has ${processCount.toLocaleString()} live processes using ${formatBytesServer(processRssBytes)}. Finish/archive idle threads and restart Codex after active work before judging deeper cleanup.`
           : `Codex currently has ${processCount.toLocaleString()} live processes using ${formatBytesServer(processRssBytes)}. Close idle threads or extra terminals if the app feels slow.`,
+    });
+  }
+
+  if (taskClarity.exists && taskClarity.tone !== "low") {
+    addRecommendation({
+      id: "task-clarity",
+      label: "Task Clarity",
+      value: taskClarity.label,
+      action: taskClarity.action,
+      tone: taskClarity.tone === "high" ? "high" : "medium",
+      priority: taskClarity.tone === "high" ? 88 : 67,
+      detail: taskClarity.detail,
     });
   }
 
@@ -8093,6 +8390,14 @@ function addHotspots(scan) {
           ? `${formatBytesServer(categories.sessionMedia.bytes)} tied to appshot/image markers.`
           : "No appshot or image-attachment markers found in the largest active transcripts.",
       ];
+  categories.taskClarity.hotspots = categories.taskClarity.hotspots?.length
+    ? categories.taskClarity.hotspots
+    : [
+        `${categories.taskClarity.userTurnCount.toLocaleString()} sampled user turn${categories.taskClarity.userTurnCount === 1 ? "" : "s"}`,
+        categories.taskClarity.highChurnFileCount
+          ? `${categories.taskClarity.highChurnFileCount.toLocaleString()} high-churn active thread${categories.taskClarity.highChurnFileCount === 1 ? "" : "s"}`
+          : "Prompt/thread shape looks scoped in the sampled files.",
+      ];
   categories.activeStaleSessions.hotspots = [
     `${categories.activeStaleSessions.fileCount.toLocaleString()} active transcript${categories.activeStaleSessions.fileCount === 1 ? "" : "s"} older than ${categories.activeStaleSessions.days} days`,
     `${categories.activeStaleSessions.oversized50mb.toLocaleString()} stale file${categories.activeStaleSessions.oversized50mb === 1 ? "" : "s"} over 50 MB`,
@@ -8277,6 +8582,7 @@ export async function scanCodex(options = {}) {
   const archiveOptions = { ...options, days: archiveChoice.days };
   const [
     sessionMedia,
+    taskClarity,
     archivedSessions,
     maintenanceArchive,
     generatedImages,
@@ -8297,6 +8603,7 @@ export async function scanCodex(options = {}) {
     processSummary,
   ] = await Promise.all([
     summarizeSessionMediaPressure(activeSessions),
+    summarizeTaskClarity(activeSessions),
     summarizeDirectory(paths.archivedSessions, { label: "Archived Sessions", risk: "warn", largestLimit: 12 }),
     summarizeDirectory(paths.maintenanceArchive, {
       label: "Old Refit Backups",
@@ -8377,6 +8684,7 @@ export async function scanCodex(options = {}) {
     },
     activeSessions,
     sessionMedia,
+    taskClarity,
     activeStaleSessions: activeStale,
     archivedSessions,
     archivedSessionsInActiveTree: archivedStillInSessions,
@@ -8394,6 +8702,7 @@ export async function scanCodex(options = {}) {
   const largestSessionCandidates = [
     ...activeStale.largest.map((file) => ({ ...file, bucket: "Stale active sessions" })),
     ...archivedDeleteCandidates.largest.map((file) => ({ ...file, bucket: "Old archived conversations" })),
+    ...taskClarity.largest.map((file) => ({ ...file, bucket: "Task clarity" })),
     ...sessionMedia.largest.map((file) => ({ ...file, bucket: "Session media" })),
     ...activeSessions.largest.map((file) => ({ ...file, bucket: "Active sessions" })),
     ...archivedSessions.largest.map((file) => ({ ...file, bucket: "Archived sessions" })),
@@ -8463,6 +8772,19 @@ function localScoreBreakdown(metrics) {
       ),
       value: `${Number(metrics.sessionMediaFileCount || 0).toLocaleString()} file${metrics.sessionMediaFileCount === 1 ? "" : "s"}`,
       detail: "Largest active transcripts carrying appshot or image-attachment markers.",
+    },
+    {
+      id: "task-clarity",
+      label: "Task Clarity",
+      points: Math.min(
+        8,
+        Number(metrics.taskClarityHighChurnFileCount || 0) * 1.4 +
+          Number(metrics.taskClarityMissingDoneMarkerFileCount || 0) * 0.45 +
+          Number(metrics.taskClarityMissingVerificationMarkerFileCount || 0) * 0.55 +
+          Number(metrics.taskClarityUnparsedFileCount || 0) * 0.35,
+      ),
+      value: `${Number(metrics.taskClarityUserTurnCount || 0).toLocaleString()} turn${metrics.taskClarityUserTurnCount === 1 ? "" : "s"}`,
+      detail: "Sampled active-thread shape: goal, context, constraints, done-when, verification, and churn markers.",
     },
     {
       id: "log-wal",
@@ -8553,6 +8875,9 @@ function benchmarkLiveScore(metrics) {
   if (metrics.modelProviderActiveAuthCommand) score -= 2;
   if (metrics.modelProviderActiveRemoteNoAuth) score -= 4;
   score -= Math.min(4, Number(metrics.modelProviderProjectIgnoredKeyCount || 0) * 1.5);
+  score -= Math.min(7, Number(metrics.taskClarityHighChurnFileCount || 0) * 1.5);
+  score -= Math.min(4, Number(metrics.taskClarityMissingDoneMarkerFileCount || 0) * 0.6);
+  score -= Math.min(4, Number(metrics.taskClarityMissingVerificationMarkerFileCount || 0) * 0.7);
   score -= Math.min(8, Math.max(0, Number(metrics.mcpEnabledCount || 0) - 6) * 0.7);
   score -= Math.min(5, Number(metrics.mcpRequiredCount || 0) * 1.5);
   score -= Math.min(5, Number(metrics.mcpMissingEnvVarCount || 0) * 2);
@@ -8637,6 +8962,19 @@ function benchmarkGuidance(metrics) {
     );
   } else if (metrics.sessionMediaBytes > 256 * 1024 ** 2 || metrics.sessionMediaFileCount >= 3) {
     guidance.push(`Start fresh after image-heavy work; Refit found ${formatBytesServer(metrics.sessionMediaBytes)} of media-marked active transcripts.`);
+  }
+  if (metrics.taskClarityHighChurnFileCount > 0) {
+    guidance.push(
+      `Compact or split ${Number(metrics.taskClarityHighChurnFileCount).toLocaleString()} high-churn active thread${metrics.taskClarityHighChurnFileCount === 1 ? "" : "s"}; clear goals beat more context when work sprawls.`,
+    );
+  } else if (metrics.taskClarityMissingDoneMarkerFileCount >= 3) {
+    guidance.push(
+      `Add done-when criteria to new prompts; ${Number(metrics.taskClarityMissingDoneMarkerFileCount).toLocaleString()} sampled active thread${metrics.taskClarityMissingDoneMarkerFileCount === 1 ? "" : "s"} lacked that marker.`,
+    );
+  } else if (metrics.taskClarityMissingVerificationMarkerFileCount >= 3) {
+    guidance.push(
+      `Name the verification step in new prompts; ${Number(metrics.taskClarityMissingVerificationMarkerFileCount).toLocaleString()} sampled active thread${metrics.taskClarityMissingVerificationMarkerFileCount === 1 ? "" : "s"} lacked test/build/benchmark markers.`,
+    );
   }
   if (metrics.processCount >= 24) {
     guidance.push(
@@ -8869,7 +9207,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v11",
+    scoreModel: "local-state-v12",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -8882,6 +9220,11 @@ function scoreMetricsFromScan(scan) {
     sessionMediaAppshotMarkerCount: categories.sessionMedia?.appshotMarkerCount || 0,
     sessionMediaImageMarkerCount: categories.sessionMedia?.imageMarkerCount || 0,
     sessionMediaDataUrlMarkerCount: categories.sessionMedia?.dataUrlMarkerCount || 0,
+    taskClarityUserTurnCount: categories.taskClarity?.userTurnCount || 0,
+    taskClarityHighChurnFileCount: categories.taskClarity?.highChurnFileCount || 0,
+    taskClarityMissingDoneMarkerFileCount: categories.taskClarity?.missingDoneMarkerFileCount || 0,
+    taskClarityMissingVerificationMarkerFileCount: categories.taskClarity?.missingVerificationMarkerFileCount || 0,
+    taskClarityUnparsedFileCount: categories.taskClarity?.unparsedFileCount || 0,
     codexWorktreeBytes: categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
@@ -9572,6 +9915,15 @@ function benchmarkDeltas(current, previous) {
     "modelProviderActiveRemoteNoAuth",
     "modelProviderProjectIgnoredKeyCount",
     "modelProviderUnknownActive",
+    "taskClarityScannedFileCount",
+    "taskClarityUserTurnCount",
+    "taskClarityToolCallCount",
+    "taskClarityCompactMarkerCount",
+    "taskClarityStructuredPromptFileCount",
+    "taskClarityMissingDoneMarkerFileCount",
+    "taskClarityMissingVerificationMarkerFileCount",
+    "taskClarityHighChurnFileCount",
+    "taskClarityUnparsedFileCount",
     "hasFastTaskProfile",
     "fastTaskProfileCount",
     "hasMiniProfile",
@@ -9680,6 +10032,26 @@ function summarizeBenchmarkEntry(entry) {
     sessionMediaImageMarkerCount: entry.metrics.sessionMediaImageMarkerCount || 0,
     sessionMediaDataUrlMarkerCount: entry.metrics.sessionMediaDataUrlMarkerCount || 0,
     sessionMediaCappedFileCount: entry.metrics.sessionMediaCappedFileCount || 0,
+    taskClarityTone: entry.metrics.taskClarityTone || "low",
+    taskClarityScannedFileCount: entry.metrics.taskClarityScannedFileCount || 0,
+    taskClarityFileCount: entry.metrics.taskClarityFileCount || 0,
+    taskClaritySampledBytes: entry.metrics.taskClaritySampledBytes || 0,
+    taskClarityUserTurnCount: entry.metrics.taskClarityUserTurnCount || 0,
+    taskClarityAssistantTurnCount: entry.metrics.taskClarityAssistantTurnCount || 0,
+    taskClarityToolCallCount: entry.metrics.taskClarityToolCallCount || 0,
+    taskClarityToolOutputCount: entry.metrics.taskClarityToolOutputCount || 0,
+    taskClarityCompactMarkerCount: entry.metrics.taskClarityCompactMarkerCount || 0,
+    taskClarityGoalMarkerCount: entry.metrics.taskClarityGoalMarkerCount || 0,
+    taskClarityContextMarkerCount: entry.metrics.taskClarityContextMarkerCount || 0,
+    taskClarityConstraintMarkerCount: entry.metrics.taskClarityConstraintMarkerCount || 0,
+    taskClarityDoneMarkerCount: entry.metrics.taskClarityDoneMarkerCount || 0,
+    taskClarityVerificationMarkerCount: entry.metrics.taskClarityVerificationMarkerCount || 0,
+    taskClarityStructuredPromptFileCount: entry.metrics.taskClarityStructuredPromptFileCount || 0,
+    taskClarityMissingDoneMarkerFileCount: entry.metrics.taskClarityMissingDoneMarkerFileCount || 0,
+    taskClarityMissingVerificationMarkerFileCount: entry.metrics.taskClarityMissingVerificationMarkerFileCount || 0,
+    taskClarityHighChurnFileCount: entry.metrics.taskClarityHighChurnFileCount || 0,
+    taskClarityCappedFileCount: entry.metrics.taskClarityCappedFileCount || 0,
+    taskClarityUnparsedFileCount: entry.metrics.taskClarityUnparsedFileCount || 0,
     codexWorktreeBytes: entry.metrics.codexWorktreeBytes || 0,
     codexWorktreeCount: entry.metrics.codexWorktreeCount || 0,
     codexWorktreeLargeCount: entry.metrics.codexWorktreeLargeCount || 0,
@@ -9908,6 +10280,16 @@ export async function benchmarkHistory(limit = 12) {
         sessionMediaFileCount: latest.sessionMediaFileCount - oldest.sessionMediaFileCount,
         sessionMediaMarkerCount: latest.sessionMediaMarkerCount - oldest.sessionMediaMarkerCount,
         sessionMediaDataUrlMarkerCount: latest.sessionMediaDataUrlMarkerCount - oldest.sessionMediaDataUrlMarkerCount,
+        taskClarityScannedFileCount: latest.taskClarityScannedFileCount - oldest.taskClarityScannedFileCount,
+        taskClarityUserTurnCount: latest.taskClarityUserTurnCount - oldest.taskClarityUserTurnCount,
+        taskClarityToolCallCount: latest.taskClarityToolCallCount - oldest.taskClarityToolCallCount,
+        taskClarityCompactMarkerCount: latest.taskClarityCompactMarkerCount - oldest.taskClarityCompactMarkerCount,
+        taskClarityStructuredPromptFileCount: latest.taskClarityStructuredPromptFileCount - oldest.taskClarityStructuredPromptFileCount,
+        taskClarityMissingDoneMarkerFileCount: latest.taskClarityMissingDoneMarkerFileCount - oldest.taskClarityMissingDoneMarkerFileCount,
+        taskClarityMissingVerificationMarkerFileCount:
+          latest.taskClarityMissingVerificationMarkerFileCount - oldest.taskClarityMissingVerificationMarkerFileCount,
+        taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - oldest.taskClarityHighChurnFileCount,
+        taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - oldest.taskClarityUnparsedFileCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - oldest.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - oldest.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - oldest.codexWorktreeLargeCount,
@@ -10001,6 +10383,16 @@ export async function benchmarkHistory(limit = 12) {
         sessionMediaFileCount: latest.sessionMediaFileCount - previous.sessionMediaFileCount,
         sessionMediaMarkerCount: latest.sessionMediaMarkerCount - previous.sessionMediaMarkerCount,
         sessionMediaDataUrlMarkerCount: latest.sessionMediaDataUrlMarkerCount - previous.sessionMediaDataUrlMarkerCount,
+        taskClarityScannedFileCount: latest.taskClarityScannedFileCount - previous.taskClarityScannedFileCount,
+        taskClarityUserTurnCount: latest.taskClarityUserTurnCount - previous.taskClarityUserTurnCount,
+        taskClarityToolCallCount: latest.taskClarityToolCallCount - previous.taskClarityToolCallCount,
+        taskClarityCompactMarkerCount: latest.taskClarityCompactMarkerCount - previous.taskClarityCompactMarkerCount,
+        taskClarityStructuredPromptFileCount: latest.taskClarityStructuredPromptFileCount - previous.taskClarityStructuredPromptFileCount,
+        taskClarityMissingDoneMarkerFileCount: latest.taskClarityMissingDoneMarkerFileCount - previous.taskClarityMissingDoneMarkerFileCount,
+        taskClarityMissingVerificationMarkerFileCount:
+          latest.taskClarityMissingVerificationMarkerFileCount - previous.taskClarityMissingVerificationMarkerFileCount,
+        taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - previous.taskClarityHighChurnFileCount,
+        taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - previous.taskClarityUnparsedFileCount,
         codexWorktreeBytes: latest.codexWorktreeBytes - previous.codexWorktreeBytes,
         codexWorktreeCount: latest.codexWorktreeCount - previous.codexWorktreeCount,
         codexWorktreeLargeCount: latest.codexWorktreeLargeCount - previous.codexWorktreeLargeCount,
@@ -10126,6 +10518,7 @@ export async function runBenchmark() {
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
+  const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
   const modelEffort = scan.codexConfig?.reasoningEffort || "default";
@@ -10138,7 +10531,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v11",
+    scoreModel: "local-state-v12",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -10166,6 +10559,26 @@ export async function runBenchmark() {
     sessionMediaImageMarkerCount: scan.categories.sessionMedia?.imageMarkerCount || 0,
     sessionMediaDataUrlMarkerCount: scan.categories.sessionMedia?.dataUrlMarkerCount || 0,
     sessionMediaCappedFileCount: scan.categories.sessionMedia?.cappedFileCount || 0,
+    taskClarityTone: taskClarity.tone || "low",
+    taskClarityScannedFileCount: taskClarity.scannedFileCount || 0,
+    taskClarityFileCount: taskClarity.fileCount || 0,
+    taskClaritySampledBytes: taskClarity.sampledBytes || 0,
+    taskClarityUserTurnCount: taskClarity.userTurnCount || 0,
+    taskClarityAssistantTurnCount: taskClarity.assistantTurnCount || 0,
+    taskClarityToolCallCount: taskClarity.toolCallCount || 0,
+    taskClarityToolOutputCount: taskClarity.toolOutputCount || 0,
+    taskClarityCompactMarkerCount: taskClarity.compactMarkerCount || 0,
+    taskClarityGoalMarkerCount: taskClarity.goalMarkerCount || 0,
+    taskClarityContextMarkerCount: taskClarity.contextMarkerCount || 0,
+    taskClarityConstraintMarkerCount: taskClarity.constraintMarkerCount || 0,
+    taskClarityDoneMarkerCount: taskClarity.doneMarkerCount || 0,
+    taskClarityVerificationMarkerCount: taskClarity.verificationMarkerCount || 0,
+    taskClarityStructuredPromptFileCount: taskClarity.structuredPromptFileCount || 0,
+    taskClarityMissingDoneMarkerFileCount: taskClarity.missingDoneMarkerFileCount || 0,
+    taskClarityMissingVerificationMarkerFileCount: taskClarity.missingVerificationMarkerFileCount || 0,
+    taskClarityHighChurnFileCount: taskClarity.highChurnFileCount || 0,
+    taskClarityCappedFileCount: taskClarity.cappedFileCount || 0,
+    taskClarityUnparsedFileCount: taskClarity.unparsedFileCount || 0,
     codexWorktreeBytes: scan.categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: scan.categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: scan.categories.codexWorktrees?.largeWorktreeCount || 0,
