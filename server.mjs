@@ -93,6 +93,8 @@ const allowedRoots = [
 ].map((allowedPath) => path.resolve(allowedPath));
 
 let actionInProgress = false;
+let runningServer = null;
+let keepAliveTimer = null;
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -5463,6 +5465,409 @@ async function summarizeTaskClarity(activeSessions = {}) {
   return summary;
 }
 
+function emptyTurnTelemetrySummary(activeSessions = {}) {
+  return {
+    label: "Turn Telemetry",
+    path: paths.sessions,
+    exists: Boolean(activeSessions.exists),
+    bytes: 0,
+    fileCount: 0,
+    scannedFileCount: 0,
+    sampledBytes: 0,
+    parsedLineCount: 0,
+    completedTurnCount: 0,
+    abortedTurnCount: 0,
+    durationCount: 0,
+    totalDurationMs: 0,
+    maxDurationMs: 0,
+    slowTurnCount: 0,
+    verySlowTurnCount: 0,
+    firstTokenCount: 0,
+    totalFirstTokenMs: 0,
+    maxFirstTokenMs: 0,
+    slowFirstTokenCount: 0,
+    verySlowFirstTokenCount: 0,
+    tokenCountEventCount: 0,
+    rateLimitEventCount: 0,
+    lowRateLimitCount: 0,
+    rateLimitReachedCount: 0,
+    creditLimitedCount: 0,
+    usageEventCount: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalReasoningTokens: 0,
+    totalCachedInputTokens: 0,
+    totalTokens: 0,
+    maxContextTokens: 0,
+    maxContextWindow: 0,
+    maxContextUsedPct: 0,
+    contextNearLimitCount: 0,
+    cappedFileCount: 0,
+    unparsedFileCount: 0,
+    largest: [],
+    risk: "scan",
+    tone: "low",
+    action: "Keep measuring",
+    detail:
+      "No slow-turn, first-token, rate-limit, or context-pressure metadata was found in the largest active transcript samples.",
+    hotspots: ["No turn-timing pressure found in the largest active transcript samples."],
+  };
+}
+
+function finiteNumber(value) {
+  if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function durationLabel(ms) {
+  const number = finiteNumber(ms);
+  if (number === null || number <= 0) return "0s";
+  if (number < 1000) return `${Math.round(number)}ms`;
+  const seconds = number / 1000;
+  if (seconds < 60) return `${seconds >= 10 ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${minutes >= 10 ? minutes.toFixed(0) : minutes.toFixed(1)}m`;
+  const hours = minutes / 60;
+  return `${hours >= 10 ? hours.toFixed(0) : hours.toFixed(1)}h`;
+}
+
+function inspectRateLimits(rateLimits) {
+  const result = {
+    low: false,
+    reached: false,
+    creditLimited: false,
+    numericFieldCount: 0,
+  };
+
+  const inspectObject = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) inspectObject(item);
+      return;
+    }
+
+    if (value.rate_limit_reached_type !== undefined && value.rate_limit_reached_type !== null && value.rate_limit_reached_type !== "") {
+      result.reached = true;
+      result.low = true;
+    }
+
+    if (value.credits && typeof value.credits === "object") {
+      const balance = finiteNumber(value.credits.balance);
+      if (balance !== null && balance <= 0 && value.credits.unlimited !== true) {
+        result.creditLimited = true;
+        result.low = true;
+      }
+    }
+
+    const numericEntries = Object.entries(value)
+      .map(([key, entryValue]) => [String(key).toLowerCase(), finiteNumber(entryValue)])
+      .filter(([, entryValue]) => entryValue !== null);
+    result.numericFieldCount += numericEntries.length;
+
+    const remaining = numericEntries.find(([key]) => /remaining|available|balance|left/.test(key))?.[1];
+    const limit = numericEntries.find(([key]) => /^limit$|limit_|_limit|max|quota|total/.test(key))?.[1];
+    if (limit && limit > 0 && remaining !== undefined && remaining / limit <= 0.1) result.low = true;
+    if (remaining === 0) result.low = true;
+
+    for (const entryValue of Object.values(value)) {
+      if (entryValue && typeof entryValue === "object") inspectObject(entryValue);
+    }
+  };
+
+  inspectObject(rateLimits);
+  return result;
+}
+
+function tokenUsageFromInfo(info) {
+  const usage = info?.last_token_usage || info?.usage || info;
+  if (!usage || typeof usage !== "object") return null;
+  const input = finiteNumber(usage.input_tokens);
+  const output = finiteNumber(usage.output_tokens);
+  const reasoning = finiteNumber(usage.reasoning_output_tokens ?? usage.reasoning_tokens);
+  const cachedInput = finiteNumber(usage.cached_input_tokens);
+  const total = finiteNumber(usage.total_tokens);
+  if ([input, output, reasoning, cachedInput, total].every((value) => value === null)) return null;
+  return {
+    input: input || 0,
+    output: output || 0,
+    reasoning: reasoning || 0,
+    cachedInput: cachedInput || 0,
+    total: total || input || output || reasoning || cachedInput || 0,
+  };
+}
+
+async function scanTurnTelemetryMarkers(file) {
+  const sampled = await sampleTextFile(file.path, { maxHeadBytes: 4 * 1024 * 1024, maxTailBytes: 2 * 1024 * 1024 });
+  if (!sampled) return null;
+  const { stats, sample, sampledBytes, capped } = sampled;
+  const result = {
+    name: path.basename(file.path),
+    path: file.path,
+    bytes: stats.size,
+    mtime: stats.mtime.toISOString(),
+    bucket: "Turn Telemetry",
+    sampledBytes,
+    capped,
+    parsedLineCount: 0,
+    completedTurnCount: 0,
+    abortedTurnCount: 0,
+    durationCount: 0,
+    totalDurationMs: 0,
+    maxDurationMs: 0,
+    slowTurnCount: 0,
+    verySlowTurnCount: 0,
+    firstTokenCount: 0,
+    totalFirstTokenMs: 0,
+    maxFirstTokenMs: 0,
+    slowFirstTokenCount: 0,
+    verySlowFirstTokenCount: 0,
+    tokenCountEventCount: 0,
+    rateLimitEventCount: 0,
+    lowRateLimitCount: 0,
+    rateLimitReachedCount: 0,
+    creditLimitedCount: 0,
+    usageEventCount: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalReasoningTokens: 0,
+    totalCachedInputTokens: 0,
+    totalTokens: 0,
+    maxContextTokens: 0,
+    maxContextWindow: 0,
+    maxContextUsedPct: 0,
+    contextNearLimitCount: 0,
+  };
+
+  for (const line of sample.split("\n")) {
+    if (!line.trim()) continue;
+    let record = null;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    result.parsedLineCount += 1;
+    const payload = record?.payload && typeof record.payload === "object" ? record.payload : record;
+    const payloadType = payload?.type || record?.type || "";
+
+    if (payloadType === "task_complete") result.completedTurnCount += 1;
+    if (payloadType === "turn_aborted") result.abortedTurnCount += 1;
+    if (payloadType === "token_count") result.tokenCountEventCount += 1;
+
+    const duration = finiteNumber(payload?.duration_ms);
+    if (duration !== null) {
+      result.durationCount += 1;
+      result.totalDurationMs += duration;
+      result.maxDurationMs = Math.max(result.maxDurationMs, duration);
+      if (duration >= 180000) result.slowTurnCount += 1;
+      if (duration >= 900000) result.verySlowTurnCount += 1;
+    }
+
+    const firstToken = finiteNumber(payload?.time_to_first_token_ms);
+    if (firstToken !== null) {
+      result.firstTokenCount += 1;
+      result.totalFirstTokenMs += firstToken;
+      result.maxFirstTokenMs = Math.max(result.maxFirstTokenMs, firstToken);
+      if (firstToken >= 15000) result.slowFirstTokenCount += 1;
+      if (firstToken >= 60000) result.verySlowFirstTokenCount += 1;
+    }
+
+    if (payload?.rate_limits) {
+      result.rateLimitEventCount += 1;
+      const rateLimitSignals = inspectRateLimits(payload.rate_limits);
+      if (rateLimitSignals.low) result.lowRateLimitCount += 1;
+      if (rateLimitSignals.reached) result.rateLimitReachedCount += 1;
+      if (rateLimitSignals.creditLimited) result.creditLimitedCount += 1;
+    }
+
+    const usage = tokenUsageFromInfo(payload?.info) || tokenUsageFromInfo(payload?.usage);
+    if (usage) {
+      result.usageEventCount += 1;
+      result.totalInputTokens += usage.input;
+      result.totalOutputTokens += usage.output;
+      result.totalReasoningTokens += usage.reasoning;
+      result.totalCachedInputTokens += usage.cachedInput;
+      result.totalTokens += usage.total;
+    }
+
+    const totalUsageTokens = finiteNumber(payload?.info?.last_token_usage?.total_tokens);
+    const contextWindow = finiteNumber(payload?.info?.model_context_window);
+    if (totalUsageTokens !== null) result.maxContextTokens = Math.max(result.maxContextTokens, totalUsageTokens);
+    if (contextWindow !== null) result.maxContextWindow = Math.max(result.maxContextWindow, contextWindow);
+    if (totalUsageTokens !== null && contextWindow && contextWindow > 0) {
+      const usedPct = totalUsageTokens / contextWindow;
+      result.maxContextUsedPct = Math.max(result.maxContextUsedPct, usedPct);
+      if (usedPct >= 0.85) result.contextNearLimitCount += 1;
+    }
+  }
+
+  return result;
+}
+
+async function summarizeTurnTelemetry(activeSessions = {}) {
+  const summary = emptyTurnTelemetrySummary(activeSessions);
+  if (!activeSessions.exists) return summary;
+  const candidates = (activeSessions.largest || [])
+    .filter((file) => file?.path && /\.(jsonl?|txt|md)$/i.test(file.path))
+    .slice(0, 10);
+  if (!candidates.length) {
+    summary.exists = true;
+    summary.detail = "No readable transcript candidates were found among the largest active session files.";
+    summary.hotspots = [summary.detail];
+    return summary;
+  }
+
+  const scanned = [];
+  for (const file of candidates) {
+    const result = await scanTurnTelemetryMarkers(file);
+    if (result) scanned.push(result);
+  }
+
+  summary.exists = true;
+  summary.scannedFileCount = candidates.length;
+  summary.largest = scanned
+    .filter(
+      (file) =>
+        file.durationCount ||
+        file.firstTokenCount ||
+        file.tokenCountEventCount ||
+        file.rateLimitEventCount ||
+        file.parsedLineCount === 0,
+    )
+    .sort((a, b) => {
+      const pressureA =
+        a.verySlowTurnCount * 12 +
+        a.slowTurnCount * 4 +
+        a.verySlowFirstTokenCount * 8 +
+        a.slowFirstTokenCount * 3 +
+        a.lowRateLimitCount * 4 +
+        a.contextNearLimitCount * 2 +
+        a.bytes / 1024 ** 3;
+      const pressureB =
+        b.verySlowTurnCount * 12 +
+        b.slowTurnCount * 4 +
+        b.verySlowFirstTokenCount * 8 +
+        b.slowFirstTokenCount * 3 +
+        b.lowRateLimitCount * 4 +
+        b.contextNearLimitCount * 2 +
+        b.bytes / 1024 ** 3;
+      return pressureB - pressureA;
+    })
+    .slice(0, 8);
+
+  summary.fileCount = summary.largest.length;
+  summary.bytes = summary.largest.reduce((total, file) => total + file.bytes, 0);
+  summary.sampledBytes = summary.largest.reduce((total, file) => total + file.sampledBytes, 0);
+  summary.parsedLineCount = summary.largest.reduce((total, file) => total + file.parsedLineCount, 0);
+  summary.completedTurnCount = summary.largest.reduce((total, file) => total + file.completedTurnCount, 0);
+  summary.abortedTurnCount = summary.largest.reduce((total, file) => total + file.abortedTurnCount, 0);
+  summary.durationCount = summary.largest.reduce((total, file) => total + file.durationCount, 0);
+  summary.totalDurationMs = summary.largest.reduce((total, file) => total + file.totalDurationMs, 0);
+  summary.maxDurationMs = summary.largest.reduce((max, file) => Math.max(max, file.maxDurationMs), 0);
+  summary.slowTurnCount = summary.largest.reduce((total, file) => total + file.slowTurnCount, 0);
+  summary.verySlowTurnCount = summary.largest.reduce((total, file) => total + file.verySlowTurnCount, 0);
+  summary.firstTokenCount = summary.largest.reduce((total, file) => total + file.firstTokenCount, 0);
+  summary.totalFirstTokenMs = summary.largest.reduce((total, file) => total + file.totalFirstTokenMs, 0);
+  summary.maxFirstTokenMs = summary.largest.reduce((max, file) => Math.max(max, file.maxFirstTokenMs), 0);
+  summary.slowFirstTokenCount = summary.largest.reduce((total, file) => total + file.slowFirstTokenCount, 0);
+  summary.verySlowFirstTokenCount = summary.largest.reduce((total, file) => total + file.verySlowFirstTokenCount, 0);
+  summary.tokenCountEventCount = summary.largest.reduce((total, file) => total + file.tokenCountEventCount, 0);
+  summary.rateLimitEventCount = summary.largest.reduce((total, file) => total + file.rateLimitEventCount, 0);
+  summary.lowRateLimitCount = summary.largest.reduce((total, file) => total + file.lowRateLimitCount, 0);
+  summary.rateLimitReachedCount = summary.largest.reduce((total, file) => total + file.rateLimitReachedCount, 0);
+  summary.creditLimitedCount = summary.largest.reduce((total, file) => total + file.creditLimitedCount, 0);
+  summary.usageEventCount = summary.largest.reduce((total, file) => total + file.usageEventCount, 0);
+  summary.totalInputTokens = summary.largest.reduce((total, file) => total + file.totalInputTokens, 0);
+  summary.totalOutputTokens = summary.largest.reduce((total, file) => total + file.totalOutputTokens, 0);
+  summary.totalReasoningTokens = summary.largest.reduce((total, file) => total + file.totalReasoningTokens, 0);
+  summary.totalCachedInputTokens = summary.largest.reduce((total, file) => total + file.totalCachedInputTokens, 0);
+  summary.totalTokens = summary.largest.reduce((total, file) => total + file.totalTokens, 0);
+  summary.maxContextTokens = summary.largest.reduce((max, file) => Math.max(max, file.maxContextTokens), 0);
+  summary.maxContextWindow = summary.largest.reduce((max, file) => Math.max(max, file.maxContextWindow), 0);
+  summary.maxContextUsedPct = summary.largest.reduce((max, file) => Math.max(max, file.maxContextUsedPct), 0);
+  summary.contextNearLimitCount = summary.largest.reduce((total, file) => total + file.contextNearLimitCount, 0);
+  summary.cappedFileCount = summary.largest.filter((file) => file.capped).length;
+  summary.unparsedFileCount = summary.largest.filter((file) => file.parsedLineCount === 0).length;
+
+  const avgDuration = summary.durationCount ? summary.totalDurationMs / summary.durationCount : 0;
+  const avgFirstToken = summary.firstTokenCount ? summary.totalFirstTokenMs / summary.firstTokenCount : 0;
+  summary.label = summary.fileCount
+    ? summary.slowTurnCount || summary.slowFirstTokenCount
+      ? `${(summary.slowTurnCount + summary.slowFirstTokenCount).toLocaleString()} slow`
+      : `${summary.completedTurnCount.toLocaleString()} turns`
+    : "No sample";
+  summary.tone =
+    summary.rateLimitReachedCount ||
+    summary.lowRateLimitCount >= 2 ||
+    summary.verySlowTurnCount ||
+    summary.maxDurationMs >= 30 * 60 * 1000 ||
+    summary.verySlowFirstTokenCount >= 2 ||
+    summary.maxFirstTokenMs >= 2 * 60 * 1000 ||
+    summary.contextNearLimitCount >= 4
+      ? "high"
+      : summary.lowRateLimitCount ||
+          summary.slowTurnCount ||
+          summary.slowFirstTokenCount >= 2 ||
+          summary.maxDurationMs >= 5 * 60 * 1000 ||
+          summary.maxFirstTokenMs >= 30000 ||
+          summary.contextNearLimitCount
+        ? "medium"
+        : "low";
+  summary.risk = summary.tone === "high" ? "warn" : "scan";
+  summary.action =
+    summary.rateLimitReachedCount || summary.lowRateLimitCount
+      ? "Check /status"
+      : summary.verySlowTurnCount || summary.slowTurnCount
+        ? "Split slow turns"
+        : summary.slowFirstTokenCount
+          ? "Check model/limits"
+          : summary.contextNearLimitCount
+            ? "Compact sooner"
+            : "Keep measuring";
+  summary.detail =
+    summary.fileCount === 0
+      ? "Refit could not parse turn-timing metadata from the largest active transcript samples."
+      : [
+          `Refit sampled ${summary.fileCount.toLocaleString()} active transcript${summary.fileCount === 1 ? "" : "s"} and found ${summary.completedTurnCount.toLocaleString()} completed turn${summary.completedTurnCount === 1 ? "" : "s"}, ${summary.tokenCountEventCount.toLocaleString()} token-count event${summary.tokenCountEventCount === 1 ? "" : "s"}, and ${summary.rateLimitEventCount.toLocaleString()} rate-limit metadata event${summary.rateLimitEventCount === 1 ? "" : "s"}.`,
+          summary.durationCount
+            ? `Average turn duration was ${durationLabel(avgDuration)}; the slowest sampled turn was ${durationLabel(summary.maxDurationMs)}.`
+            : "No completed-turn duration fields were present in the sample.",
+          summary.firstTokenCount
+            ? `Average first token was ${durationLabel(avgFirstToken)}; the slowest first token was ${durationLabel(summary.maxFirstTokenMs)}.`
+            : "No first-token timing fields were present in the sample.",
+          summary.lowRateLimitCount
+            ? `${summary.lowRateLimitCount.toLocaleString()} rate-limit event${summary.lowRateLimitCount === 1 ? " looked" : "s looked"} low or exhausted.`
+            : null,
+          summary.contextNearLimitCount
+            ? `${summary.contextNearLimitCount.toLocaleString()} token-count event${summary.contextNearLimitCount === 1 ? " was" : "s were"} near the model context window.`
+            : null,
+          summary.cappedFileCount
+            ? `${summary.cappedFileCount.toLocaleString()} very large file${summary.cappedFileCount === 1 ? " was" : "s were"} sampled at the head and tail only.`
+            : null,
+          "Refit reports timing, token, and rate-limit counts only, never prompt text.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+  summary.hotspots = [
+    summary.durationCount
+      ? `${summary.slowTurnCount.toLocaleString()} slow turn${summary.slowTurnCount === 1 ? "" : "s"}; slowest ${durationLabel(summary.maxDurationMs)}.`
+      : "No completed-turn duration fields found.",
+    summary.firstTokenCount
+      ? `${summary.slowFirstTokenCount.toLocaleString()} slow first-token event${summary.slowFirstTokenCount === 1 ? "" : "s"}; slowest ${durationLabel(summary.maxFirstTokenMs)}.`
+      : "No first-token timing fields found.",
+    summary.lowRateLimitCount
+      ? `${summary.lowRateLimitCount.toLocaleString()} rate-limit event${summary.lowRateLimitCount === 1 ? " looks" : "s look"} low or exhausted; check /status.`
+      : `${summary.rateLimitEventCount.toLocaleString()} rate-limit metadata event${summary.rateLimitEventCount === 1 ? "" : "s"} sampled.`,
+    summary.contextNearLimitCount
+      ? `${summary.contextNearLimitCount.toLocaleString()} token-count event${summary.contextNearLimitCount === 1 ? " was" : "s were"} near context limit.`
+      : summary.maxContextUsedPct
+        ? `Peak sampled context use: ${Math.round(summary.maxContextUsedPct * 100)}%.`
+        : "No sampled context-window pressure found.",
+  ];
+  return summary;
+}
+
 async function summarizeSessionMediaPressure(activeSessions = {}) {
   const summary = emptySessionMediaSummary(activeSessions);
   if (!activeSessions.exists) return summary;
@@ -6424,6 +6829,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const logWalBytes = context.logWalBytes || 0;
   const sessionMedia = scan?.categories?.sessionMedia || emptySessionMediaSummary(scan?.categories?.activeSessions || {});
   const taskClarity = scan?.categories?.taskClarity || emptyTaskClaritySummary(scan?.categories?.activeSessions || {});
+  const turnTelemetry = scan?.categories?.turnTelemetry || emptyTurnTelemetrySummary(scan?.categories?.activeSessions || {});
   const worktrees = scan?.categories?.codexWorktrees || emptyWorktreeSummary();
   const staleProjectPaths = codexConfig?.staleTrustedProjectPaths || [];
   const defaultReasoningEffort = normalizedEffort(codexConfig?.reasoningEffort);
@@ -6528,6 +6934,29 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "# For active long threads:",
         "/compact",
         "# Then continue with the four-line shape above or start a fresh thread for the next focused task.",
+      ].join("\n"),
+    });
+  }
+
+  if (turnTelemetry.exists && turnTelemetry.tone !== "low") {
+    addFix({
+      id: "turn-telemetry",
+      label: "Turn Telemetry",
+      value: turnTelemetry.label || `${turnTelemetry.completedTurnCount.toLocaleString()} turns`,
+      tone: turnTelemetry.tone === "high" ? "high" : "medium",
+      action: turnTelemetry.action,
+      detail:
+        "Refit found slow-turn, first-token, context, or rate-limit metadata in active transcripts. That points to model/service/context pressure rather than something Smart Optimize can fix by moving files.",
+      snippet: [
+        "/status",
+        "# Check context usage and rate limits in the active Codex thread.",
+        "",
+        "# If first-token latency is high:",
+        "# - Use the speed profile, lower reasoning, or mini/Spark for small tasks.",
+        "# - Split the task or /compact before another long turn.",
+        "",
+        "# If rate limits are low:",
+        "# - Wait for the limit to recover, use a lighter profile, or move independent heavy work to cloud when the repo is ready.",
       ].join("\n"),
     });
   }
@@ -7324,6 +7753,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const generatedImageBytes = categories.generatedImages?.bytes || 0;
   const sessionMedia = categories.sessionMedia || emptySessionMediaSummary(categories.activeSessions || {});
   const taskClarity = categories.taskClarity || emptyTaskClaritySummary(categories.activeSessions || {});
+  const turnTelemetry = categories.turnTelemetry || emptyTurnTelemetrySummary(categories.activeSessions || {});
   const worktrees = categories.codexWorktrees || emptyWorktreeSummary();
   const staleThreads = Number(scan.state?.threads?.activeStale ?? scan.state?.threads?.activeOlder7d ?? 0);
   const model = codexConfig?.model || "Not set";
@@ -7412,7 +7842,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       : memoriesFeature
         ? `Memories are enabled, but Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`
         : `Memories are off in config. Refit found ${memoryFiles.toLocaleString()} local memory file${memoryFiles === 1 ? "" : "s"} (${formatBytesServer(memoryBytes)}).`;
-  const docsSource = "Official Codex manual: Speed, Cloud Threads, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
+  const docsSource = "Official Codex manual: Speed, /status, Cloud Threads, Models, Config, AGENTS, MCP, Memories, Troubleshooting";
   const processReady = processSummary?.status === "ready";
   const processLoaded = processReady && processSummary.tone !== "low";
   const processCount = Number(processSummary?.processCount || 0);
@@ -7862,6 +8292,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: taskClarity.detail,
     },
     {
+      id: "turn-telemetry",
+      label: "Turn Telemetry",
+      value: turnTelemetry.label,
+      tone: turnTelemetry.tone,
+      action: turnTelemetry.action,
+      priority: turnTelemetry.tone === "high" ? 91 : turnTelemetry.tone === "medium" ? 74 : 22,
+      detail: turnTelemetry.detail,
+    },
+    {
       id: "cloud-handoff",
       label: "Cloud Handoff",
       value: cloudHandoff.label,
@@ -8061,6 +8500,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: taskClarity.tone === "high" ? "high" : "medium",
       priority: taskClarity.tone === "high" ? 88 : 67,
       detail: taskClarity.detail,
+    });
+  }
+
+  if (turnTelemetry.exists && turnTelemetry.tone !== "low") {
+    addRecommendation({
+      id: "turn-telemetry",
+      label: "Turn Telemetry",
+      value: turnTelemetry.label,
+      action: turnTelemetry.action,
+      tone: turnTelemetry.tone === "high" ? "high" : "medium",
+      priority: turnTelemetry.tone === "high" ? 89 : 68,
+      detail:
+        turnTelemetry.lowRateLimitCount || turnTelemetry.rateLimitReachedCount
+          ? `${turnTelemetry.detail} Run /status in Codex to see current context and rate-limit state before tuning local cleanup again.`
+          : turnTelemetry.detail,
     });
   }
 
@@ -8677,6 +9131,14 @@ function addHotspots(scan) {
           ? `${categories.taskClarity.highChurnFileCount.toLocaleString()} high-churn active thread${categories.taskClarity.highChurnFileCount === 1 ? "" : "s"}`
           : "Prompt/thread shape looks scoped in the sampled files.",
       ];
+  categories.turnTelemetry.hotspots = categories.turnTelemetry.hotspots?.length
+    ? categories.turnTelemetry.hotspots
+    : [
+        `${categories.turnTelemetry.completedTurnCount.toLocaleString()} completed turn${categories.turnTelemetry.completedTurnCount === 1 ? "" : "s"} with timing metadata`,
+        categories.turnTelemetry.slowTurnCount || categories.turnTelemetry.slowFirstTokenCount
+          ? `${(categories.turnTelemetry.slowTurnCount + categories.turnTelemetry.slowFirstTokenCount).toLocaleString()} slow timing signal${categories.turnTelemetry.slowTurnCount + categories.turnTelemetry.slowFirstTokenCount === 1 ? "" : "s"}`
+          : "No slow turn-timing pressure found in the sampled files.",
+      ];
   categories.activeStaleSessions.hotspots = [
     `${categories.activeStaleSessions.fileCount.toLocaleString()} active transcript${categories.activeStaleSessions.fileCount === 1 ? "" : "s"} older than ${categories.activeStaleSessions.days} days`,
     `${categories.activeStaleSessions.oversized50mb.toLocaleString()} stale file${categories.activeStaleSessions.oversized50mb === 1 ? "" : "s"} over 50 MB`,
@@ -8862,6 +9324,7 @@ export async function scanCodex(options = {}) {
   const [
     sessionMedia,
     taskClarity,
+    turnTelemetry,
     archivedSessions,
     maintenanceArchive,
     generatedImages,
@@ -8883,6 +9346,7 @@ export async function scanCodex(options = {}) {
   ] = await Promise.all([
     summarizeSessionMediaPressure(activeSessions),
     summarizeTaskClarity(activeSessions),
+    summarizeTurnTelemetry(activeSessions),
     summarizeDirectory(paths.archivedSessions, { label: "Archived Sessions", risk: "warn", largestLimit: 12 }),
     summarizeDirectory(paths.maintenanceArchive, {
       label: "Old Refit Backups",
@@ -8964,6 +9428,7 @@ export async function scanCodex(options = {}) {
     activeSessions,
     sessionMedia,
     taskClarity,
+    turnTelemetry,
     activeStaleSessions: activeStale,
     archivedSessions,
     archivedSessionsInActiveTree: archivedStillInSessions,
@@ -8981,6 +9446,7 @@ export async function scanCodex(options = {}) {
   const largestSessionCandidates = [
     ...activeStale.largest.map((file) => ({ ...file, bucket: "Stale active sessions" })),
     ...archivedDeleteCandidates.largest.map((file) => ({ ...file, bucket: "Old archived conversations" })),
+    ...turnTelemetry.largest.map((file) => ({ ...file, bucket: "Turn telemetry" })),
     ...taskClarity.largest.map((file) => ({ ...file, bucket: "Task clarity" })),
     ...sessionMedia.largest.map((file) => ({ ...file, bucket: "Session media" })),
     ...activeSessions.largest.map((file) => ({ ...file, bucket: "Active sessions" })),
@@ -9064,6 +9530,20 @@ function localScoreBreakdown(metrics) {
       ),
       value: `${Number(metrics.taskClarityUserTurnCount || 0).toLocaleString()} turn${metrics.taskClarityUserTurnCount === 1 ? "" : "s"}`,
       detail: "Sampled active-thread shape: goal, context, constraints, done-when, verification, and churn markers.",
+    },
+    {
+      id: "turn-telemetry",
+      label: "Turn Telemetry",
+      points: Math.min(
+        9,
+        Number(metrics.turnTelemetrySlowTurnCount || 0) * 1.2 +
+          Number(metrics.turnTelemetryVerySlowTurnCount || 0) * 2 +
+          Number(metrics.turnTelemetrySlowFirstTokenCount || 0) * 0.9 +
+          Number(metrics.turnTelemetryLowRateLimitCount || 0) * 1.4 +
+          Number(metrics.turnTelemetryContextNearLimitCount || 0) * 0.5,
+      ),
+      value: `${Number(metrics.turnTelemetrySlowTurnCount || 0) + Number(metrics.turnTelemetrySlowFirstTokenCount || 0)} slow`,
+      detail: "Observed turn duration, first-token delay, rate-limit metadata, and near-context-window events from active transcript metadata.",
     },
     {
       id: "log-wal",
@@ -9157,6 +9637,10 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(7, Number(metrics.taskClarityHighChurnFileCount || 0) * 1.5);
   score -= Math.min(4, Number(metrics.taskClarityMissingDoneMarkerFileCount || 0) * 0.6);
   score -= Math.min(4, Number(metrics.taskClarityMissingVerificationMarkerFileCount || 0) * 0.7);
+  score -= Math.min(6, Number(metrics.turnTelemetrySlowTurnCount || 0) * 1.1 + Number(metrics.turnTelemetryVerySlowTurnCount || 0) * 2);
+  score -= Math.min(5, Number(metrics.turnTelemetrySlowFirstTokenCount || 0) * 0.9 + Number(metrics.turnTelemetryVerySlowFirstTokenCount || 0) * 1.5);
+  score -= Math.min(5, Number(metrics.turnTelemetryLowRateLimitCount || 0) * 1.4 + Number(metrics.turnTelemetryRateLimitReachedCount || 0) * 2);
+  score -= Math.min(4, Number(metrics.turnTelemetryContextNearLimitCount || 0) * 0.6);
   if (metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffHasGithubRemote) score -= 3;
   if (metrics.cloudHandoffDetachedHead) score -= 3;
   if ((metrics.processCount >= 12 || metrics.backgroundProcessCount > 0) && metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffReady) score -= 2;
@@ -9218,7 +9702,7 @@ function benchmarkMeaning(score) {
   if (score >= 88) return "Codex state is light. Keep scanning occasionally.";
   if (score >= 72) return "Codex is healthy, with only light local slowdown.";
   if (score >= 55) return "Loaded means local history and logs are starting to add drag.";
-  if (score >= 35) return "Heavy means local sessions, logs, or archived pointers are probably slowing Codex down.";
+  if (score >= 35) return "Heavy means local state, slow active turns, logs, or archived pointers are probably adding drag.";
   return "Bogged means local Codex state needs cleanup before speed can recover.";
 }
 
@@ -9258,6 +9742,23 @@ function benchmarkGuidance(metrics) {
   } else if (metrics.taskClarityMissingVerificationMarkerFileCount >= 3) {
     guidance.push(
       `Name the verification step in new prompts; ${Number(metrics.taskClarityMissingVerificationMarkerFileCount).toLocaleString()} sampled active thread${metrics.taskClarityMissingVerificationMarkerFileCount === 1 ? "" : "s"} lacked test/build/benchmark markers.`,
+    );
+  }
+  if (metrics.turnTelemetryLowRateLimitCount > 0 || metrics.turnTelemetryRateLimitReachedCount > 0) {
+    guidance.push(
+      `Run /status in Codex: Refit saw ${Number(metrics.turnTelemetryLowRateLimitCount || metrics.turnTelemetryRateLimitReachedCount).toLocaleString()} low or reached rate-limit metadata event${Number(metrics.turnTelemetryLowRateLimitCount || metrics.turnTelemetryRateLimitReachedCount) === 1 ? "" : "s"}.`,
+    );
+  } else if (metrics.turnTelemetrySlowFirstTokenCount >= 2) {
+    guidance.push(
+      `Investigate first-token delay: ${Number(metrics.turnTelemetrySlowFirstTokenCount).toLocaleString()} sampled turn${metrics.turnTelemetrySlowFirstTokenCount === 1 ? "" : "s"} took over 15s to start responding.`,
+    );
+  } else if (metrics.turnTelemetrySlowTurnCount > 0) {
+    guidance.push(
+      `Split or compact slow active work: ${Number(metrics.turnTelemetrySlowTurnCount).toLocaleString()} sampled turn${metrics.turnTelemetrySlowTurnCount === 1 ? "" : "s"} took over 3 minutes.`,
+    );
+  } else if (metrics.turnTelemetryContextNearLimitCount > 0) {
+    guidance.push(
+      `Use /compact sooner in long threads; ${Number(metrics.turnTelemetryContextNearLimitCount).toLocaleString()} sampled token-count event${metrics.turnTelemetryContextNearLimitCount === 1 ? " was" : "s were"} near the model context window.`,
     );
   }
   if (metrics.cloudHandoffHasGitRepo && !metrics.cloudHandoffHasGithubRemote) {
@@ -9506,7 +10007,7 @@ function scanProofMetrics(scan) {
 function scoreMetricsFromScan(scan) {
   const categories = scan?.categories || {};
   return {
-    scoreModel: "local-state-v13",
+    scoreModel: "local-state-v14",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -9524,6 +10025,13 @@ function scoreMetricsFromScan(scan) {
     taskClarityMissingDoneMarkerFileCount: categories.taskClarity?.missingDoneMarkerFileCount || 0,
     taskClarityMissingVerificationMarkerFileCount: categories.taskClarity?.missingVerificationMarkerFileCount || 0,
     taskClarityUnparsedFileCount: categories.taskClarity?.unparsedFileCount || 0,
+    turnTelemetrySlowTurnCount: categories.turnTelemetry?.slowTurnCount || 0,
+    turnTelemetryVerySlowTurnCount: categories.turnTelemetry?.verySlowTurnCount || 0,
+    turnTelemetrySlowFirstTokenCount: categories.turnTelemetry?.slowFirstTokenCount || 0,
+    turnTelemetryVerySlowFirstTokenCount: categories.turnTelemetry?.verySlowFirstTokenCount || 0,
+    turnTelemetryLowRateLimitCount: categories.turnTelemetry?.lowRateLimitCount || 0,
+    turnTelemetryRateLimitReachedCount: categories.turnTelemetry?.rateLimitReachedCount || 0,
+    turnTelemetryContextNearLimitCount: categories.turnTelemetry?.contextNearLimitCount || 0,
     codexWorktreeBytes: categories.codexWorktrees?.bytes || 0,
     codexWorktreeCount: categories.codexWorktrees?.worktreeCount || 0,
     codexWorktreeLargeCount: categories.codexWorktrees?.largeWorktreeCount || 0,
@@ -10223,6 +10731,32 @@ function benchmarkDeltas(current, previous) {
     "taskClarityMissingVerificationMarkerFileCount",
     "taskClarityHighChurnFileCount",
     "taskClarityUnparsedFileCount",
+    "turnTelemetryScannedFileCount",
+    "turnTelemetryCompletedTurnCount",
+    "turnTelemetryDurationCount",
+    "turnTelemetryMaxDurationMs",
+    "turnTelemetrySlowTurnCount",
+    "turnTelemetryVerySlowTurnCount",
+    "turnTelemetryFirstTokenCount",
+    "turnTelemetryMaxFirstTokenMs",
+    "turnTelemetrySlowFirstTokenCount",
+    "turnTelemetryVerySlowFirstTokenCount",
+    "turnTelemetryTokenCountEventCount",
+    "turnTelemetryRateLimitEventCount",
+    "turnTelemetryLowRateLimitCount",
+    "turnTelemetryRateLimitReachedCount",
+    "turnTelemetryCreditLimitedCount",
+    "turnTelemetryUsageEventCount",
+    "turnTelemetryTotalInputTokens",
+    "turnTelemetryTotalOutputTokens",
+    "turnTelemetryTotalReasoningTokens",
+    "turnTelemetryTotalCachedInputTokens",
+    "turnTelemetryTotalTokens",
+    "turnTelemetryMaxContextTokens",
+    "turnTelemetryMaxContextWindow",
+    "turnTelemetryMaxContextUsedPct",
+    "turnTelemetryContextNearLimitCount",
+    "turnTelemetryUnparsedFileCount",
     "cloudHandoffReady",
     "cloudHandoffHasGithubRemote",
     "cloudHandoffDirtyCount",
@@ -10358,6 +10892,38 @@ function summarizeBenchmarkEntry(entry) {
     taskClarityHighChurnFileCount: entry.metrics.taskClarityHighChurnFileCount || 0,
     taskClarityCappedFileCount: entry.metrics.taskClarityCappedFileCount || 0,
     taskClarityUnparsedFileCount: entry.metrics.taskClarityUnparsedFileCount || 0,
+    turnTelemetryTone: entry.metrics.turnTelemetryTone || "low",
+    turnTelemetryScannedFileCount: entry.metrics.turnTelemetryScannedFileCount || 0,
+    turnTelemetryFileCount: entry.metrics.turnTelemetryFileCount || 0,
+    turnTelemetrySampledBytes: entry.metrics.turnTelemetrySampledBytes || 0,
+    turnTelemetryParsedLineCount: entry.metrics.turnTelemetryParsedLineCount || 0,
+    turnTelemetryCompletedTurnCount: entry.metrics.turnTelemetryCompletedTurnCount || 0,
+    turnTelemetryAbortedTurnCount: entry.metrics.turnTelemetryAbortedTurnCount || 0,
+    turnTelemetryDurationCount: entry.metrics.turnTelemetryDurationCount || 0,
+    turnTelemetryMaxDurationMs: entry.metrics.turnTelemetryMaxDurationMs || 0,
+    turnTelemetrySlowTurnCount: entry.metrics.turnTelemetrySlowTurnCount || 0,
+    turnTelemetryVerySlowTurnCount: entry.metrics.turnTelemetryVerySlowTurnCount || 0,
+    turnTelemetryFirstTokenCount: entry.metrics.turnTelemetryFirstTokenCount || 0,
+    turnTelemetryMaxFirstTokenMs: entry.metrics.turnTelemetryMaxFirstTokenMs || 0,
+    turnTelemetrySlowFirstTokenCount: entry.metrics.turnTelemetrySlowFirstTokenCount || 0,
+    turnTelemetryVerySlowFirstTokenCount: entry.metrics.turnTelemetryVerySlowFirstTokenCount || 0,
+    turnTelemetryTokenCountEventCount: entry.metrics.turnTelemetryTokenCountEventCount || 0,
+    turnTelemetryRateLimitEventCount: entry.metrics.turnTelemetryRateLimitEventCount || 0,
+    turnTelemetryLowRateLimitCount: entry.metrics.turnTelemetryLowRateLimitCount || 0,
+    turnTelemetryRateLimitReachedCount: entry.metrics.turnTelemetryRateLimitReachedCount || 0,
+    turnTelemetryCreditLimitedCount: entry.metrics.turnTelemetryCreditLimitedCount || 0,
+    turnTelemetryUsageEventCount: entry.metrics.turnTelemetryUsageEventCount || 0,
+    turnTelemetryTotalInputTokens: entry.metrics.turnTelemetryTotalInputTokens || 0,
+    turnTelemetryTotalOutputTokens: entry.metrics.turnTelemetryTotalOutputTokens || 0,
+    turnTelemetryTotalReasoningTokens: entry.metrics.turnTelemetryTotalReasoningTokens || 0,
+    turnTelemetryTotalCachedInputTokens: entry.metrics.turnTelemetryTotalCachedInputTokens || 0,
+    turnTelemetryTotalTokens: entry.metrics.turnTelemetryTotalTokens || 0,
+    turnTelemetryMaxContextTokens: entry.metrics.turnTelemetryMaxContextTokens || 0,
+    turnTelemetryMaxContextWindow: entry.metrics.turnTelemetryMaxContextWindow || 0,
+    turnTelemetryMaxContextUsedPct: entry.metrics.turnTelemetryMaxContextUsedPct || 0,
+    turnTelemetryContextNearLimitCount: entry.metrics.turnTelemetryContextNearLimitCount || 0,
+    turnTelemetryCappedFileCount: entry.metrics.turnTelemetryCappedFileCount || 0,
+    turnTelemetryUnparsedFileCount: entry.metrics.turnTelemetryUnparsedFileCount || 0,
     cloudHandoffTone: entry.metrics.cloudHandoffTone || "low",
     cloudHandoffReady: Boolean(entry.metrics.cloudHandoffReady),
     cloudHandoffProjectReady: Boolean(entry.metrics.cloudHandoffProjectReady),
@@ -10611,6 +11177,20 @@ export async function benchmarkHistory(limit = 12) {
           latest.taskClarityMissingVerificationMarkerFileCount - oldest.taskClarityMissingVerificationMarkerFileCount,
         taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - oldest.taskClarityHighChurnFileCount,
         taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - oldest.taskClarityUnparsedFileCount,
+        turnTelemetryCompletedTurnCount: latest.turnTelemetryCompletedTurnCount - oldest.turnTelemetryCompletedTurnCount,
+        turnTelemetryMaxDurationMs: latest.turnTelemetryMaxDurationMs - oldest.turnTelemetryMaxDurationMs,
+        turnTelemetrySlowTurnCount: latest.turnTelemetrySlowTurnCount - oldest.turnTelemetrySlowTurnCount,
+        turnTelemetryVerySlowTurnCount: latest.turnTelemetryVerySlowTurnCount - oldest.turnTelemetryVerySlowTurnCount,
+        turnTelemetryMaxFirstTokenMs: latest.turnTelemetryMaxFirstTokenMs - oldest.turnTelemetryMaxFirstTokenMs,
+        turnTelemetrySlowFirstTokenCount: latest.turnTelemetrySlowFirstTokenCount - oldest.turnTelemetrySlowFirstTokenCount,
+        turnTelemetryVerySlowFirstTokenCount: latest.turnTelemetryVerySlowFirstTokenCount - oldest.turnTelemetryVerySlowFirstTokenCount,
+        turnTelemetryRateLimitEventCount: latest.turnTelemetryRateLimitEventCount - oldest.turnTelemetryRateLimitEventCount,
+        turnTelemetryLowRateLimitCount: latest.turnTelemetryLowRateLimitCount - oldest.turnTelemetryLowRateLimitCount,
+        turnTelemetryRateLimitReachedCount: latest.turnTelemetryRateLimitReachedCount - oldest.turnTelemetryRateLimitReachedCount,
+        turnTelemetryTotalTokens: latest.turnTelemetryTotalTokens - oldest.turnTelemetryTotalTokens,
+        turnTelemetryMaxContextTokens: latest.turnTelemetryMaxContextTokens - oldest.turnTelemetryMaxContextTokens,
+        turnTelemetryMaxContextUsedPct: latest.turnTelemetryMaxContextUsedPct - oldest.turnTelemetryMaxContextUsedPct,
+        turnTelemetryContextNearLimitCount: latest.turnTelemetryContextNearLimitCount - oldest.turnTelemetryContextNearLimitCount,
         cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(oldest.cloudHandoffReady),
         cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(oldest.cloudHandoffHasGithubRemote),
         cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - oldest.cloudHandoffDirtyCount,
@@ -10721,6 +11301,20 @@ export async function benchmarkHistory(limit = 12) {
           latest.taskClarityMissingVerificationMarkerFileCount - previous.taskClarityMissingVerificationMarkerFileCount,
         taskClarityHighChurnFileCount: latest.taskClarityHighChurnFileCount - previous.taskClarityHighChurnFileCount,
         taskClarityUnparsedFileCount: latest.taskClarityUnparsedFileCount - previous.taskClarityUnparsedFileCount,
+        turnTelemetryCompletedTurnCount: latest.turnTelemetryCompletedTurnCount - previous.turnTelemetryCompletedTurnCount,
+        turnTelemetryMaxDurationMs: latest.turnTelemetryMaxDurationMs - previous.turnTelemetryMaxDurationMs,
+        turnTelemetrySlowTurnCount: latest.turnTelemetrySlowTurnCount - previous.turnTelemetrySlowTurnCount,
+        turnTelemetryVerySlowTurnCount: latest.turnTelemetryVerySlowTurnCount - previous.turnTelemetryVerySlowTurnCount,
+        turnTelemetryMaxFirstTokenMs: latest.turnTelemetryMaxFirstTokenMs - previous.turnTelemetryMaxFirstTokenMs,
+        turnTelemetrySlowFirstTokenCount: latest.turnTelemetrySlowFirstTokenCount - previous.turnTelemetrySlowFirstTokenCount,
+        turnTelemetryVerySlowFirstTokenCount: latest.turnTelemetryVerySlowFirstTokenCount - previous.turnTelemetryVerySlowFirstTokenCount,
+        turnTelemetryRateLimitEventCount: latest.turnTelemetryRateLimitEventCount - previous.turnTelemetryRateLimitEventCount,
+        turnTelemetryLowRateLimitCount: latest.turnTelemetryLowRateLimitCount - previous.turnTelemetryLowRateLimitCount,
+        turnTelemetryRateLimitReachedCount: latest.turnTelemetryRateLimitReachedCount - previous.turnTelemetryRateLimitReachedCount,
+        turnTelemetryTotalTokens: latest.turnTelemetryTotalTokens - previous.turnTelemetryTotalTokens,
+        turnTelemetryMaxContextTokens: latest.turnTelemetryMaxContextTokens - previous.turnTelemetryMaxContextTokens,
+        turnTelemetryMaxContextUsedPct: latest.turnTelemetryMaxContextUsedPct - previous.turnTelemetryMaxContextUsedPct,
+        turnTelemetryContextNearLimitCount: latest.turnTelemetryContextNearLimitCount - previous.turnTelemetryContextNearLimitCount,
         cloudHandoffReady: Number(latest.cloudHandoffReady) - Number(previous.cloudHandoffReady),
         cloudHandoffHasGithubRemote: Number(latest.cloudHandoffHasGithubRemote) - Number(previous.cloudHandoffHasGithubRemote),
         cloudHandoffDirtyCount: latest.cloudHandoffDirtyCount - previous.cloudHandoffDirtyCount,
@@ -10854,6 +11448,7 @@ export async function runBenchmark() {
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
   const modelProvider = scan.codexConfig?.modelProvider || emptyModelProviderSummary();
   const taskClarity = scan.categories?.taskClarity || emptyTaskClaritySummary(scan.categories?.activeSessions || {});
+  const turnTelemetry = scan.categories?.turnTelemetry || emptyTurnTelemetrySummary(scan.categories?.activeSessions || {});
   const cloudHandoff = scan.codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const modelName = scan.codexConfig?.model || "default";
   const modelNameText = String(modelName || "").toLowerCase();
@@ -10867,7 +11462,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v13",
+    scoreModel: "local-state-v14",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -10915,6 +11510,38 @@ export async function runBenchmark() {
     taskClarityHighChurnFileCount: taskClarity.highChurnFileCount || 0,
     taskClarityCappedFileCount: taskClarity.cappedFileCount || 0,
     taskClarityUnparsedFileCount: taskClarity.unparsedFileCount || 0,
+    turnTelemetryTone: turnTelemetry.tone || "low",
+    turnTelemetryScannedFileCount: turnTelemetry.scannedFileCount || 0,
+    turnTelemetryFileCount: turnTelemetry.fileCount || 0,
+    turnTelemetrySampledBytes: turnTelemetry.sampledBytes || 0,
+    turnTelemetryParsedLineCount: turnTelemetry.parsedLineCount || 0,
+    turnTelemetryCompletedTurnCount: turnTelemetry.completedTurnCount || 0,
+    turnTelemetryAbortedTurnCount: turnTelemetry.abortedTurnCount || 0,
+    turnTelemetryDurationCount: turnTelemetry.durationCount || 0,
+    turnTelemetryMaxDurationMs: turnTelemetry.maxDurationMs || 0,
+    turnTelemetrySlowTurnCount: turnTelemetry.slowTurnCount || 0,
+    turnTelemetryVerySlowTurnCount: turnTelemetry.verySlowTurnCount || 0,
+    turnTelemetryFirstTokenCount: turnTelemetry.firstTokenCount || 0,
+    turnTelemetryMaxFirstTokenMs: turnTelemetry.maxFirstTokenMs || 0,
+    turnTelemetrySlowFirstTokenCount: turnTelemetry.slowFirstTokenCount || 0,
+    turnTelemetryVerySlowFirstTokenCount: turnTelemetry.verySlowFirstTokenCount || 0,
+    turnTelemetryTokenCountEventCount: turnTelemetry.tokenCountEventCount || 0,
+    turnTelemetryRateLimitEventCount: turnTelemetry.rateLimitEventCount || 0,
+    turnTelemetryLowRateLimitCount: turnTelemetry.lowRateLimitCount || 0,
+    turnTelemetryRateLimitReachedCount: turnTelemetry.rateLimitReachedCount || 0,
+    turnTelemetryCreditLimitedCount: turnTelemetry.creditLimitedCount || 0,
+    turnTelemetryUsageEventCount: turnTelemetry.usageEventCount || 0,
+    turnTelemetryTotalInputTokens: turnTelemetry.totalInputTokens || 0,
+    turnTelemetryTotalOutputTokens: turnTelemetry.totalOutputTokens || 0,
+    turnTelemetryTotalReasoningTokens: turnTelemetry.totalReasoningTokens || 0,
+    turnTelemetryTotalCachedInputTokens: turnTelemetry.totalCachedInputTokens || 0,
+    turnTelemetryTotalTokens: turnTelemetry.totalTokens || 0,
+    turnTelemetryMaxContextTokens: turnTelemetry.maxContextTokens || 0,
+    turnTelemetryMaxContextWindow: turnTelemetry.maxContextWindow || 0,
+    turnTelemetryMaxContextUsedPct: turnTelemetry.maxContextUsedPct || 0,
+    turnTelemetryContextNearLimitCount: turnTelemetry.contextNearLimitCount || 0,
+    turnTelemetryCappedFileCount: turnTelemetry.cappedFileCount || 0,
+    turnTelemetryUnparsedFileCount: turnTelemetry.unparsedFileCount || 0,
     cloudHandoffTone: cloudHandoff.tone || "low",
     cloudHandoffReady: Boolean(cloudHandoff.cloudReady),
     cloudHandoffProjectReady: Boolean(cloudHandoff.projectReady),
@@ -11750,8 +12377,26 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPat
 
 if (isMain) {
   try {
-    const { url } = await startServer();
+    const started = await startServer();
+    runningServer = started.server;
+    const { url } = started;
     console.log(`Codex Refit running at ${url}`);
+    keepAliveTimer = setInterval(() => {}, 60 * 60 * 1000);
+    await new Promise((resolve) => {
+      const shutdown = () => {
+        if (keepAliveTimer) {
+          clearInterval(keepAliveTimer);
+          keepAliveTimer = null;
+        }
+        if (!runningServer?.listening) {
+          resolve();
+          return;
+        }
+        runningServer.close(() => resolve());
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+    });
   } catch (error) {
     console.error(error);
     process.exit(1);

@@ -607,6 +607,7 @@ function renderScan(scan) {
     scan.categories.activeSessions,
     scan.categories.sessionMedia,
     scan.categories.taskClarity,
+    scan.categories.turnTelemetry,
     scan.categories.activeStaleSessions,
     scan.categories.archivedSessionsInActiveTree,
     scan.categories.archivedSessions,
