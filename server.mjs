@@ -875,6 +875,31 @@ function emptyInstructionStackSummary() {
   };
 }
 
+function emptyInstructionOverrideSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "Defaults",
+    action: "Use sparingly",
+    detail: "No custom instruction or compact-prompt overrides were found in the active Codex config layers Refit inspected.",
+    configuredCount: 0,
+    effectiveCount: 0,
+    developerInstructionsConfigured: false,
+    modelInstructionsFileConfigured: false,
+    compactPromptConfigured: false,
+    compactPromptFileConfigured: false,
+    developerInstructionChars: 0,
+    compactPromptChars: 0,
+    modelInstructionFileBytes: 0,
+    compactPromptFileBytes: 0,
+    instructionOverrideBytes: 0,
+    compactOverrideBytes: 0,
+    missingFileCount: 0,
+    largeOverrideCount: 0,
+    sources: [],
+  };
+}
+
 async function gitRootFor(startPath) {
   try {
     const { stdout } = await execFileAsync("git", ["-C", startPath, "rev-parse", "--show-toplevel"], {
@@ -1086,6 +1111,236 @@ async function getInstructionStackSummary({ values = {}, currentProject = null }
     currentProjectPath: displayPath(projectRoot),
     currentWorkPath: displayPath(workPath),
     files,
+  };
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function tomlStringAssignment(text, key) {
+  const source = String(text || "");
+  const escaped = escapeRegExp(key);
+  const triple = source.match(new RegExp(`^\\s*${escaped}\\s*=\\s*("""|''')([\\s\\S]*?)\\1`, "m"));
+  if (triple) {
+    return {
+      present: true,
+      value: triple[2],
+      chars: triple[2].length,
+      bytes: Buffer.byteLength(triple[2], "utf8"),
+      multiline: true,
+    };
+  }
+
+  const line = source.match(new RegExp(`^\\s*${escaped}\\s*=\\s*(.+)$`, "m"));
+  if (!line) {
+    return { present: false, value: "", chars: 0, bytes: 0, multiline: false };
+  }
+
+  const value = parseTomlScalar(line[1]);
+  const stringValue = value === undefined || value === null ? "" : String(value);
+  return {
+    present: true,
+    value: stringValue,
+    chars: stringValue.length,
+    bytes: Buffer.byteLength(stringValue, "utf8"),
+    multiline: false,
+  };
+}
+
+function resolveConfigPathValue(value, configPath) {
+  if (!value) return null;
+  const text = String(value);
+  return path.isAbsolute(text) ? text : path.resolve(path.dirname(configPath), text);
+}
+
+async function projectConfigPathsFor(currentProject = null) {
+  const projectRoot = await resolveInstructionProjectRoot(currentProject);
+  const workPath = resolveInstructionWorkPath(projectRoot);
+  const dirs = directoryChain(projectRoot, workPath);
+  const configs = [];
+
+  for (const dir of dirs) {
+    const configPath = path.join(dir, ".codex", "config.toml");
+    if (await exists(configPath)) configs.push(configPath);
+  }
+
+  return configs;
+}
+
+async function collectInstructionOverrideSource({ configPath, text, scope }) {
+  const entries = [];
+  const addInline = (key, label) => {
+    const assignment = tomlStringAssignment(text, key);
+    if (!assignment.present) return;
+    entries.push({
+      key,
+      label,
+      scope,
+      configPath: displayPath(configPath),
+      type: "inline",
+      chars: assignment.chars,
+      bytes: assignment.bytes,
+      multiline: assignment.multiline,
+      exists: true,
+      effective: false,
+    });
+  };
+  const addFile = async (key, label) => {
+    const assignment = tomlStringAssignment(text, key);
+    if (!assignment.present) return;
+    const resolved = resolveConfigPathValue(assignment.value, configPath);
+    const stats = resolved ? await statOrNull(resolved) : null;
+    entries.push({
+      key,
+      label,
+      scope,
+      configPath: displayPath(configPath),
+      type: "file",
+      filePath: resolved ? displayPath(resolved) : null,
+      exists: Boolean(stats?.isFile()),
+      bytes: stats?.isFile() ? stats.size : 0,
+      chars: 0,
+      missing: !stats?.isFile(),
+      effective: false,
+    });
+  };
+
+  addInline("developer_instructions", "Developer Instructions");
+  addInline("compact_prompt", "Compact Prompt");
+  await addFile("model_instructions_file", "Model Instructions File");
+  await addFile("experimental_compact_prompt_file", "Compact Prompt File");
+  return entries;
+}
+
+async function getInstructionOverrideSummary({ globalConfigText = "", currentProject = null } = {}) {
+  const sources = [];
+  if (globalConfigText) {
+    sources.push({
+      scope: "global",
+      configPath: paths.configToml,
+      text: globalConfigText,
+    });
+  }
+
+  const projectConfigPaths = await projectConfigPathsFor(currentProject);
+  for (const configPath of projectConfigPaths) {
+    try {
+      sources.push({
+        scope: "project",
+        configPath,
+        text: await fs.readFile(configPath, "utf8"),
+      });
+    } catch {
+      // Missing project config files are ignored; they can disappear while a scan is running.
+    }
+  }
+
+  const entries = [];
+  for (const source of sources) {
+    entries.push(...(await collectInstructionOverrideSource(source)));
+  }
+  if (!entries.length) return emptyInstructionOverrideSummary();
+
+  const effectiveByKey = new Map();
+  for (const entry of entries) {
+    effectiveByKey.set(entry.key, entry);
+  }
+  const effectiveEntries = entries.map((entry) => ({
+    ...entry,
+    effective: effectiveByKey.get(entry.key) === entry,
+  }));
+  const effective = effectiveEntries.filter((entry) => entry.effective);
+  const configuredCount = entries.length;
+  const missingFileCount = effective.filter((entry) => entry.missing).length;
+  const developerEntry = effective.find((entry) => entry.key === "developer_instructions");
+  const compactEntry = effective.find((entry) => entry.key === "compact_prompt");
+  const modelFileEntry = effective.find((entry) => entry.key === "model_instructions_file");
+  const compactFileEntry = effective.find((entry) => entry.key === "experimental_compact_prompt_file");
+  const developerInstructionChars = developerEntry?.chars || 0;
+  const compactPromptChars = compactEntry?.chars || 0;
+  const modelInstructionFileBytes = modelFileEntry?.bytes || 0;
+  const compactPromptFileBytes = compactFileEntry?.bytes || 0;
+  const instructionOverrideBytes = (developerEntry?.bytes || 0) + modelInstructionFileBytes;
+  const compactOverrideBytes = (compactEntry?.bytes || 0) + compactPromptFileBytes;
+  const largeOverrideCount = effective.filter((entry) => (entry.bytes || 0) >= largeInstructionFileBytes).length;
+  const developerInstructionsConfigured = Boolean(developerEntry);
+  const modelInstructionsFileConfigured = Boolean(modelFileEntry);
+  const compactPromptConfigured = Boolean(compactEntry);
+  const compactPromptFileConfigured = Boolean(compactFileEntry);
+  const highLoad =
+    missingFileCount > 0 ||
+    instructionOverrideBytes >= 48 * 1024 ||
+    developerInstructionChars >= 24 * 1024 ||
+    largeOverrideCount >= 3;
+  const mediumLoad =
+    highLoad ||
+    instructionOverrideBytes >= 12 * 1024 ||
+    compactOverrideBytes >= 12 * 1024 ||
+    developerInstructionChars >= 4 * 1024 ||
+    modelInstructionsFileConfigured ||
+    compactPromptConfigured ||
+    compactPromptFileConfigured;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const effectiveCount = effective.length;
+  const label = effectiveCount
+    ? `${effectiveCount.toLocaleString()} override${effectiveCount === 1 ? "" : "s"}`
+    : "Defaults";
+  const action =
+    tone === "low"
+      ? "Keep rare"
+      : missingFileCount
+        ? "Fix file paths"
+        : modelInstructionsFileConfigured
+          ? "Review base override"
+          : "Trim overrides";
+  const detail =
+    tone === "low"
+      ? "Custom instruction overrides are present but small. Keep them rare so AGENTS.md and task prompts remain the main behavior controls."
+      : [
+          "Codex can inject developer_instructions before AGENTS.md, load model_instructions_file instead of the built-in base instructions, and use compact prompt overrides during summarization.",
+          `Refit found ${effectiveCount.toLocaleString()} effective override${effectiveCount === 1 ? "" : "s"} totaling ${formatBytesServer(instructionOverrideBytes + compactOverrideBytes)}.`,
+          modelInstructionsFileConfigured ? "A model_instructions_file override changes the base behavior Codex starts from." : null,
+          compactPromptConfigured || compactPromptFileConfigured ? "A compact prompt override can affect long-thread summarization quality." : null,
+          missingFileCount ? `${missingFileCount.toLocaleString()} referenced instruction file${missingFileCount === 1 ? "" : "s"} ${pluralVerb(missingFileCount)} missing.` : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    configuredCount,
+    effectiveCount,
+    developerInstructionsConfigured,
+    modelInstructionsFileConfigured,
+    compactPromptConfigured,
+    compactPromptFileConfigured,
+    developerInstructionChars,
+    compactPromptChars,
+    modelInstructionFileBytes,
+    compactPromptFileBytes,
+    instructionOverrideBytes,
+    compactOverrideBytes,
+    missingFileCount,
+    largeOverrideCount,
+    sources: effectiveEntries.map((entry) => ({
+      key: entry.key,
+      label: entry.label,
+      scope: entry.scope,
+      configPath: entry.configPath,
+      type: entry.type,
+      filePath: entry.filePath || null,
+      exists: entry.exists,
+      missing: Boolean(entry.missing),
+      bytes: entry.bytes || 0,
+      chars: entry.chars || 0,
+      multiline: Boolean(entry.multiline),
+      effective: Boolean(entry.effective),
+    })),
   };
 }
 
@@ -2834,6 +3089,7 @@ async function getCodexConfigSummary() {
     shellEnvironmentSummary: buildShellEnvironmentSummary({}),
     contextBudgetSummary: buildContextBudgetSummary({}),
     instructionStack: emptyInstructionStackSummary(),
+    instructionOverrides: emptyInstructionOverrideSummary(),
     goalsFeature: false,
     hooksFeature: true,
     hookSummary: {
@@ -2910,6 +3166,7 @@ async function getCodexConfigSummary() {
   if (!(await exists(paths.configToml))) {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
+    summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
     return summary;
   }
   summary.exists = true;
@@ -2987,6 +3244,10 @@ async function getCodexConfigSummary() {
     }
     summary.instructionStack = await getInstructionStackSummary({
       values: mcpValues,
+      currentProject: summary.projectReadiness.currentProject,
+    });
+    summary.instructionOverrides = await getInstructionOverrideSummary({
+      globalConfigText: text,
       currentProject: summary.projectReadiness.currentProject,
     });
     summary.mcpSummary = buildMcpConfigSummary(mcpValues, mcpSections);
@@ -3085,6 +3346,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
+  const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -3157,6 +3419,33 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "",
         "# Optional ~/.codex/config.toml if critical project guidance is being truncated:",
         `project_doc_max_bytes = ${Number(instructionStack.projectDocMaxBytes || defaultProjectDocMaxBytes)}`,
+      ].join("\n"),
+    });
+  }
+
+  if (instructionOverrides.status === "ready" && instructionOverrides.tone !== "low") {
+    const overrideConfigPaths = [
+      ...new Set((instructionOverrides.sources || []).filter((source) => source.effective).map((source) => source.configPath).filter(Boolean)),
+    ];
+    addFix({
+      id: "instruction-overrides",
+      label: "Instruction Overrides",
+      value: instructionOverrides.label,
+      tone: instructionOverrides.tone === "high" ? "high" : "medium",
+      action: instructionOverrides.action || "Review overrides",
+      detail:
+        "Custom instruction overrides can change what Codex loads before normal repo guidance. Keep them small, intentional, and easy to remove.",
+      snippet: [
+        "# Review active override config file(s):",
+        ...(overrideConfigPaths.length ? overrideConfigPaths.map((configPath) => `# ${configPath}`) : [`# ${paths.configToml}`]),
+        "",
+        "# Review these keys if they are present:",
+        "# developer_instructions = \"...\"",
+        "# model_instructions_file = \"/path/to/instructions.txt\"",
+        "# compact_prompt = \"...\"",
+        "# experimental_compact_prompt_file = \"/path/to/compact_prompt.txt\"",
+        "",
+        "# Prefer AGENTS.md for durable repo guidance and skills for reusable workflows.",
       ].join("\n"),
     });
   }
@@ -3554,6 +3843,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const shellEnvironmentSummary = codexConfig?.shellEnvironmentSummary || buildShellEnvironmentSummary({});
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
+  const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -3797,6 +4087,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       action: instructionStack.action || "Keep practical",
       priority: instructionStack.tone === "high" ? 87 : instructionStack.tone === "medium" ? 65 : instructionStack.emptyFileCount ? 38 : 19,
       detail: instructionStack.detail,
+    },
+    {
+      id: "instruction-overrides",
+      label: "Instruction Overrides",
+      value: instructionOverrides.label,
+      tone: instructionOverrides.tone,
+      action: instructionOverrides.action,
+      priority: instructionOverrides.tone === "high" ? 86 : instructionOverrides.tone === "medium" ? 64 : instructionOverrides.configuredCount ? 34 : 17,
+      detail: instructionOverrides.detail,
     },
     {
       id: "hooks",
@@ -4229,6 +4528,23 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (instructionOverrides.status === "ready" && instructionOverrides.tone !== "low") {
+    addRecommendation({
+      id: "instruction-overrides",
+      label: "Instruction Overrides",
+      value: instructionOverrides.label,
+      action: instructionOverrides.action || "Review overrides",
+      tone: instructionOverrides.tone === "high" ? "high" : "medium",
+      priority: instructionOverrides.tone === "high" ? 82 : 58,
+      detail:
+        instructionOverrides.missingFileCount > 0
+          ? `${instructionOverrides.detail} Fix or remove missing instruction file references before debugging prompt quality.`
+          : instructionOverrides.modelInstructionsFileConfigured
+            ? `${instructionOverrides.detail} Prefer this only when you intentionally need to replace the default Codex base behavior.`
+            : instructionOverrides.detail,
+    });
+  }
+
   if (currentProject && !currentProject.ready) {
     addRecommendation({
       id: "project-playbook",
@@ -4391,6 +4707,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     shellEnvironmentSummary,
     contextBudgetSummary,
     instructionStack,
+    instructionOverrides,
     goalsFeature,
     webSearchMode,
     hooksFeature,
@@ -4868,6 +5185,9 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(5, Math.max(0, Number(metrics.instructionTotalBytes || 0) - 24 * 1024) / 8192);
   if (metrics.instructionProjectOverCap) score -= 5;
   if (metrics.instructionProjectNearCap) score -= 2;
+  score -= Math.min(5, Math.max(0, Number(metrics.instructionOverrideBytes || 0) - 12 * 1024) / 8192);
+  if (metrics.instructionOverrideMissingFileCount) score -= Math.min(6, Number(metrics.instructionOverrideMissingFileCount || 0) * 3);
+  if (metrics.modelInstructionsFileConfigured) score -= 2;
   if (metrics.memoriesUseMemories) score -= Math.min(5, ((Number(metrics.memoryBytes || 0) / 1024 ** 2) || 0) / 3);
   score -= Math.min(5, Math.max(0, Number(metrics.skillEstimatedCatalogChars || 0) - skillCatalogBudgetChars) / 4000);
   score -= Math.min(4, Math.max(0, Number(metrics.skillCount || 0) - 40) * 0.08);
@@ -4981,6 +5301,17 @@ function benchmarkGuidance(metrics) {
     guidance.push(`Review AGENTS guidance; Codex starts with ${formatBytesServer(metrics.instructionTotalBytes)} of selected instruction files.`);
   } else if (metrics.instructionEmptyFileCount > 0) {
     guidance.push(`Fill in or remove ${Number(metrics.instructionEmptyFileCount).toLocaleString()} empty AGENTS instruction file${metrics.instructionEmptyFileCount === 1 ? "" : "s"}.`);
+  }
+  if (metrics.instructionOverrideMissingFileCount > 0) {
+    guidance.push(
+      `Fix ${Number(metrics.instructionOverrideMissingFileCount).toLocaleString()} missing instruction override file reference${metrics.instructionOverrideMissingFileCount === 1 ? "" : "s"} in Codex config.`,
+    );
+  } else if (metrics.modelInstructionsFileConfigured) {
+    guidance.push("Review model_instructions_file; it replaces the default Codex base instructions and can change every run.");
+  } else if (metrics.instructionOverrideBytes >= 12 * 1024) {
+    guidance.push(`Trim custom instruction overrides; Refit sees ${formatBytesServer(metrics.instructionOverrideBytes)} before AGENTS guidance.`);
+  } else if (metrics.compactOverrideBytes >= 12 * 1024) {
+    guidance.push(`Review compact prompt overrides; ${formatBytesServer(metrics.compactOverrideBytes)} can affect long-thread summarization.`);
   }
   if (metrics.stateQueryMs > 250) guidance.push("Optimize the state database because thread queries are slow.");
   if (metrics.staleArchivedPointers > 0) {
@@ -5642,6 +5973,10 @@ function benchmarkDeltas(current, previous) {
     "instructionProjectCandidateBytes",
     "instructionSelectedFileCount",
     "instructionEmptyFileCount",
+    "instructionOverrideConfiguredCount",
+    "instructionOverrideBytes",
+    "compactOverrideBytes",
+    "instructionOverrideMissingFileCount",
     "hookCommandCount",
     "hookTurnScopedCommandCount",
     "hookBroadMatcherCount",
@@ -5711,6 +6046,19 @@ function summarizeBenchmarkEntry(entry) {
     instructionProjectDocMaxBytes: entry.metrics.instructionProjectDocMaxBytes || defaultProjectDocMaxBytes,
     instructionProjectNearCap: Boolean(entry.metrics.instructionProjectNearCap),
     instructionProjectOverCap: Boolean(entry.metrics.instructionProjectOverCap),
+    instructionOverrideConfiguredCount: entry.metrics.instructionOverrideConfiguredCount || 0,
+    instructionOverrideEffectiveCount: entry.metrics.instructionOverrideEffectiveCount || 0,
+    instructionOverrideBytes: entry.metrics.instructionOverrideBytes || 0,
+    compactOverrideBytes: entry.metrics.compactOverrideBytes || 0,
+    developerInstructionChars: entry.metrics.developerInstructionChars || 0,
+    compactPromptChars: entry.metrics.compactPromptChars || 0,
+    modelInstructionFileBytes: entry.metrics.modelInstructionFileBytes || 0,
+    compactPromptFileBytes: entry.metrics.compactPromptFileBytes || 0,
+    instructionOverrideMissingFileCount: entry.metrics.instructionOverrideMissingFileCount || 0,
+    developerInstructionsConfigured: Boolean(entry.metrics.developerInstructionsConfigured),
+    modelInstructionsFileConfigured: Boolean(entry.metrics.modelInstructionsFileConfigured),
+    compactPromptConfigured: Boolean(entry.metrics.compactPromptConfigured),
+    compactPromptFileConfigured: Boolean(entry.metrics.compactPromptFileConfigured),
     hooksFeature: entry.metrics.hooksFeature !== false,
     hookCommandCount: entry.metrics.hookCommandCount || 0,
     hookTurnScopedCommandCount: entry.metrics.hookTurnScopedCommandCount || 0,
@@ -5768,6 +6116,8 @@ export async function benchmarkHistory(limit = 12) {
         instructionTotalBytes: latest.instructionTotalBytes - oldest.instructionTotalBytes,
         instructionProjectCandidateBytes: latest.instructionProjectCandidateBytes - oldest.instructionProjectCandidateBytes,
         instructionSelectedFileCount: latest.instructionSelectedFileCount - oldest.instructionSelectedFileCount,
+        instructionOverrideBytes: latest.instructionOverrideBytes - oldest.instructionOverrideBytes,
+        compactOverrideBytes: latest.compactOverrideBytes - oldest.compactOverrideBytes,
         memoryBytes: latest.memoryBytes - oldest.memoryBytes,
         skillCount: latest.skillCount - oldest.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - oldest.skillEstimatedCatalogChars,
@@ -5789,6 +6139,7 @@ export async function benchmarkHistory(limit = 12) {
         toolOutputTokenLimit: latest.toolOutputTokenLimit - previous.toolOutputTokenLimit,
         instructionTotalBytes: latest.instructionTotalBytes - previous.instructionTotalBytes,
         instructionProjectCandidateBytes: latest.instructionProjectCandidateBytes - previous.instructionProjectCandidateBytes,
+        instructionOverrideBytes: latest.instructionOverrideBytes - previous.instructionOverrideBytes,
         skillCount: latest.skillCount - previous.skillCount,
         skillEstimatedCatalogChars: latest.skillEstimatedCatalogChars - previous.skillEstimatedCatalogChars,
       }
@@ -5905,6 +6256,19 @@ export async function runBenchmark() {
     instructionProjectDocMaxBytes: scan.codexConfig?.instructionStack?.projectDocMaxBytes || defaultProjectDocMaxBytes,
     instructionProjectNearCap: Boolean(scan.codexConfig?.instructionStack?.projectNearCap),
     instructionProjectOverCap: Boolean(scan.codexConfig?.instructionStack?.projectOverCap),
+    instructionOverrideConfiguredCount: scan.codexConfig?.instructionOverrides?.configuredCount || 0,
+    instructionOverrideEffectiveCount: scan.codexConfig?.instructionOverrides?.effectiveCount || 0,
+    instructionOverrideBytes: scan.codexConfig?.instructionOverrides?.instructionOverrideBytes || 0,
+    compactOverrideBytes: scan.codexConfig?.instructionOverrides?.compactOverrideBytes || 0,
+    developerInstructionChars: scan.codexConfig?.instructionOverrides?.developerInstructionChars || 0,
+    compactPromptChars: scan.codexConfig?.instructionOverrides?.compactPromptChars || 0,
+    modelInstructionFileBytes: scan.codexConfig?.instructionOverrides?.modelInstructionFileBytes || 0,
+    compactPromptFileBytes: scan.codexConfig?.instructionOverrides?.compactPromptFileBytes || 0,
+    instructionOverrideMissingFileCount: scan.codexConfig?.instructionOverrides?.missingFileCount || 0,
+    developerInstructionsConfigured: Boolean(scan.codexConfig?.instructionOverrides?.developerInstructionsConfigured),
+    modelInstructionsFileConfigured: Boolean(scan.codexConfig?.instructionOverrides?.modelInstructionsFileConfigured),
+    compactPromptConfigured: Boolean(scan.codexConfig?.instructionOverrides?.compactPromptConfigured),
+    compactPromptFileConfigured: Boolean(scan.codexConfig?.instructionOverrides?.compactPromptFileConfigured),
     hooksFeature: scan.codexConfig?.hookSummary?.hooksFeature !== false,
     hookCommandCount: scan.codexConfig?.hookSummary?.commandCount || 0,
     hookTurnScopedCommandCount: scan.codexConfig?.hookSummary?.turnScopedCommandCount || 0,
