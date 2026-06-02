@@ -5451,6 +5451,263 @@ async function getTrustedProjectReadiness(trustedProjectStatuses) {
   };
 }
 
+function emptyAutomationSummary(projectRoot = null) {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "No automation",
+    action: "Optional",
+    detail:
+      "No codex exec or Codex GitHub Action usage was found in the current project package scripts, GitHub workflows, or scripts directory.",
+    projectPath: projectRoot ? displayPath(projectRoot) : null,
+    scannedFileCount: 0,
+    scannedBytes: 0,
+    codexExecCount: 0,
+    codexActionCount: 0,
+    workflowCodexExecCount: 0,
+    scriptCodexExecCount: 0,
+    packageScriptCodexExecCount: 0,
+    ephemeralCount: 0,
+    jsonOutputCount: 0,
+    outputSchemaCount: 0,
+    outputLastMessageCount: 0,
+    workspaceWriteSandboxCount: 0,
+    dangerFullAccessCount: 0,
+    deprecatedFullAutoCount: 0,
+    ignoreUserConfigCount: 0,
+    ignoreRulesCount: 0,
+    skipGitRepoCheckCount: 0,
+    resumeCount: 0,
+    apiKeyMentionCount: 0,
+    directApiKeyCodexExecRisk: 0,
+    nonEphemeralExecCount: 0,
+    machineReadableGapCount: 0,
+    controlledAutomationGapCount: 0,
+    files: [],
+  };
+}
+
+function countRegex(text, regex) {
+  return (String(text || "").match(regex) || []).length;
+}
+
+function automationSourceMetrics({ text = "", kind = "file", name = "", sourcePath = null, bytes = 0 } = {}) {
+  const sourceText = String(text || "");
+  const codexExecCount = countRegex(sourceText, /\bcodex\s+exec\b/g);
+  const codexActionCount = countRegex(sourceText, /\bopenai\/codex-action(?:@|["'\s]|$)/gi);
+  const apiKeyMentionCount = countRegex(sourceText, /\b(?:OPENAI_API_KEY|CODEX_API_KEY)\b/g);
+  const jsonOutputCount = countRegex(sourceText, /(?:^|\s)--json(?:\s|$)/g);
+  const outputSchemaCount = countRegex(sourceText, /(?:^|\s)--output-schema(?:[=\s]|$)/g);
+  const outputLastMessageCount = countRegex(sourceText, /(?:^|\s)(?:--output-last-message|-o)(?:[=\s]|$)/g);
+  const machineReadableCount = jsonOutputCount + outputSchemaCount + outputLastMessageCount;
+  const isWorkflow = kind === "workflow";
+  const isPackage = kind === "package";
+  const directWorkflowExec = isWorkflow ? codexExecCount : 0;
+  const directApiKeyCodexExecRisk = directWorkflowExec && apiKeyMentionCount && !codexActionCount ? 1 : 0;
+  const nonEphemeralExecCount = Math.max(0, codexExecCount - countRegex(sourceText, /(?:^|\s)--ephemeral(?:\s|$)/g));
+  const machineReadableGapCount = directWorkflowExec && !machineReadableCount ? directWorkflowExec : 0;
+  const controlledAutomationGapCount =
+    directWorkflowExec && !(sourceText.includes("--ignore-user-config") || sourceText.includes("--ignore-rules")) ? directWorkflowExec : 0;
+
+  return {
+    kind,
+    name,
+    path: sourcePath ? displayPath(sourcePath) : null,
+    bytes,
+    codexExecCount,
+    codexActionCount,
+    workflowCodexExecCount: directWorkflowExec,
+    scriptCodexExecCount: kind === "script" ? codexExecCount : 0,
+    packageScriptCodexExecCount: isPackage ? codexExecCount : 0,
+    ephemeralCount: countRegex(sourceText, /(?:^|\s)--ephemeral(?:\s|$)/g),
+    jsonOutputCount,
+    outputSchemaCount,
+    outputLastMessageCount,
+    workspaceWriteSandboxCount: countRegex(sourceText, /(?:^|\s)--sandbox[=\s]+workspace-write(?:\s|$)/g),
+    dangerFullAccessCount: countRegex(sourceText, /(?:^|\s)--sandbox[=\s]+danger-full-access(?:\s|$)|\bdanger-full-access\b/g),
+    deprecatedFullAutoCount: countRegex(sourceText, /(?:^|\s)--full-auto(?:\s|$)/g),
+    ignoreUserConfigCount: countRegex(sourceText, /(?:^|\s)--ignore-user-config(?:\s|$)/g),
+    ignoreRulesCount: countRegex(sourceText, /(?:^|\s)--ignore-rules(?:\s|$)/g),
+    skipGitRepoCheckCount: countRegex(sourceText, /(?:^|\s)--skip-git-repo-check(?:\s|$)/g),
+    resumeCount: countRegex(sourceText, /\bcodex\s+exec\s+resume\b/g),
+    apiKeyMentionCount,
+    directApiKeyCodexExecRisk,
+    nonEphemeralExecCount,
+    machineReadableGapCount,
+    controlledAutomationGapCount,
+  };
+}
+
+async function collectAutomationFiles(projectRoot) {
+  const files = [];
+  const seen = new Set();
+
+  const addFile = async (filePath, kind) => {
+    if (files.length >= 80) return;
+    const resolved = path.resolve(filePath);
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    const stats = await statOrNull(resolved);
+    if (!stats?.isFile() || stats.size > 384 * 1024) return;
+    files.push({ path: resolved, kind, name: path.relative(projectRoot, resolved), bytes: stats.size });
+  };
+
+  const workflowsDir = path.join(projectRoot, ".github", "workflows");
+  try {
+    const entries = await fs.readdir(workflowsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && /\.ya?ml$/i.test(entry.name)) {
+        await addFile(path.join(workflowsDir, entry.name), "workflow");
+      }
+    }
+  } catch {
+    // Workflows are optional.
+  }
+
+  const scriptsDir = path.join(projectRoot, "scripts");
+  const visitScripts = async (dir, depth = 0) => {
+    if (files.length >= 80 || depth > 2) return;
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= 80) break;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!["node_modules", "dist", "release", ".git"].includes(entry.name)) await visitScripts(fullPath, depth + 1);
+        continue;
+      }
+      if (entry.isFile() && /\.(?:sh|bash|zsh|js|mjs|cjs|ts|tsx|py|rb|ya?ml|json)$/i.test(entry.name)) {
+        await addFile(fullPath, "script");
+      }
+    }
+  };
+  await visitScripts(scriptsDir);
+  return files;
+}
+
+async function getAutomationSummary(currentProject = null) {
+  const projectRoot =
+    currentProject?.exists && currentProject.path
+      ? path.resolve(currentProject.path)
+      : (await gitRootFor(process.cwd())) || (await gitRootFor(rootDir)) || path.resolve(process.cwd());
+  const summary = emptyAutomationSummary(projectRoot);
+  const rootStats = await statOrNull(projectRoot);
+  if (!rootStats?.isDirectory()) return summary;
+
+  const metrics = [];
+  const packageJson = await readJsonOrNull(path.join(projectRoot, "package.json"));
+  const packageScripts = packageJson?.scripts && typeof packageJson.scripts === "object" ? packageJson.scripts : {};
+  for (const [name, command] of Object.entries(packageScripts)) {
+    if (/\bcodex\s+exec\b|\bopenai\/codex-action\b/i.test(String(command || ""))) {
+      metrics.push(
+        automationSourceMetrics({
+          text: String(command || ""),
+          kind: "package",
+          name: `package.json#${name}`,
+          sourcePath: path.join(projectRoot, "package.json"),
+          bytes: String(command || "").length,
+        }),
+      );
+    }
+  }
+
+  const files = await collectAutomationFiles(projectRoot);
+  for (const file of files) {
+    let text = "";
+    try {
+      text = await fs.readFile(file.path, "utf8");
+    } catch {
+      continue;
+    }
+    if (!/\bcodex\s+exec\b|\bopenai\/codex-action\b|\b(?:OPENAI_API_KEY|CODEX_API_KEY)\b/i.test(text)) continue;
+    metrics.push(automationSourceMetrics({ text, kind: file.kind, name: file.name, sourcePath: file.path, bytes: file.bytes }));
+  }
+
+  const totals = metrics.reduce((acc, item) => {
+    for (const [key, value] of Object.entries(item)) {
+      if (typeof value === "number") acc[key] = (acc[key] || 0) + value;
+    }
+    return acc;
+  }, {});
+  Object.assign(summary, totals);
+  summary.scannedFileCount = metrics.length;
+  summary.scannedBytes = metrics.reduce((total, item) => total + Number(item.bytes || 0), 0);
+  summary.files = metrics
+    .filter((item) => item.codexExecCount || item.codexActionCount || item.directApiKeyCodexExecRisk)
+    .slice(0, 10)
+    .map((item) => ({
+      kind: item.kind,
+      name: item.name,
+      path: item.path,
+      codexExecCount: item.codexExecCount,
+      codexActionCount: item.codexActionCount,
+      ephemeralCount: item.ephemeralCount,
+      machineReadable: Boolean(item.jsonOutputCount || item.outputSchemaCount || item.outputLastMessageCount),
+      directApiKeyCodexExecRisk: Boolean(item.directApiKeyCodexExecRisk),
+    }));
+
+  const highLoad =
+    summary.directApiKeyCodexExecRisk > 0 ||
+    summary.dangerFullAccessCount > 0 ||
+    summary.skipGitRepoCheckCount > 0 ||
+    summary.deprecatedFullAutoCount > 0;
+  const mediumLoad =
+    highLoad ||
+    summary.nonEphemeralExecCount > 0 ||
+    summary.machineReadableGapCount > 0 ||
+    summary.controlledAutomationGapCount > 0;
+  summary.tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  summary.label = summary.codexExecCount
+    ? `${summary.codexExecCount.toLocaleString()} exec`
+    : summary.codexActionCount
+      ? `${summary.codexActionCount.toLocaleString()} action`
+      : "No automation";
+  summary.action = summary.directApiKeyCodexExecRisk
+    ? "Use codex-action"
+    : summary.deprecatedFullAutoCount
+      ? "Replace full-auto"
+      : summary.dangerFullAccessCount || summary.skipGitRepoCheckCount
+        ? "Tighten sandbox"
+        : summary.nonEphemeralExecCount
+          ? "Use ephemeral"
+          : summary.machineReadableGapCount
+            ? "Use JSON output"
+            : summary.controlledAutomationGapCount
+              ? "Pin config scope"
+              : "Keep scoped";
+  summary.detail =
+    summary.codexExecCount || summary.codexActionCount
+      ? [
+          `Refit found ${summary.codexExecCount.toLocaleString()} codex exec use${summary.codexExecCount === 1 ? "" : "s"} and ${summary.codexActionCount.toLocaleString()} Codex GitHub Action use${summary.codexActionCount === 1 ? "" : "s"} in ${summary.scannedFileCount.toLocaleString()} current-project automation source${summary.scannedFileCount === 1 ? "" : "s"}.`,
+          summary.directApiKeyCodexExecRisk
+            ? "A workflow appears to run codex exec directly with API-key environment variables; the manual recommends the Codex GitHub Action for GitHub Actions automation."
+            : null,
+          summary.deprecatedFullAutoCount ? "codex exec --full-auto is deprecated; use explicit sandbox flags." : null,
+          summary.dangerFullAccessCount || summary.skipGitRepoCheckCount
+            ? "Danger-full-access or skip-git-repo-check appears in automation. Keep those only for isolated runners."
+            : null,
+          summary.nonEphemeralExecCount
+            ? "Some scripted codex exec runs do not use --ephemeral, so throwaway automation can add local session state."
+            : null,
+          summary.machineReadableGapCount
+            ? "Some workflow codex exec runs do not use --json, --output-schema, or --output-last-message, making proof harder to parse."
+            : null,
+          summary.controlledAutomationGapCount
+            ? "For controlled CI, --ignore-user-config or --ignore-rules can make runs less dependent on personal local settings."
+            : null,
+          "Refit reports counts and filenames only; it does not print automation prompt text or secret values.",
+        ]
+          .filter(Boolean)
+          .join(" ")
+      : summary.detail;
+
+  return summary;
+}
+
 async function duBytes(targetPath) {
   const stats = await statOrNull(targetPath);
   if (!stats) return 0;
@@ -7095,6 +7352,7 @@ async function getCodexConfigSummary() {
       currentProject: null,
       weakestProjects: [],
     },
+    automation: emptyAutomationSummary(),
     cloudHandoff: emptyCloudHandoffSummary(),
     enabledPluginCount: 0,
     enabledMcpCount: 0,
@@ -7134,6 +7392,7 @@ async function getCodexConfigSummary() {
     summary.customPrompts = await getCustomPromptSummary();
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
+    summary.automation = await getAutomationSummary(null);
     summary.cloudHandoff = await getCloudHandoffSummary(null);
     return summary;
   }
@@ -7211,6 +7470,7 @@ async function getCodexConfigSummary() {
     summary.staleTrustedProjectPaths = summary.trustedProjectStatuses.filter((project) => !project.exists).map((project) => project.path);
     summary.staleTrustedProjectCount = summary.staleTrustedProjectPaths.length;
     summary.projectReadiness = await getTrustedProjectReadiness(summary.trustedProjectStatuses);
+    summary.automation = await getAutomationSummary(summary.projectReadiness.currentProject);
     summary.cloudHandoff = await getCloudHandoffSummary(summary.projectReadiness.currentProject);
     summary.hookSummary = await getHookConfigSummary({
       hooksFeature: summary.hooksFeature,
@@ -7268,6 +7528,7 @@ async function getCodexConfigSummary() {
   } catch (error) {
     summary.error = error.message;
     summary.storagePaths = await buildStoragePathSummary({}, { currentProject: null });
+    summary.automation = await getAutomationSummary(null);
     summary.managedConfig = await getManagedConfigSummary({ userValues: {}, userSections: [] });
     summary.commandRules = await getCommandRuleSummary({ rulesFeature: summary.rulesFeature, currentProject: null });
   }
@@ -7403,6 +7664,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
   const currentLocalEnvironment = currentProject?.localEnvironment || null;
+  const automation = codexConfig?.automation || emptyAutomationSummary(currentProject?.path || null);
   const cloudHandoff = codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const localEnvironmentNeedsWork = Boolean(
     currentProject &&
@@ -8228,6 +8490,33 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
     });
   }
 
+  if (automation.status === "ready" && automation.tone !== "low") {
+    addFix({
+      id: "codex-automation",
+      label: "Automation",
+      value: automation.label,
+      tone: automation.tone === "high" ? "high" : "medium",
+      action: automation.action,
+      detail:
+        "Codex exec is useful for scripts and CI, but repeated automation should be explicit, parseable, and light on local state. Refit reports counts and filenames only.",
+      snippet: [
+        "# For throwaway scripted checks, avoid adding session rollout state:",
+        'codex exec --ephemeral --json "summarize the failing check and suggest next steps" | jq',
+        "",
+        "# For CI on GitHub, prefer the official action instead of running codex exec directly with API-key env vars:",
+        "uses: openai/codex-action@v1",
+        "with:",
+        "  openai-api-key: ${{ secrets.OPENAI_API_KEY }}",
+        "  prompt: |",
+        "    Reproduce the failure, make the smallest fix, and report verification.",
+        "",
+        "# For controlled automation, pin the surface intentionally:",
+        "# codex exec --sandbox workspace-write --ignore-user-config --ignore-rules --json \"...\"",
+        "# Avoid deprecated --full-auto; use explicit --sandbox instead.",
+      ].join("\n"),
+    });
+  }
+
   if (cloudHandoff.hasGitRepo && cloudHandoff.tone !== "low") {
     const branchName = cloudHandoff.branch || "your-branch";
     addFix({
@@ -8432,6 +8721,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const modelIsSpark = normalizedModel.includes("spark");
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject || null;
+  const automation = codexConfig?.automation || emptyAutomationSummary(currentProject?.path || null);
   const cloudHandoff = codexConfig?.cloudHandoff || emptyCloudHandoffSummary();
   const existingProjectCount = Number(projectReadiness.existingCount || 0);
   const projectReadyCount = Number(projectReadiness.readyCount || 0);
@@ -9042,6 +9332,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: localEnvironmentDetail,
     },
     {
+      id: "codex-automation",
+      label: "Automation",
+      value: automation.label,
+      tone: automation.tone,
+      action: automation.action,
+      priority: automation.tone === "high" ? 88 : automation.tone === "medium" ? 64 : automation.codexExecCount ? 24 : 10,
+      detail: automation.detail,
+    },
+    {
       id: "runtime-version",
       label: "Codex Runtime",
       value: runtime?.versionMismatch ? "Mismatch" : runtime?.cliVersion || runtime?.appVersion || "Missing",
@@ -9585,6 +9884,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     });
   }
 
+  if (automation.status === "ready" && automation.tone !== "low") {
+    addRecommendation({
+      id: "codex-automation",
+      label: "Automation",
+      value: automation.label,
+      action: automation.action,
+      tone: automation.tone === "high" ? "high" : "medium",
+      priority: automation.tone === "high" ? 84 : 60,
+      detail:
+        automation.directApiKeyCodexExecRisk || automation.deprecatedFullAutoCount || automation.nonEphemeralExecCount
+          ? `${automation.detail} Tighten this before using automation results as speed proof.`
+          : automation.detail,
+    });
+  }
+
   if (trustedProjectCount >= 20) {
     addRecommendation({
       id: "trusted-project-review",
@@ -9823,6 +10137,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     commandRules,
     authCache,
     projectReadiness,
+    automation,
     cloudHandoff,
     profileCount: codexConfig?.profileCount || 0,
     profileHealth,
@@ -10284,6 +10599,22 @@ function localScoreBreakdown(metrics) {
       detail: "OpenTelemetry export, prompt logging, secret-like headers, and ignored project telemetry config.",
     },
     {
+      id: "codex-automation",
+      label: "Automation",
+      points: Math.min(
+        5,
+        Number(metrics.automationDirectApiKeyRisk || 0) * 3 +
+          Number(metrics.automationDangerFullAccessCount || 0) * 2 +
+          Number(metrics.automationDeprecatedFullAutoCount || 0) * 2 +
+          Number(metrics.automationSkipGitRepoCheckCount || 0) * 2 +
+          Number(metrics.automationNonEphemeralExecCount || 0) * 0.8 +
+          Number(metrics.automationMachineReadableGapCount || 0) * 0.5 +
+          Number(metrics.automationControlledGapCount || 0) * 0.5,
+      ),
+      value: metrics.automationLabel || "No automation",
+      detail: "Codex exec and GitHub Action hygiene for scripted, CI, and machine-readable runs.",
+    },
+    {
       id: "session-media",
       label: "Session Media",
       points: Math.min(
@@ -10470,6 +10801,11 @@ function benchmarkLiveScore(metrics) {
   if (metrics.telemetryLogUserPrompt) score -= 2;
   if (metrics.telemetryHeaderSecretLike) score -= 1;
   if (metrics.telemetryProjectIgnored) score -= 2;
+  if (metrics.automationDirectApiKeyRisk) score -= Math.min(4, Number(metrics.automationDirectApiKeyRisk || 0) * 3);
+  if (metrics.automationDangerFullAccessCount) score -= Math.min(4, Number(metrics.automationDangerFullAccessCount || 0) * 2);
+  if (metrics.automationDeprecatedFullAutoCount) score -= Math.min(3, Number(metrics.automationDeprecatedFullAutoCount || 0) * 2);
+  if (metrics.automationSkipGitRepoCheckCount) score -= Math.min(3, Number(metrics.automationSkipGitRepoCheckCount || 0) * 2);
+  score -= Math.min(3, Number(metrics.automationNonEphemeralExecCount || 0) * 0.5);
   if (metrics.historyInvalidConfig) score -= 2;
   if (metrics.historyFileHuge) score -= 4;
   else if (metrics.historyFileLarge) score -= 2;
@@ -10606,6 +10942,19 @@ function benchmarkGuidance(metrics) {
     guidance.push("Move provider/profile/telemetry keys out of project .codex/config.toml; Codex ignores those keys there.");
   } else if (metrics.modelProviderActiveCustom) {
     guidance.push("Custom model provider is active. If Codex feels slower than expected, compare provider latency against the built-in OpenAI provider.");
+  }
+  if (metrics.automationDirectApiKeyRisk > 0) {
+    guidance.push("Use the Codex GitHub Action for GitHub Actions automation instead of running codex exec directly with API-key environment variables.");
+  } else if (metrics.automationDeprecatedFullAutoCount > 0) {
+    guidance.push("Replace codex exec --full-auto with explicit --sandbox settings in automation.");
+  } else if (metrics.automationDangerFullAccessCount > 0 || metrics.automationSkipGitRepoCheckCount > 0) {
+    guidance.push("Review Codex automation sandbox settings; danger-full-access and skip-git-repo-check belong only in isolated, controlled runners.");
+  } else if (metrics.automationNonEphemeralExecCount > 0) {
+    guidance.push("Use codex exec --ephemeral for throwaway scripted runs so repeated automation does not add local session state.");
+  } else if (metrics.automationMachineReadableGapCount > 0) {
+    guidance.push("Use codex exec --json, --output-schema, or --output-last-message for workflow automation so speed checks have parseable proof.");
+  } else if (metrics.automationControlledGapCount > 0) {
+    guidance.push("For controlled CI, consider --ignore-user-config or --ignore-rules so codex exec runs do not inherit personal local settings.");
   }
   if (metrics.profileBrokenCount > 0) {
     guidance.push(`Fix ${Number(metrics.profileBrokenCount).toLocaleString()} unreadable profile file${metrics.profileBrokenCount === 1 ? "" : "s"} before trusting profile-based speed advice.`);
@@ -10854,8 +11203,9 @@ function scoreMetricsFromScan(scan) {
   const historyRetention = scan?.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = scan?.codexConfig?.storagePaths || {};
   const telemetry = scan?.codexConfig?.telemetry || buildTelemetrySummary({});
+  const automation = scan?.codexConfig?.automation || emptyAutomationSummary();
   return {
-    scoreModel: "local-state-v18",
+    scoreModel: "local-state-v19",
     activeSessionBytes: categories.activeSessions?.bytes || 0,
     logBytes: scan?.logs?.bytes || 0,
     logWalBytes: scan?.logs?.walBytes || 0,
@@ -10920,6 +11270,22 @@ function scoreMetricsFromScan(scan) {
     telemetryProjectIgnoredCount: telemetry.projectIgnoredTelemetryCount || 0,
     telemetryHeaderKeyCount: telemetry.headerKeyCount || 0,
     telemetryEnvironmentConfigured: Boolean(telemetry.environmentConfigured),
+    automationTone: automation.tone || "low",
+    automationLabel: automation.label || "No automation",
+    automationCodexExecCount: automation.codexExecCount || 0,
+    automationCodexActionCount: automation.codexActionCount || 0,
+    automationWorkflowCodexExecCount: automation.workflowCodexExecCount || 0,
+    automationEphemeralCount: automation.ephemeralCount || 0,
+    automationJsonOutputCount: automation.jsonOutputCount || 0,
+    automationOutputSchemaCount: automation.outputSchemaCount || 0,
+    automationOutputLastMessageCount: automation.outputLastMessageCount || 0,
+    automationDirectApiKeyRisk: automation.directApiKeyCodexExecRisk || 0,
+    automationNonEphemeralExecCount: automation.nonEphemeralExecCount || 0,
+    automationMachineReadableGapCount: automation.machineReadableGapCount || 0,
+    automationControlledGapCount: automation.controlledAutomationGapCount || 0,
+    automationDangerFullAccessCount: automation.dangerFullAccessCount || 0,
+    automationDeprecatedFullAutoCount: automation.deprecatedFullAutoCount || 0,
+    automationSkipGitRepoCheckCount: automation.skipGitRepoCheckCount || 0,
   };
 }
 
@@ -11743,6 +12109,24 @@ function benchmarkDeltas(current, previous) {
     "telemetryProjectIgnoredCount",
     "telemetryHeaderKeyCount",
     "telemetryEnvironmentConfigured",
+    "automationScannedFileCount",
+    "automationScannedBytes",
+    "automationCodexExecCount",
+    "automationCodexActionCount",
+    "automationWorkflowCodexExecCount",
+    "automationScriptCodexExecCount",
+    "automationPackageScriptCodexExecCount",
+    "automationEphemeralCount",
+    "automationJsonOutputCount",
+    "automationOutputSchemaCount",
+    "automationOutputLastMessageCount",
+    "automationDirectApiKeyRisk",
+    "automationNonEphemeralExecCount",
+    "automationMachineReadableGapCount",
+    "automationControlledGapCount",
+    "automationDangerFullAccessCount",
+    "automationDeprecatedFullAutoCount",
+    "automationSkipGitRepoCheckCount",
     "historyPersistenceOff",
     "historyMaxBytesConfigured",
     "historyMaxBytes",
@@ -12096,6 +12480,30 @@ function summarizeBenchmarkEntry(entry) {
     telemetryProjectIgnoredCount: entry.metrics.telemetryProjectIgnoredCount || 0,
     telemetryHeaderKeyCount: entry.metrics.telemetryHeaderKeyCount || 0,
     telemetryEnvironmentConfigured: Boolean(entry.metrics.telemetryEnvironmentConfigured),
+    automationTone: entry.metrics.automationTone || "low",
+    automationLabel: entry.metrics.automationLabel || "No automation",
+    automationScannedFileCount: entry.metrics.automationScannedFileCount || 0,
+    automationScannedBytes: entry.metrics.automationScannedBytes || 0,
+    automationCodexExecCount: entry.metrics.automationCodexExecCount || 0,
+    automationCodexActionCount: entry.metrics.automationCodexActionCount || 0,
+    automationWorkflowCodexExecCount: entry.metrics.automationWorkflowCodexExecCount || 0,
+    automationScriptCodexExecCount: entry.metrics.automationScriptCodexExecCount || 0,
+    automationPackageScriptCodexExecCount: entry.metrics.automationPackageScriptCodexExecCount || 0,
+    automationEphemeralCount: entry.metrics.automationEphemeralCount || 0,
+    automationJsonOutputCount: entry.metrics.automationJsonOutputCount || 0,
+    automationOutputSchemaCount: entry.metrics.automationOutputSchemaCount || 0,
+    automationOutputLastMessageCount: entry.metrics.automationOutputLastMessageCount || 0,
+    automationDirectApiKeyRisk: entry.metrics.automationDirectApiKeyRisk || 0,
+    automationNonEphemeralExecCount: entry.metrics.automationNonEphemeralExecCount || 0,
+    automationMachineReadableGapCount: entry.metrics.automationMachineReadableGapCount || 0,
+    automationControlledGapCount: entry.metrics.automationControlledGapCount || 0,
+    automationDangerFullAccessCount: entry.metrics.automationDangerFullAccessCount || 0,
+    automationDeprecatedFullAutoCount: entry.metrics.automationDeprecatedFullAutoCount || 0,
+    automationSkipGitRepoCheckCount: entry.metrics.automationSkipGitRepoCheckCount || 0,
+    automationIgnoreUserConfigCount: entry.metrics.automationIgnoreUserConfigCount || 0,
+    automationIgnoreRulesCount: entry.metrics.automationIgnoreRulesCount || 0,
+    automationResumeCount: entry.metrics.automationResumeCount || 0,
+    automationApiKeyMentionCount: entry.metrics.automationApiKeyMentionCount || 0,
     historyTone: entry.metrics.historyTone || "low",
     historyLabel: entry.metrics.historyLabel || "Uncapped",
     historyPersistence: entry.metrics.historyPersistence || "save-all",
@@ -12299,6 +12707,22 @@ export async function benchmarkHistory(limit = 12) {
         telemetryProjectIgnoredCount: latest.telemetryProjectIgnoredCount - oldest.telemetryProjectIgnoredCount,
         telemetryHeaderKeyCount: latest.telemetryHeaderKeyCount - oldest.telemetryHeaderKeyCount,
         telemetryEnvironmentConfigured: Number(latest.telemetryEnvironmentConfigured) - Number(oldest.telemetryEnvironmentConfigured),
+        automationScannedFileCount: latest.automationScannedFileCount - oldest.automationScannedFileCount,
+        automationScannedBytes: latest.automationScannedBytes - oldest.automationScannedBytes,
+        automationCodexExecCount: latest.automationCodexExecCount - oldest.automationCodexExecCount,
+        automationCodexActionCount: latest.automationCodexActionCount - oldest.automationCodexActionCount,
+        automationWorkflowCodexExecCount: latest.automationWorkflowCodexExecCount - oldest.automationWorkflowCodexExecCount,
+        automationEphemeralCount: latest.automationEphemeralCount - oldest.automationEphemeralCount,
+        automationJsonOutputCount: latest.automationJsonOutputCount - oldest.automationJsonOutputCount,
+        automationOutputSchemaCount: latest.automationOutputSchemaCount - oldest.automationOutputSchemaCount,
+        automationOutputLastMessageCount: latest.automationOutputLastMessageCount - oldest.automationOutputLastMessageCount,
+        automationDirectApiKeyRisk: latest.automationDirectApiKeyRisk - oldest.automationDirectApiKeyRisk,
+        automationNonEphemeralExecCount: latest.automationNonEphemeralExecCount - oldest.automationNonEphemeralExecCount,
+        automationMachineReadableGapCount: latest.automationMachineReadableGapCount - oldest.automationMachineReadableGapCount,
+        automationControlledGapCount: latest.automationControlledGapCount - oldest.automationControlledGapCount,
+        automationDangerFullAccessCount: latest.automationDangerFullAccessCount - oldest.automationDangerFullAccessCount,
+        automationDeprecatedFullAutoCount: latest.automationDeprecatedFullAutoCount - oldest.automationDeprecatedFullAutoCount,
+        automationSkipGitRepoCheckCount: latest.automationSkipGitRepoCheckCount - oldest.automationSkipGitRepoCheckCount,
         historyPersistenceOff: Number(latest.historyPersistenceOff) - Number(oldest.historyPersistenceOff),
         historyMaxBytesConfigured: Number(latest.historyMaxBytesConfigured) - Number(oldest.historyMaxBytesConfigured),
         historyMaxBytes: latest.historyMaxBytes - oldest.historyMaxBytes,
@@ -12445,6 +12869,22 @@ export async function benchmarkHistory(limit = 12) {
         telemetryProjectIgnoredCount: latest.telemetryProjectIgnoredCount - previous.telemetryProjectIgnoredCount,
         telemetryHeaderKeyCount: latest.telemetryHeaderKeyCount - previous.telemetryHeaderKeyCount,
         telemetryEnvironmentConfigured: Number(latest.telemetryEnvironmentConfigured) - Number(previous.telemetryEnvironmentConfigured),
+        automationScannedFileCount: latest.automationScannedFileCount - previous.automationScannedFileCount,
+        automationScannedBytes: latest.automationScannedBytes - previous.automationScannedBytes,
+        automationCodexExecCount: latest.automationCodexExecCount - previous.automationCodexExecCount,
+        automationCodexActionCount: latest.automationCodexActionCount - previous.automationCodexActionCount,
+        automationWorkflowCodexExecCount: latest.automationWorkflowCodexExecCount - previous.automationWorkflowCodexExecCount,
+        automationEphemeralCount: latest.automationEphemeralCount - previous.automationEphemeralCount,
+        automationJsonOutputCount: latest.automationJsonOutputCount - previous.automationJsonOutputCount,
+        automationOutputSchemaCount: latest.automationOutputSchemaCount - previous.automationOutputSchemaCount,
+        automationOutputLastMessageCount: latest.automationOutputLastMessageCount - previous.automationOutputLastMessageCount,
+        automationDirectApiKeyRisk: latest.automationDirectApiKeyRisk - previous.automationDirectApiKeyRisk,
+        automationNonEphemeralExecCount: latest.automationNonEphemeralExecCount - previous.automationNonEphemeralExecCount,
+        automationMachineReadableGapCount: latest.automationMachineReadableGapCount - previous.automationMachineReadableGapCount,
+        automationControlledGapCount: latest.automationControlledGapCount - previous.automationControlledGapCount,
+        automationDangerFullAccessCount: latest.automationDangerFullAccessCount - previous.automationDangerFullAccessCount,
+        automationDeprecatedFullAutoCount: latest.automationDeprecatedFullAutoCount - previous.automationDeprecatedFullAutoCount,
+        automationSkipGitRepoCheckCount: latest.automationSkipGitRepoCheckCount - previous.automationSkipGitRepoCheckCount,
         historyPersistenceOff: Number(latest.historyPersistenceOff) - Number(previous.historyPersistenceOff),
         historyMaxBytesConfigured: Number(latest.historyMaxBytesConfigured) - Number(previous.historyMaxBytesConfigured),
         historyMaxBytes: latest.historyMaxBytes - previous.historyMaxBytes,
@@ -12533,6 +12973,7 @@ export async function runBenchmark() {
   const responseShapeSummary = scan.codexConfig?.responseShapeSummary || buildResponseShapeSummary({});
   const notificationFlow = scan.codexConfig?.notificationFlow || buildNotificationFlowSummary({});
   const telemetry = scan.codexConfig?.telemetry || buildTelemetrySummary({});
+  const automation = scan.codexConfig?.automation || emptyAutomationSummary();
   const historyRetention = scan.codexConfig?.historyRetention || buildHistoryRetentionSummary({});
   const storagePaths = scan.codexConfig?.storagePaths || {};
   const profileHealth = scan.codexConfig?.profileHealth || buildProfileHealthSummary({ profileSummaries: [] });
@@ -12552,7 +12993,7 @@ export async function runBenchmark() {
   const fastTaskProfileCount = Number(scan.codexConfig?.fastTaskProfileNames?.length || 0);
 
   const metrics = {
-    scoreModel: "local-state-v18",
+    scoreModel: "local-state-v19",
     generatedAt: new Date().toISOString(),
     scanMs: scanTimed.ms,
     stateQueryMs: stateTimed.ms,
@@ -12847,6 +13288,30 @@ export async function runBenchmark() {
     telemetryProjectIgnoredCount: telemetry.projectIgnoredTelemetryCount || 0,
     telemetryHeaderKeyCount: telemetry.headerKeyCount || 0,
     telemetryEnvironmentConfigured: Boolean(telemetry.environmentConfigured),
+    automationTone: automation.tone || "low",
+    automationLabel: automation.label || "No automation",
+    automationScannedFileCount: automation.scannedFileCount || 0,
+    automationScannedBytes: automation.scannedBytes || 0,
+    automationCodexExecCount: automation.codexExecCount || 0,
+    automationCodexActionCount: automation.codexActionCount || 0,
+    automationWorkflowCodexExecCount: automation.workflowCodexExecCount || 0,
+    automationScriptCodexExecCount: automation.scriptCodexExecCount || 0,
+    automationPackageScriptCodexExecCount: automation.packageScriptCodexExecCount || 0,
+    automationEphemeralCount: automation.ephemeralCount || 0,
+    automationJsonOutputCount: automation.jsonOutputCount || 0,
+    automationOutputSchemaCount: automation.outputSchemaCount || 0,
+    automationOutputLastMessageCount: automation.outputLastMessageCount || 0,
+    automationDirectApiKeyRisk: automation.directApiKeyCodexExecRisk || 0,
+    automationNonEphemeralExecCount: automation.nonEphemeralExecCount || 0,
+    automationMachineReadableGapCount: automation.machineReadableGapCount || 0,
+    automationControlledGapCount: automation.controlledAutomationGapCount || 0,
+    automationDangerFullAccessCount: automation.dangerFullAccessCount || 0,
+    automationDeprecatedFullAutoCount: automation.deprecatedFullAutoCount || 0,
+    automationSkipGitRepoCheckCount: automation.skipGitRepoCheckCount || 0,
+    automationIgnoreUserConfigCount: automation.ignoreUserConfigCount || 0,
+    automationIgnoreRulesCount: automation.ignoreRulesCount || 0,
+    automationResumeCount: automation.resumeCount || 0,
+    automationApiKeyMentionCount: automation.apiKeyMentionCount || 0,
     historyTone: historyRetention.tone || "low",
     historyLabel: historyRetention.label || "Uncapped",
     historyPersistence: historyRetention.persistence || "save-all",
