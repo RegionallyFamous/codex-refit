@@ -1794,16 +1794,66 @@ function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function benchmarkScore(metrics) {
+function localScoreBreakdown(metrics) {
   const gb = (bytes) => (Number(bytes) || 0) / 1024 ** 3;
-  let score = 100;
-  score -= Math.min(28, gb(metrics.activeSessionBytes) * 1.2);
-  score -= Math.min(22, gb(metrics.logBytes) * 2.5);
-  score -= Math.min(18, gb(metrics.logWalBytes) * 12);
-  score -= Math.min(18, metrics.oversizedActiveFiles * 0.25);
-  score -= Math.min(10, metrics.archivedFilesInSessions * 0.2);
-  score -= Math.min(10, metrics.staleThreads * 0.08);
-  return Math.round(clampNumber(score, 0, 100));
+  const components = [
+    {
+      id: "active-sessions",
+      label: "Active Sessions",
+      points: Math.min(28, gb(metrics.activeSessionBytes) * 1.2),
+      value: formatBytesServer(metrics.activeSessionBytes),
+      detail: "Active transcript weight inside ~/.codex/sessions.",
+    },
+    {
+      id: "logs",
+      label: "Logs",
+      points: Math.min(22, gb(metrics.logBytes) * 2.5),
+      value: formatBytesServer(metrics.logBytes),
+      detail: "Local log database size.",
+    },
+    {
+      id: "log-wal",
+      label: "Log WAL",
+      points: Math.min(18, gb(metrics.logWalBytes) * 12),
+      value: formatBytesServer(metrics.logWalBytes),
+      detail: "SQLite write-ahead log waiting to be checkpointed.",
+    },
+    {
+      id: "large-files",
+      label: "Large Files",
+      points: Math.min(18, Number(metrics.oversizedActiveFiles || 0) * 0.25),
+      value: `${Number(metrics.oversizedActiveFiles || 0).toLocaleString()} files`,
+      detail: "Active transcript files over 50 MB.",
+    },
+    {
+      id: "archived-active",
+      label: "Archived In Active",
+      points: Math.min(10, Number(metrics.archivedFilesInSessions || 0) * 0.2),
+      value: `${Number(metrics.archivedFilesInSessions || 0).toLocaleString()} files`,
+      detail: "Archived transcripts still stored under active sessions.",
+    },
+    {
+      id: "stale-threads",
+      label: "Stale Threads",
+      points: Math.min(10, Number(metrics.staleThreads || 0) * 0.08),
+      value: `${Number(metrics.staleThreads || 0).toLocaleString()} threads`,
+      detail: "Unarchived threads older than the active cutoff.",
+    },
+  ].map((component) => ({
+    ...component,
+    points: Number(component.points.toFixed(1)),
+  }));
+  const totalPenalty = components.reduce((total, component) => total + component.points, 0);
+  const score = Math.round(clampNumber(100 - totalPenalty, 0, 100));
+  return {
+    score,
+    totalPenalty: Number(totalPenalty.toFixed(1)),
+    components: components.sort((a, b) => b.points - a.points),
+  };
+}
+
+function benchmarkScore(metrics) {
+  return localScoreBreakdown(metrics).score;
 }
 
 function benchmarkLiveScore(metrics) {
@@ -1876,6 +1926,58 @@ function scanProofMetrics(scan) {
     archivedFilesInSessions: categories.archivedSessionsInActiveTree?.fileCount || 0,
     archivedDeleteRows: categories.archivedDeleteCandidates?.dbRowCount || 0,
     archivedDeleteBytes: categories.archivedDeleteCandidates?.bytes || 0,
+  };
+}
+
+function scoreMetricsFromScan(scan) {
+  const categories = scan?.categories || {};
+  return {
+    scoreModel: "local-state-v2",
+    activeSessionBytes: categories.activeSessions?.bytes || 0,
+    logBytes: scan?.logs?.bytes || 0,
+    logWalBytes: scan?.logs?.walBytes || 0,
+    oversizedActiveFiles: categories.activeSessions?.oversized50mb || 0,
+    archivedFilesInSessions: categories.archivedSessionsInActiveTree?.fileCount || 0,
+    staleThreads: Number(scan?.state?.threads?.activeStale ?? scan?.state?.threads?.activeOlder7d ?? 0),
+  };
+}
+
+function buildScoreProjection(scan, { steps = [], logBytes = 0, logWalBytes = 0 } = {}) {
+  const hasStep = (id) => steps.some((step) => step.id === id && !step.disabled && !step.confirmRequired);
+  const categories = scan?.categories || {};
+  const currentMetrics = scoreMetricsFromScan(scan);
+  const projectedMetrics = { ...currentMetrics };
+
+  if (hasStep("archiveStaleThreads")) {
+    projectedMetrics.activeSessionBytes = Math.max(0, projectedMetrics.activeSessionBytes - (categories.activeStaleSessions?.bytes || 0));
+    projectedMetrics.oversizedActiveFiles = Math.max(0, projectedMetrics.oversizedActiveFiles - (categories.activeStaleSessions?.oversized50mb || 0));
+    projectedMetrics.staleThreads = 0;
+  }
+
+  if (hasStep("migrateArchivedSessions")) {
+    projectedMetrics.activeSessionBytes = Math.max(0, projectedMetrics.activeSessionBytes - (categories.archivedSessionsInActiveTree?.bytes || 0));
+    projectedMetrics.archivedFilesInSessions = 0;
+  }
+
+  if (hasStep("pruneLogs")) {
+    projectedMetrics.logWalBytes = 0;
+    projectedMetrics.logBytes = logBytes > 0 ? Math.min(logBytes, projectedMetrics.logBytes) : projectedMetrics.logBytes;
+  }
+
+  const current = localScoreBreakdown(currentMetrics);
+  const projected = localScoreBreakdown(projectedMetrics);
+  return {
+    confidence: "Estimate",
+    currentScore: current.score,
+    projectedScore: projected.score,
+    delta: projected.score - current.score,
+    current,
+    projected,
+    assumptions: [
+      hasStep("archiveStaleThreads") ? "Stale active sessions leave active history." : null,
+      hasStep("migrateArchivedSessions") ? "Archived transcripts leave active sessions." : null,
+      hasStep("pruneLogs") ? "Log WAL checkpoints to zero; retained log size is estimated conservatively." : null,
+    ].filter(Boolean),
   };
 }
 
@@ -2200,14 +2302,15 @@ function buildSmartPlan(scan, options = {}) {
     (effectivePolicy !== "safe" && destructiveSteps.some((step) => step.id === "deleteMaintenanceArchives")
       ? maintenanceBytes
       : 0);
-  const headline =
-    activeFolderReliefBytes > 0
-      ? `Move ${formatBytesServer(activeFolderReliefBytes)} out of active history`
-      : logBytes > 1024 ** 3
-        ? `Compact ${formatBytesServer(logBytes)} of logs`
-        : destructiveSteps.length
-          ? `Recover ${formatBytesServer(deletePreviewBytes)} from old archived data`
-          : "No urgent local slowdown detected";
+  let headline = "No urgent local slowdown detected";
+  if (activeFolderReliefBytes > 0) {
+    headline = `Move ${formatBytesServer(activeFolderReliefBytes)} out of active history`;
+  } else if (logBytes > 1024 ** 3) {
+    headline = `Compact ${formatBytesServer(logBytes)} of logs`;
+  } else if (destructiveSteps.length) {
+    headline = `Recover ${formatBytesServer(deletePreviewBytes)} from old archived data`;
+  }
+  const scoreProjection = buildScoreProjection(scan, { steps, logBytes, logWalBytes });
   const decision = {
     suggestedPolicy,
     suggestedReason,
@@ -2220,7 +2323,20 @@ function buildSmartPlan(scan, options = {}) {
     deletePreviewBytes,
     deleteRequiresArm: destructiveSteps.length > 0,
     archiveChoice,
+    scoreProjection,
     impacts: [
+      {
+        label: "Projected Score",
+        value:
+          scoreProjection.delta > 0
+            ? `${scoreProjection.currentScore} -> ${scoreProjection.projectedScore}`
+            : `${scoreProjection.currentScore}`,
+        detail:
+          scoreProjection.delta > 0
+            ? `Estimated +${scoreProjection.delta} local readiness point${scoreProjection.delta === 1 ? "" : "s"} after non-delete cleanup.`
+            : "No score lift is projected from the currently visible non-delete cleanup steps.",
+        tone: scoreProjection.delta > 0 ? "high" : "low",
+      },
       {
         label: "Active Folder",
         value: formatBytesServer(activeFolderReliefBytes),
@@ -2438,6 +2554,7 @@ function summarizeBenchmarkEntry(entry) {
     staleThreads: entry.metrics.staleThreads,
     oversizedActiveFiles: entry.metrics.oversizedActiveFiles,
     scoreModel: entry.metrics.scoreModel,
+    scoreBreakdown: entry.metrics.scoreBreakdown || localScoreBreakdown(entry.metrics),
   };
 }
 
@@ -2546,7 +2663,8 @@ export async function runBenchmark() {
     archivedDeleteBytes: scan.categories.archivedDeleteCandidates?.bytes || 0,
     archivedDeleteDays: scan.categories.archivedDeleteCandidates?.days || 30,
   };
-  metrics.score = benchmarkScore(metrics);
+  metrics.scoreBreakdown = localScoreBreakdown(metrics);
+  metrics.score = metrics.scoreBreakdown.score;
   metrics.liveScore = benchmarkLiveScore(metrics);
   metrics.timingPenalty = Math.max(0, metrics.score - metrics.liveScore);
 

@@ -72,6 +72,7 @@ const elements = {
   benchmarkGuidance: $("#benchmarkGuidance"),
   benchmarkProof: $("#benchmarkProof"),
   benchmarkHistory: $("#benchmarkHistory"),
+  benchmarkBreakdown: $("#benchmarkBreakdown"),
   benchmarkScan: $("#benchmarkScan"),
   benchmarkState: $("#benchmarkState"),
   benchmarkDelta: $("#benchmarkDelta"),
@@ -583,7 +584,27 @@ function renderBenchmark(benchmark) {
       .map((item) => `<span>${escapeHtml(item)}</span>`)
       .join("");
   }
+  renderScoreBreakdown(metrics.scoreBreakdown);
   if (benchmark.history) renderBenchmarkHistory(benchmark.history);
+}
+
+function renderScoreBreakdown(scoreBreakdown) {
+  if (!elements.benchmarkBreakdown) return;
+  const components = scoreBreakdown?.components || [];
+  elements.benchmarkBreakdown.innerHTML = components.length
+    ? components
+        .slice(0, 4)
+        .map(
+          (component) => `
+            <article title="${escapeHtml(component.detail || "")}">
+              <strong>-${escapeHtml(String(component.points))}</strong>
+              <span>${escapeHtml(component.label || "Driver")}</span>
+              <small>${escapeHtml(component.value || "")}</small>
+            </article>
+          `,
+        )
+        .join("")
+    : `<span>Run a check to see score drivers.</span>`;
 }
 
 function renderBenchmarkHistory(history) {
@@ -627,6 +648,7 @@ function renderBenchmarkHistory(history) {
           .join("")
       : `<span>No saved speed checks yet.</span>`;
   }
+  if (latest?.scoreBreakdown) renderScoreBreakdown(latest.scoreBreakdown);
 }
 
 function renderRefitOutcome(outcome, benchmark = null) {

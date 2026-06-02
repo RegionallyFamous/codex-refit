@@ -1026,6 +1026,54 @@ body[data-hard-mode] .benchmark-history {
   color: var(--green);
 }
 
+.benchmark-breakdown {
+  display: none;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.32rem;
+}
+
+body[data-hard-mode] .benchmark-breakdown {
+  display: grid;
+}
+
+.benchmark-breakdown article {
+  display: grid;
+  gap: 0.12rem;
+  border: 1px solid rgba(255, 208, 105, 0.18);
+  border-left: 6px solid var(--gold);
+  border-radius: 6px;
+  padding: 0.34rem 0.42rem;
+  background: rgba(255, 208, 105, 0.06);
+}
+
+.benchmark-breakdown strong,
+.benchmark-breakdown span,
+.benchmark-breakdown small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.benchmark-breakdown strong {
+  color: var(--gold);
+  font-size: 0.82rem;
+  font-weight: 950;
+}
+
+.benchmark-breakdown span {
+  color: var(--cream);
+  font-size: 0.68rem;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.benchmark-breakdown small {
+  color: var(--muted);
+  font-size: 0.62rem;
+  font-weight: 850;
+}
+
 .benchmark-card button {
   grid-column: 1 / -1;
   justify-self: stretch;
@@ -1958,6 +2006,10 @@ body[data-busy] .app-shell {
 
   .summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .benchmark-breakdown {
+    grid-template-columns: 1fr;
   }
 
   .action-band {
