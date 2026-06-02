@@ -44,6 +44,7 @@ const maxSkillCatalogDirs = 4000;
 const maxSkillCatalogDepth = 10;
 const defaultProjectDocMaxBytes = 32 * 1024;
 const largeInstructionFileBytes = 12 * 1024;
+const builtInAgentNames = new Set(["default", "worker", "explorer"]);
 
 const paths = {
   codexHome,
@@ -54,6 +55,7 @@ const paths = {
   generatedImagesArchive: path.join(codexHome, "archived_generated_images"),
   memories: path.join(codexHome, "memories"),
   memoriesExtensions: path.join(codexHome, "memories_extensions"),
+  customAgents: path.join(codexHome, "agents"),
   codexSkills: path.join(codexHome, "skills"),
   codexSystemSkills: path.join(codexHome, "skills", ".system"),
   userAgentSkills: path.join(homeDir, ".agents", "skills"),
@@ -1341,6 +1343,284 @@ async function getInstructionOverrideSummary({ globalConfigText = "", currentPro
       multiline: Boolean(entry.multiline),
       effective: Boolean(entry.effective),
     })),
+  };
+}
+
+function emptyCustomAgentSummary() {
+  return {
+    status: "ready",
+    tone: "low",
+    label: "None",
+    action: "Use when helpful",
+    detail: "No personal or current-project custom agent files were found.",
+    agentCount: 0,
+    validAgentCount: 0,
+    invalidAgentCount: 0,
+    globalAgentCount: 0,
+    projectAgentCount: 0,
+    duplicateNameCount: 0,
+    builtInOverrideCount: 0,
+    highEffortCount: 0,
+    modelOverrideCount: 0,
+    sandboxOverrideCount: 0,
+    mcpServerCount: 0,
+    requiredMcpCount: 0,
+    missingMcpEnvVarCount: 0,
+    skillsConfigCount: 0,
+    totalDeveloperInstructionBytes: 0,
+    longDeveloperInstructionCount: 0,
+    roots: [],
+    agents: [],
+  };
+}
+
+async function customAgentRoots(currentProject = null) {
+  const projectRoot = await resolveInstructionProjectRoot(currentProject);
+  const roots = [
+    {
+      scope: "global",
+      label: "Personal Custom Agents",
+      path: paths.customAgents,
+    },
+    {
+      scope: "project",
+      label: "Project Custom Agents",
+      path: path.join(projectRoot, ".codex", "agents"),
+    },
+  ];
+  const seen = new Set();
+  return roots
+    .map((root) => ({ ...root, path: path.resolve(root.path) }))
+    .filter((root) => {
+      if (seen.has(root.path)) return false;
+      seen.add(root.path);
+      return true;
+    });
+}
+
+async function listCustomAgentFiles(root) {
+  const result = {
+    scope: root.scope,
+    label: root.label,
+    path: displayPath(root.path),
+    exists: false,
+    fileCount: 0,
+    dirCount: 0,
+    files: [],
+  };
+  const stats = await statOrNull(root.path);
+  if (!stats?.isDirectory()) return result;
+  result.exists = true;
+
+  const stack = [{ dir: root.path, depth: 0 }];
+  while (stack.length) {
+    const { dir, depth } = stack.pop();
+    result.dirCount += 1;
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const stats = await statOrNull(fullPath);
+      if (!stats) continue;
+      if (stats.isDirectory() && depth < 2 && ![".git", "node_modules"].includes(entry.name)) {
+        stack.push({ dir: fullPath, depth: depth + 1 });
+        continue;
+      }
+      if (stats.isFile() && /\.toml$/i.test(entry.name)) {
+        result.files.push(fullPath);
+      }
+    }
+  }
+
+  result.fileCount = result.files.length;
+  return result;
+}
+
+function normalizedEffort(value) {
+  return String(value || "").toLowerCase().replaceAll("_", "-");
+}
+
+async function readCustomAgentFile(filePath, root) {
+  const stats = await statOrNull(filePath);
+  let text = "";
+  let parsed = { values: {}, sections: [] };
+  let parseError = null;
+  try {
+    text = await fs.readFile(filePath, "utf8");
+    parsed = parseTomlSummary(text);
+  } catch (error) {
+    parseError = error.message;
+  }
+
+  const nameEntry = tomlStringAssignment(text, "name");
+  const descriptionEntry = tomlStringAssignment(text, "description");
+  const developerEntry = tomlStringAssignment(text, "developer_instructions");
+  const values = parsed.values || {};
+  const sections = parsed.sections || [];
+  const name = (nameEntry.present ? nameEntry.value : values.name) || path.basename(filePath, path.extname(filePath));
+  const descriptionChars = descriptionEntry.chars || 0;
+  const developerInstructionBytes = developerEntry.bytes || 0;
+  const model = values.model || null;
+  const effort = values.model_reasoning_effort || values.reasoning_effort || null;
+  const effortText = normalizedEffort(effort);
+  const highEffort = ["high", "xhigh", "extra-high"].includes(effortText);
+  const mcpSummary = buildMcpConfigSummary(values, sections);
+  const skillsConfigCount = sections.filter((section) => section === "skills.config").length;
+  const missingRequired = [];
+  if (!nameEntry.present || !String(nameEntry.value || "").trim()) missingRequired.push("name");
+  if (!descriptionEntry.present || !String(descriptionEntry.value || "").trim()) missingRequired.push("description");
+  if (!developerEntry.present || !String(developerEntry.value || "").trim()) missingRequired.push("developer_instructions");
+  if (parseError) missingRequired.push("readable TOML");
+
+  return {
+    scope: root.scope,
+    name,
+    path: displayPath(filePath),
+    bytes: stats?.isFile() ? stats.size : 0,
+    mtime: stats?.mtime?.toISOString?.() || null,
+    valid: missingRequired.length === 0,
+    missingRequired,
+    builtInOverride: builtInAgentNames.has(String(name).toLowerCase()),
+    descriptionChars,
+    developerInstructionBytes,
+    model,
+    reasoningEffort: effort,
+    highEffort,
+    modelOverride: Boolean(model),
+    sandboxOverride: Boolean(values.sandbox_mode || values.approval_policy || values.approvals_reviewer),
+    mcpServerCount: mcpSummary.enabledCount || 0,
+    requiredMcpCount: mcpSummary.requiredCount || 0,
+    missingMcpEnvVarCount: mcpSummary.missingEnvVarCount || 0,
+    skillsConfigCount,
+  };
+}
+
+async function getCustomAgentSummary(currentProject = null) {
+  const roots = await customAgentRoots(currentProject);
+  const discovered = await Promise.all(roots.map((root) => listCustomAgentFiles(root)));
+  const files = [];
+  for (const rootResult of discovered) {
+    const root = roots.find((candidate) => displayPath(candidate.path) === rootResult.path) || roots.find((candidate) => candidate.scope === rootResult.scope) || {};
+    for (const filePath of rootResult.files) files.push({ filePath, root });
+  }
+
+  if (!files.length) {
+    return {
+      ...emptyCustomAgentSummary(),
+      roots: discovered.map((root) => ({
+        scope: root.scope,
+        label: root.label,
+        path: root.path,
+        exists: root.exists,
+        fileCount: root.fileCount,
+        dirCount: root.dirCount,
+      })),
+    };
+  }
+
+  const agents = await Promise.all(files.map((item) => readCustomAgentFile(item.filePath, item.root)));
+  const nameCounts = agents.reduce((counts, agent) => {
+    const key = String(agent.name || "").toLowerCase();
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
+  const duplicateNameCount = Object.values(nameCounts).filter((count) => count > 1).length;
+  const invalidAgentCount = agents.filter((agent) => !agent.valid).length;
+  const builtInOverrideCount = agents.filter((agent) => agent.builtInOverride).length;
+  const highEffortCount = agents.filter((agent) => agent.highEffort).length;
+  const modelOverrideCount = agents.filter((agent) => agent.modelOverride).length;
+  const sandboxOverrideCount = agents.filter((agent) => agent.sandboxOverride).length;
+  const mcpServerCount = agents.reduce((total, agent) => total + agent.mcpServerCount, 0);
+  const requiredMcpCount = agents.reduce((total, agent) => total + agent.requiredMcpCount, 0);
+  const missingMcpEnvVarCount = agents.reduce((total, agent) => total + agent.missingMcpEnvVarCount, 0);
+  const skillsConfigCount = agents.reduce((total, agent) => total + agent.skillsConfigCount, 0);
+  const totalDeveloperInstructionBytes = agents.reduce((total, agent) => total + agent.developerInstructionBytes, 0);
+  const longDeveloperInstructionCount = agents.filter((agent) => agent.developerInstructionBytes >= largeInstructionFileBytes).length;
+  const agentCount = agents.length;
+  const projectAgentCount = agents.filter((agent) => agent.scope === "project").length;
+  const globalAgentCount = agents.filter((agent) => agent.scope === "global").length;
+  const highLoad =
+    invalidAgentCount > 0 ||
+    builtInOverrideCount > 0 ||
+    missingMcpEnvVarCount > 0 ||
+    totalDeveloperInstructionBytes >= 48 * 1024 ||
+    longDeveloperInstructionCount >= 3;
+  const mediumLoad =
+    highLoad ||
+    agentCount >= 6 ||
+    highEffortCount > 0 ||
+    modelOverrideCount >= 3 ||
+    sandboxOverrideCount > 0 ||
+    mcpServerCount >= 4 ||
+    requiredMcpCount > 0 ||
+    totalDeveloperInstructionBytes >= 12 * 1024 ||
+    duplicateNameCount > 0;
+  const tone = highLoad ? "high" : mediumLoad ? "medium" : "low";
+  const label = `${agentCount.toLocaleString()} agent${agentCount === 1 ? "" : "s"}`;
+  const action =
+    tone === "low"
+      ? "Keep narrow"
+      : invalidAgentCount || missingMcpEnvVarCount
+        ? "Fix agents"
+        : builtInOverrideCount
+          ? "Review override"
+          : "Review agents";
+  const detail =
+    tone === "low"
+      ? `Custom agents look tidy: ${agentCount.toLocaleString()} configured, ${formatBytesServer(totalDeveloperInstructionBytes)} of developer instructions.`
+      : [
+          "Custom agents are spawned only when requested, but each does its own model and tool work. Their files can override model, effort, sandbox, MCP, skills, and developer instructions for spawned sessions.",
+          `Refit found ${agentCount.toLocaleString()} custom agent${agentCount === 1 ? "" : "s"} with ${formatBytesServer(totalDeveloperInstructionBytes)} of developer instructions.`,
+          invalidAgentCount ? `${invalidAgentCount.toLocaleString()} agent file${invalidAgentCount === 1 ? "" : "s"} ${pluralVerb(invalidAgentCount)} missing required fields.` : null,
+          builtInOverrideCount ? `${builtInOverrideCount.toLocaleString()} custom agent name${builtInOverrideCount === 1 ? "" : "s"} ${pluralVerb(builtInOverrideCount, "overrides", "override")} built-in agents.` : null,
+          highEffortCount ? `${highEffortCount.toLocaleString()} agent${highEffortCount === 1 ? "" : "s"} ${pluralVerb(highEffortCount, "uses", "use")} high or xhigh reasoning.` : null,
+          missingMcpEnvVarCount ? `${missingMcpEnvVarCount.toLocaleString()} MCP env var reference${missingMcpEnvVarCount === 1 ? "" : "s"} ${pluralVerb(missingMcpEnvVarCount)} missing.` : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+  return {
+    status: "ready",
+    tone,
+    label,
+    action,
+    detail,
+    agentCount,
+    validAgentCount: agentCount - invalidAgentCount,
+    invalidAgentCount,
+    globalAgentCount,
+    projectAgentCount,
+    duplicateNameCount,
+    builtInOverrideCount,
+    highEffortCount,
+    modelOverrideCount,
+    sandboxOverrideCount,
+    mcpServerCount,
+    requiredMcpCount,
+    missingMcpEnvVarCount,
+    skillsConfigCount,
+    totalDeveloperInstructionBytes,
+    longDeveloperInstructionCount,
+    roots: discovered.map((root) => ({
+      scope: root.scope,
+      label: root.label,
+      path: root.path,
+      exists: root.exists,
+      fileCount: root.fileCount,
+      dirCount: root.dirCount,
+    })),
+    agents: agents
+      .sort((a, b) => {
+        const aRisk = (!a.valid ? 6 : 0) + (a.builtInOverride ? 5 : 0) + (a.missingMcpEnvVarCount ? 4 : 0) + (a.highEffort ? 2 : 0) + a.developerInstructionBytes / 1024;
+        const bRisk = (!b.valid ? 6 : 0) + (b.builtInOverride ? 5 : 0) + (b.missingMcpEnvVarCount ? 4 : 0) + (b.highEffort ? 2 : 0) + b.developerInstructionBytes / 1024;
+        return bRisk - aRisk;
+      })
+      .slice(0, 12),
   };
 }
 
@@ -3090,6 +3370,7 @@ async function getCodexConfigSummary() {
     contextBudgetSummary: buildContextBudgetSummary({}),
     instructionStack: emptyInstructionStackSummary(),
     instructionOverrides: emptyInstructionOverrideSummary(),
+    customAgents: emptyCustomAgentSummary(),
     goalsFeature: false,
     hooksFeature: true,
     hookSummary: {
@@ -3167,6 +3448,7 @@ async function getCodexConfigSummary() {
     summary.hookSummary = await getHookConfigSummary({ hooksFeature: summary.hooksFeature });
     summary.instructionStack = await getInstructionStackSummary({ values: {}, currentProject: null });
     summary.instructionOverrides = await getInstructionOverrideSummary({ globalConfigText: "", currentProject: null });
+    summary.customAgents = await getCustomAgentSummary(null);
     return summary;
   }
   summary.exists = true;
@@ -3250,6 +3532,7 @@ async function getCodexConfigSummary() {
       globalConfigText: text,
       currentProject: summary.projectReadiness.currentProject,
     });
+    summary.customAgents = await getCustomAgentSummary(summary.projectReadiness.currentProject);
     summary.mcpSummary = buildMcpConfigSummary(mcpValues, mcpSections);
     summary.enabledMcpCount = summary.mcpSummary.enabledCount;
     summary.disabledMcpCount = summary.mcpSummary.disabledCount;
@@ -3347,6 +3630,7 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
+  const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
   const hasFastTaskProfile = Boolean(codexConfig?.hasFastTaskProfile);
   const projectReadiness = codexConfig?.projectReadiness || {};
   const currentProject = projectReadiness.currentProject;
@@ -3446,6 +3730,32 @@ function buildDoctorFixKit(scan, codexConfig, runtime, context = {}) {
         "# experimental_compact_prompt_file = \"/path/to/compact_prompt.txt\"",
         "",
         "# Prefer AGENTS.md for durable repo guidance and skills for reusable workflows.",
+      ].join("\n"),
+    });
+  }
+
+  if (customAgents.status === "ready" && customAgents.tone !== "low") {
+    addFix({
+      id: "custom-agents",
+      label: "Custom Agents",
+      value: customAgents.label,
+      tone: customAgents.tone === "high" ? "high" : "medium",
+      action: customAgents.action || "Review agents",
+      detail:
+        "Custom agents can be powerful, but each spawned agent does its own model and tool work. Keep agents narrow, valid, and tuned to the job.",
+      snippet: [
+        "# Review custom agent files:",
+        `# ${displayPath(paths.customAgents)}`,
+        "# <project>/.codex/agents/",
+        "",
+        "# Each custom agent TOML must include:",
+        'name = "reviewer"',
+        'description = "Focused reviewer for correctness, security, and tests."',
+        'developer_instructions = """',
+        "Stay narrow. Return concise findings with file references.",
+        '"""',
+        "",
+        "# For fast scans, prefer a lighter model/effort inside the agent file when appropriate.",
       ].join("\n"),
     });
   }
@@ -3844,6 +4154,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
   const contextBudgetSummary = codexConfig?.contextBudgetSummary || buildContextBudgetSummary({});
   const instructionStack = codexConfig?.instructionStack || emptyInstructionStackSummary();
   const instructionOverrides = codexConfig?.instructionOverrides || emptyInstructionOverrideSummary();
+  const customAgents = codexConfig?.customAgents || emptyCustomAgentSummary();
   const goalsFeature = Boolean(codexConfig?.goalsFeature);
   const tier = codexConfig?.serviceTier || "standard";
   const desktopTier = codexConfig?.desktopServiceTier || null;
@@ -4216,6 +4527,15 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       detail: agentFanoutDetail,
     },
     {
+      id: "custom-agents",
+      label: "Custom Agents",
+      value: customAgents.label,
+      tone: customAgents.tone,
+      action: customAgents.action,
+      priority: customAgents.tone === "high" ? 87 : customAgents.tone === "medium" ? 67 : customAgents.agentCount ? 27 : 11,
+      detail: customAgents.detail,
+    },
+    {
       id: "project-playbooks",
       label: "Project Playbooks",
       value: existingProjectCount ? `${projectReadyCount}/${existingProjectCount}` : "None",
@@ -4450,6 +4770,21 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
       tone: agentFanoutHeavy ? "high" : "medium",
       priority: agentFanoutHeavy ? 86 : 70,
       detail: agentFanoutDetail,
+    });
+  }
+
+  if (customAgents.status === "ready" && customAgents.tone !== "low") {
+    addRecommendation({
+      id: "custom-agents",
+      label: "Custom Agents",
+      value: customAgents.label,
+      action: customAgents.action || "Review agents",
+      tone: customAgents.tone === "high" ? "high" : "medium",
+      priority: customAgents.tone === "high" ? 81 : 61,
+      detail:
+        customAgents.invalidAgentCount || customAgents.missingMcpEnvVarCount
+          ? `${customAgents.detail} Fix invalid agents before relying on subagent workflows for speed.`
+          : customAgents.detail,
     });
   }
 
@@ -4727,6 +5062,7 @@ function buildCodexDoctor(scan, codexConfig, runtime = {}, processSummary = {}) 
     agentMaxDepth: codexConfig?.agentMaxDepth ?? null,
     agentMaxDepthEffective: agentMaxDepth,
     agentJobMaxRuntimeSeconds: codexConfig?.agentJobMaxRuntimeSeconds ?? null,
+    customAgents,
     authCache,
     projectReadiness,
     profileCount: codexConfig?.profileCount || 0,
@@ -5168,6 +5504,11 @@ function benchmarkLiveScore(metrics) {
   score -= Math.min(8, ((Number(metrics.backgroundRssBytes || 0) / 1024 ** 3) || 0) * 2);
   score -= Math.min(8, Math.max(0, Number(metrics.agentMaxDepth || 1) - 1) * 4);
   score -= Math.min(6, Math.max(0, Number(metrics.agentMaxThreads || 6) - 12) * 0.45);
+  score -= Math.min(8, Number(metrics.customAgentInvalidCount || 0) * 4);
+  score -= Math.min(5, Number(metrics.customAgentBuiltInOverrideCount || 0) * 3);
+  score -= Math.min(5, Number(metrics.customAgentMissingMcpEnvVarCount || 0) * 2);
+  score -= Math.min(4, Number(metrics.customAgentHighEffortCount || 0) * 1.2);
+  score -= Math.min(4, Math.max(0, Number(metrics.customAgentInstructionBytes || 0) - 12 * 1024) / 8192);
   score -= Math.min(8, Math.max(0, Number(metrics.hookTurnScopedCommandCount || 0) - 1) * 1.2);
   score -= Math.min(4, Math.max(0, Number(metrics.hookBroadMatcherCount || 0)) * 1.5);
   if (metrics.approvalAutoReview) score -= 4;
@@ -5247,6 +5588,17 @@ function benchmarkGuidance(metrics) {
     );
   } else if (metrics.agentMaxThreads >= 12) {
     guidance.push(`Keep subagent fan-out scoped; agents.max_threads is ${Number(metrics.agentMaxThreads).toLocaleString()}.`);
+  }
+  if (metrics.customAgentInvalidCount > 0) {
+    guidance.push(`Fix ${Number(metrics.customAgentInvalidCount).toLocaleString()} invalid custom agent file${metrics.customAgentInvalidCount === 1 ? "" : "s"} before using subagents for speed.`);
+  } else if (metrics.customAgentMissingMcpEnvVarCount > 0) {
+    guidance.push(
+      `Check custom agent MCP setup: ${Number(metrics.customAgentMissingMcpEnvVarCount).toLocaleString()} referenced env var${metrics.customAgentMissingMcpEnvVarCount === 1 ? "" : "s"} ${metrics.customAgentMissingMcpEnvVarCount === 1 ? "was" : "were"} not visible to Refit.`,
+    );
+  } else if (metrics.customAgentBuiltInOverrideCount > 0) {
+    guidance.push(`Review ${Number(metrics.customAgentBuiltInOverrideCount).toLocaleString()} custom agent name${metrics.customAgentBuiltInOverrideCount === 1 ? "" : "s"} overriding built-in agents.`);
+  } else if (metrics.customAgentHighEffortCount > 0) {
+    guidance.push(`Review custom agents with high/xhigh reasoning; use lighter effort for fast scan-style subagents.`);
   }
   if (metrics.memoriesUseMemories && metrics.memoryBytes > 10 * 1024 ** 2) {
     guidance.push(`Review ${formatBytesServer(metrics.memoryBytes)} of local memories if Codex starts carrying stale assumptions.`);
@@ -5956,6 +6308,12 @@ function benchmarkDeltas(current, previous) {
     "backgroundCpuPercent",
     "agentMaxThreads",
     "agentMaxDepth",
+    "customAgentCount",
+    "customAgentInvalidCount",
+    "customAgentBuiltInOverrideCount",
+    "customAgentHighEffortCount",
+    "customAgentMissingMcpEnvVarCount",
+    "customAgentInstructionBytes",
     "mcpEnabledCount",
     "mcpRequiredCount",
     "mcpMissingEnvVarCount",
@@ -6016,6 +6374,16 @@ function summarizeBenchmarkEntry(entry) {
     backgroundCpuPercent: entry.metrics.backgroundCpuPercent || 0,
     agentMaxThreads: entry.metrics.agentMaxThreads ?? 6,
     agentMaxDepth: entry.metrics.agentMaxDepth ?? 1,
+    customAgentCount: entry.metrics.customAgentCount || 0,
+    customAgentInvalidCount: entry.metrics.customAgentInvalidCount || 0,
+    customAgentBuiltInOverrideCount: entry.metrics.customAgentBuiltInOverrideCount || 0,
+    customAgentHighEffortCount: entry.metrics.customAgentHighEffortCount || 0,
+    customAgentModelOverrideCount: entry.metrics.customAgentModelOverrideCount || 0,
+    customAgentSandboxOverrideCount: entry.metrics.customAgentSandboxOverrideCount || 0,
+    customAgentMcpServerCount: entry.metrics.customAgentMcpServerCount || 0,
+    customAgentRequiredMcpCount: entry.metrics.customAgentRequiredMcpCount || 0,
+    customAgentMissingMcpEnvVarCount: entry.metrics.customAgentMissingMcpEnvVarCount || 0,
+    customAgentInstructionBytes: entry.metrics.customAgentInstructionBytes || 0,
     approvalAutoReview: Boolean(entry.metrics.approvalAutoReview),
     approvalInteractive: entry.metrics.approvalInteractive !== false,
     approvalGranularPolicy: Boolean(entry.metrics.approvalGranularPolicy),
@@ -6110,6 +6478,8 @@ export async function benchmarkHistory(limit = 12) {
         mcpEnabledCount: latest.mcpEnabledCount - oldest.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - oldest.mcpRequiredCount,
         mcpMissingEnvVarCount: latest.mcpMissingEnvVarCount - oldest.mcpMissingEnvVarCount,
+        customAgentCount: latest.customAgentCount - oldest.customAgentCount,
+        customAgentInstructionBytes: latest.customAgentInstructionBytes - oldest.customAgentInstructionBytes,
         shellEnvVarCount: latest.shellEnvVarCount - oldest.shellEnvVarCount,
         shellEnvSecretLikeNameCount: latest.shellEnvSecretLikeNameCount - oldest.shellEnvSecretLikeNameCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - oldest.toolOutputTokenLimit,
@@ -6135,6 +6505,7 @@ export async function benchmarkHistory(limit = 12) {
         backgroundProcessCount: latest.backgroundProcessCount - previous.backgroundProcessCount,
         mcpEnabledCount: latest.mcpEnabledCount - previous.mcpEnabledCount,
         mcpRequiredCount: latest.mcpRequiredCount - previous.mcpRequiredCount,
+        customAgentCount: latest.customAgentCount - previous.customAgentCount,
         shellEnvVarCount: latest.shellEnvVarCount - previous.shellEnvVarCount,
         toolOutputTokenLimit: latest.toolOutputTokenLimit - previous.toolOutputTokenLimit,
         instructionTotalBytes: latest.instructionTotalBytes - previous.instructionTotalBytes,
@@ -6226,6 +6597,16 @@ export async function runBenchmark() {
     backgroundCpuPercent: scan.processes?.background?.cpuPercent || 0,
     agentMaxThreads: scan.codexConfig?.agentMaxThreadsEffective ?? 6,
     agentMaxDepth: scan.codexConfig?.agentMaxDepthEffective ?? 1,
+    customAgentCount: scan.codexConfig?.customAgents?.agentCount || 0,
+    customAgentInvalidCount: scan.codexConfig?.customAgents?.invalidAgentCount || 0,
+    customAgentBuiltInOverrideCount: scan.codexConfig?.customAgents?.builtInOverrideCount || 0,
+    customAgentHighEffortCount: scan.codexConfig?.customAgents?.highEffortCount || 0,
+    customAgentModelOverrideCount: scan.codexConfig?.customAgents?.modelOverrideCount || 0,
+    customAgentSandboxOverrideCount: scan.codexConfig?.customAgents?.sandboxOverrideCount || 0,
+    customAgentMcpServerCount: scan.codexConfig?.customAgents?.mcpServerCount || 0,
+    customAgentRequiredMcpCount: scan.codexConfig?.customAgents?.requiredMcpCount || 0,
+    customAgentMissingMcpEnvVarCount: scan.codexConfig?.customAgents?.missingMcpEnvVarCount || 0,
+    customAgentInstructionBytes: scan.codexConfig?.customAgents?.totalDeveloperInstructionBytes || 0,
     approvalAutoReview: Boolean(scan.codexConfig?.approvalFlow?.autoReviewApplies),
     approvalInteractive: scan.codexConfig?.approvalFlow?.interactiveApprovals !== false,
     approvalGranularPolicy: Boolean(scan.codexConfig?.approvalFlow?.granularPolicy),
