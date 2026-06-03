@@ -19,6 +19,7 @@ const resourcesDir = path.join(contentsDir, "Resources");
 const appResourcesDir = path.join(resourcesDir, "app");
 const plistPath = path.join(contentsDir, "Info.plist");
 const appIcon = path.join(projectRoot, "electron", "appIcon.icns");
+const entitlementsPath = path.join(projectRoot, "electron", "entitlements.mac.plist");
 
 function setPlist(key, value) {
   execFileSync("/usr/libexec/PlistBuddy", ["-c", `Set :${key} ${value}`, plistPath]);
@@ -74,19 +75,28 @@ async function copyAppSources() {
 function signApp(identity) {
   if (identity) {
     signNestedBinaries(identity);
-    execFileSync(
-      "codesign",
-      ["--force", "--deep", "--options", "runtime", "--timestamp", "--sign", identity, appPath],
-      { stdio: "inherit" },
-    );
+    signElectronBundles(identity);
+    signCode(identity, appPath, { entitlements: entitlementsPath });
     return;
   }
 
   execFileSync("codesign", ["--force", "--deep", "--sign", "-", appPath], { stdio: "inherit" });
 }
 
-function signFile(identity, filePath) {
-  execFileSync("codesign", ["--force", "--options", "runtime", "--timestamp", "--sign", identity, filePath], { stdio: "inherit" });
+function signCode(identity, filePath, { entitlements = null } = {}) {
+  const args = ["--force", "--options", "runtime", "--timestamp"];
+  if (entitlements) args.push("--entitlements", entitlements);
+  args.push("--sign", identity, filePath);
+  execFileSync("codesign", args, { stdio: "inherit" });
+}
+
+function signIfPresent(identity, filePath, options) {
+  try {
+    execFileSync("test", ["-e", filePath]);
+    signCode(identity, filePath, options);
+  } catch {
+    // Electron versions can move helper binaries. Missing optional nested binaries are fine.
+  }
 }
 
 function signNestedBinaries(identity) {
@@ -101,12 +111,30 @@ function signNestedBinaries(identity) {
   ];
 
   for (const binaryPath of nestedBinaries) {
-    try {
-      execFileSync("test", ["-f", binaryPath]);
-      signFile(identity, binaryPath);
-    } catch {
-      // Electron versions can move helper binaries. Missing optional nested binaries are fine.
-    }
+    signIfPresent(identity, binaryPath);
+  }
+}
+
+function signElectronBundles(identity) {
+  const frameworkDir = path.join(contentsDir, "Frameworks");
+  const frameworks = [
+    path.join(frameworkDir, "Electron Framework.framework"),
+    path.join(frameworkDir, "Mantle.framework"),
+    path.join(frameworkDir, "ReactiveObjC.framework"),
+    path.join(frameworkDir, "Squirrel.framework"),
+  ];
+  const helperApps = [
+    path.join(frameworkDir, "Electron Helper.app"),
+    path.join(frameworkDir, "Electron Helper (GPU).app"),
+    path.join(frameworkDir, "Electron Helper (Plugin).app"),
+    path.join(frameworkDir, "Electron Helper (Renderer).app"),
+  ];
+
+  for (const frameworkPath of frameworks) {
+    signIfPresent(identity, frameworkPath);
+  }
+  for (const helperAppPath of helperApps) {
+    signIfPresent(identity, helperAppPath, { entitlements: entitlementsPath });
   }
 }
 
