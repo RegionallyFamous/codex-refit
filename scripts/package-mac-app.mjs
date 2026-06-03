@@ -13,6 +13,7 @@ const releaseDir = path.join(projectRoot, "release");
 const appPath = path.join(releaseDir, `${appName}.app`);
 const dmgRoot = path.join(releaseDir, "dmg-root");
 const dmgPath = path.join(releaseDir, `${appName.replaceAll(" ", "-")}-${version}-macOS-arm64.dmg`);
+const notarizationZipPath = path.join(releaseDir, `${appName.replaceAll(" ", "-")}-${version}-macOS-arm64-notarization.zip`);
 const contentsDir = path.join(appPath, "Contents");
 const resourcesDir = path.join(contentsDir, "Resources");
 const appResourcesDir = path.join(resourcesDir, "app");
@@ -72,6 +73,7 @@ async function copyAppSources() {
 
 function signApp(identity) {
   if (identity) {
+    signNestedBinaries(identity);
     execFileSync(
       "codesign",
       ["--force", "--deep", "--options", "runtime", "--timestamp", "--sign", identity, appPath],
@@ -83,8 +85,59 @@ function signApp(identity) {
   execFileSync("codesign", ["--force", "--deep", "--sign", "-", appPath], { stdio: "inherit" });
 }
 
+function signFile(identity, filePath) {
+  execFileSync("codesign", ["--force", "--options", "runtime", "--timestamp", "--sign", identity, filePath], { stdio: "inherit" });
+}
+
+function signNestedBinaries(identity) {
+  const frameworkDir = path.join(contentsDir, "Frameworks");
+  const nestedBinaries = [
+    path.join(frameworkDir, "Electron Framework.framework", "Versions", "A", "Libraries", "libEGL.dylib"),
+    path.join(frameworkDir, "Electron Framework.framework", "Versions", "A", "Libraries", "libGLESv2.dylib"),
+    path.join(frameworkDir, "Electron Framework.framework", "Versions", "A", "Libraries", "libffmpeg.dylib"),
+    path.join(frameworkDir, "Electron Framework.framework", "Versions", "A", "Libraries", "libvk_swiftshader.dylib"),
+    path.join(frameworkDir, "Electron Framework.framework", "Versions", "A", "Helpers", "chrome_crashpad_handler"),
+    path.join(frameworkDir, "Squirrel.framework", "Versions", "A", "Resources", "ShipIt"),
+  ];
+
+  for (const binaryPath of nestedBinaries) {
+    try {
+      execFileSync("test", ["-f", binaryPath]);
+      signFile(identity, binaryPath);
+    } catch {
+      // Electron versions can move helper binaries. Missing optional nested binaries are fine.
+    }
+  }
+}
+
 function verifyAppSignature() {
   execFileSync("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath], { stdio: "inherit" });
+}
+
+function submitForNotarization(filePath, profile) {
+  const output = execFileSync(
+    "xcrun",
+    ["notarytool", "submit", filePath, "--keychain-profile", profile, "--wait", "--output-format", "json"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+  );
+  const result = JSON.parse(output);
+  if (result.status !== "Accepted") {
+    throw new Error(`Notarization failed for ${filePath}: ${result.status || "unknown"} (${result.id || "no submission id"})`);
+  }
+  console.log(`Notarization accepted for ${filePath}: ${result.id}`);
+}
+
+function staple(filePath) {
+  execFileSync("xcrun", ["stapler", "staple", filePath], { stdio: "inherit" });
+  execFileSync("xcrun", ["stapler", "validate", filePath], { stdio: "inherit" });
+}
+
+async function notarizeApp(profile) {
+  await rm(notarizationZipPath, { force: true });
+  execFileSync("ditto", ["-c", "-k", "--keepParent", appPath, notarizationZipPath], { stdio: "inherit" });
+  submitForNotarization(notarizationZipPath, profile);
+  staple(appPath);
+  verifyAppSignature();
 }
 
 async function createDmg(identity) {
@@ -127,6 +180,7 @@ async function main() {
   deletePlist("ElectronAsarIntegrity");
 
   const identity = findDeveloperIdIdentity();
+  const notaryProfile = process.env.NOTARY_PROFILE || null;
   signApp(identity);
   verifyAppSignature();
 
@@ -137,7 +191,17 @@ async function main() {
   }
 
   console.log(appPath);
+  if (notaryProfile) {
+    if (!identity) {
+      throw new Error("NOTARY_PROFILE requires a Developer ID signed app, but no Developer ID signing identity was found.");
+    }
+    await notarizeApp(notaryProfile);
+  }
   await createDmg(identity);
+  if (notaryProfile) {
+    submitForNotarization(dmgPath, notaryProfile);
+    staple(dmgPath);
+  }
   console.log(dmgPath);
   if (!identity) {
     console.warn("Developer ID signing identity not found; created an ad-hoc signed app and unsigned DMG.");

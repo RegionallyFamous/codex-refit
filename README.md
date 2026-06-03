@@ -62,9 +62,9 @@ The happy path is simple: scan, understand, optimize, check the result.
 
 ## Download
 
-Grab the signed macOS DMG from the [Releases page](https://github.com/RegionallyFamous/codex-refit/releases).
+Grab the signed and notarized macOS DMG from the [Releases page](https://github.com/RegionallyFamous/codex-refit/releases).
 
-The current build is Developer ID signed, but not notarized yet. macOS may still show an Unnotarized Developer ID warning on first open. That is expected for this early local utility.
+The current build is Developer ID signed and notarized by Apple.
 
 ## Want The Technical Details?
 
