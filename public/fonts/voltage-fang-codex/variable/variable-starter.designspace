@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<designspace format="5.0">
+  <axes>
+    <axis tag="wght" name="Weight" minimum="300" default="400" maximum="900" />
+  </axes>
+  <sources>
+    <source filename="sources/voltage-fang-light-qbt.ufo" name="Voltage Fang voltage-fang-light.qbt" familyname="Voltage Fang" stylename="voltage-fang-light.qbt">
+      <location>
+        <dimension name="Weight" xvalue="300" />
+      </location>
+    </source>
+    <source filename="sources/voltage-fang-black-qbt.ufo" name="Voltage Fang voltage-fang-black.qbt" familyname="Voltage Fang" stylename="voltage-fang-black.qbt">
+      <location>
+        <dimension name="Weight" xvalue="900" />
+      </location>
+    </source>
+  </sources>
+  <instances>
+    <instance familyname="Voltage Fang" stylename="wght 300" filename="instances/voltage-fang-wght-300.ufo">
+      <location>
+        <dimension name="Weight" xvalue="300" />
+      </location>
+    </instance>
+    <instance familyname="Voltage Fang" stylename="wght 400" filename="instances/voltage-fang-wght-400.ufo">
+      <location>
+        <dimension name="Weight" xvalue="400" />
+      </location>
+    </instance>
+    <instance familyname="Voltage Fang" stylename="wght 700" filename="instances/voltage-fang-wght-700.ufo">
+      <location>
+        <dimension name="Weight" xvalue="700" />
+      </location>
+    </instance>
+    <instance familyname="Voltage Fang" stylename="wght 900" filename="instances/voltage-fang-wght-900.ufo">
+      <location>
+        <dimension name="Weight" xvalue="900" />
+      </location>
+    </instance>
+  </instances>
+</designspace>

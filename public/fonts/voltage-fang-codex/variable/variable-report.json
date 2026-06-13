@@ -1,0 +1,46 @@
+{
+  "generatedAt": "2026-06-09T19:07:00.234987+00:00",
+  "family": "Voltage Fang",
+  "axis": {
+    "tag": "wght",
+    "name": "Weight",
+    "minimum": 300.0,
+    "default": 400.0,
+    "maximum": 900.0
+  },
+  "masters": [
+    {
+      "label": "voltage-fang-light.qbt",
+      "path": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02/source/voltage-fang-light.qbt.json",
+      "location": 300.0
+    },
+    {
+      "label": "voltage-fang-black.qbt",
+      "path": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02/source/voltage-fang-black.qbt.json",
+      "location": 900.0
+    }
+  ],
+  "instances": [
+    300.0,
+    400.0,
+    700.0,
+    900.0
+  ],
+  "compatibility": {
+    "ok": true,
+    "glyphSet": {
+      "ok": true,
+      "missingByMaster": {}
+    },
+    "contours": {
+      "ok": true,
+      "mismatches": []
+    },
+    "duplicateLocations": {
+      "ok": true,
+      "locations": []
+    }
+  },
+  "status": "pass",
+  "warnings": []
+}

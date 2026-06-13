@@ -1,0 +1,45 @@
+Patch Needed QA Report
+======================
+Status: PASS
+Validation: /Users/nick/Documents/Weirdo/output/embroidery/bidoof-8bit-round-patch-vectorizer-stitchsafe-validation.txt
+Threadlist: /Users/nick/Documents/Weirdo/output/embroidery/bidoof-8bit-round-patch-vectorizer-stitchsafe-threadlist.txt
+Troubleshoot SVG: /Users/nick/Documents/Weirdo/output/embroidery/bidoof-8bit-vectorizer-ai-stitchsafe2-troubleshoot.svg
+
+Design Metrics
+--------------
+Size: 76.20 mm x 76.20 mm
+Stitches: 19564
+PES threads: 8
+Threadlist colors: 7
+Thread order entries: 8
+Trims: 19
+Jumps: 21
+Max stitch segment: 3.10 mm
+>12 mm jumps: 11
+Untrimmed >12 mm jumps: 0
+Dense-cell endpoint max: 220
+
+Threshold Checks
+----------------
+- PASS: PES thread count: 8 (<= 12)
+- PASS: Threadlist color count: 7 (<= 12)
+- PASS: Thread order entries: 8 (<= 14)
+- PASS: Stitch commands: 19564 (<= 30000)
+- PASS: Max stitch segment: 3.10 mm (<= 7.00 mm)
+- PASS: >7 mm stitch segments: 0 (<= 0)
+- PASS: >10 mm stitch segments: 0 (<= 0)
+- PASS: Untrimmed >12 mm jumps: 0 (<= 0)
+- PASS: Trimmed/total >12 mm jumps: 11 (<= 40)
+- PASS: Trims: 19 (<= 60)
+- PASS: Jumps: 21 (<= 80)
+- PASS: Dense 5 mm cell endpoints: 220 (<= 500)
+- PASS: Ink/Stitch Small Fill warnings: 0 (<= 0)
+- PASS: Ink/Stitch border-cross warnings: 0 (<= 4)
+
+Ink/Stitch Warning Counts
+-------------------------
+- none detected
+
+Next Actions
+------------
+- Software QA passed. A physical stitch-out on target fabric is still the final proof.

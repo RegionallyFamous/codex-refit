@@ -1,0 +1,20 @@
+{
+  "generatedAt": "2026-06-09T19:07:00.241266+00:00",
+  "projectName": "Voltage Fang wght 400",
+  "status": "pass",
+  "warnings": [],
+  "checks": {
+    "requiredGlyphs": {
+      "ok": true,
+      "missing": []
+    },
+    "emptyContours": {
+      "ok": true,
+      "glyphs": []
+    },
+    "advanceWidths": {
+      "ok": true,
+      "glyphs": []
+    }
+  }
+}

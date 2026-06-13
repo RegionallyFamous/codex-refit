@@ -1,0 +1,13 @@
+{
+  "publishedAt": "2026-06-09T21:01:16.549048+00:00",
+  "sourcePackage": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02",
+  "destination": "/Users/nick/Documents/Weirdo/public/fonts/voltage-fang-codex",
+  "familyName": "Voltage Fang",
+  "sourceReport": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02/package-report.json",
+  "urlPath": "/public/fonts/voltage-fang-codex/index.html",
+  "copiedFiles": 42,
+  "destructiveCleanup": false,
+  "policy": "best",
+  "scoreKey": "overall",
+  "decision": "restored usable best 7.1"
+}

@@ -1,0 +1,140 @@
+{
+  "palette": {
+    "name": "Generic Embroidery Starter Palette",
+    "brand": "Generic",
+    "source": "assets/thread-palettes/generic-embroidery-starter.json"
+  },
+  "max_distance_warning": 55.0,
+  "thread_order": [
+    {
+      "index": 1,
+      "source_hex": "#FFF2C7",
+      "brand": "Generic",
+      "code": "GEN-003",
+      "name": "Cream",
+      "hex": "#FFF2C7",
+      "distance": 0.0
+    },
+    {
+      "index": 2,
+      "source_hex": "#080B0C",
+      "brand": "Generic",
+      "code": "GEN-001",
+      "name": "Black",
+      "hex": "#080B0C",
+      "distance": 0.0
+    },
+    {
+      "index": 3,
+      "source_hex": "#D8952A",
+      "brand": "Generic",
+      "code": "GEN-004",
+      "name": "Golden Tan",
+      "hex": "#D8952A",
+      "distance": 0.0
+    },
+    {
+      "index": 4,
+      "source_hex": "#4B4A45",
+      "brand": "Generic",
+      "code": "GEN-009",
+      "name": "Charcoal",
+      "hex": "#4B4A45",
+      "distance": 0.0
+    },
+    {
+      "index": 5,
+      "source_hex": "#D94A32",
+      "brand": "Generic",
+      "code": "GEN-010",
+      "name": "Red Orange",
+      "hex": "#D94A32",
+      "distance": 0.0
+    },
+    {
+      "index": 6,
+      "source_hex": "#F6DFA8",
+      "brand": "Generic",
+      "code": "GEN-006",
+      "name": "Light Tan",
+      "hex": "#FFD48F",
+      "distance": 7.55
+    },
+    {
+      "index": 7,
+      "source_hex": "#F8F3E7",
+      "brand": "Generic",
+      "code": "GEN-002",
+      "name": "Soft White",
+      "hex": "#F8F3E7",
+      "distance": 0.0
+    },
+    {
+      "index": 8,
+      "source_hex": "#080B0C",
+      "brand": "Generic",
+      "code": "GEN-001",
+      "name": "Black",
+      "hex": "#080B0C",
+      "distance": 0.0
+    }
+  ],
+  "unique_colors": [
+    {
+      "source_hex": "#FFF2C7",
+      "brand": "Generic",
+      "code": "GEN-003",
+      "name": "Cream",
+      "hex": "#FFF2C7",
+      "distance": 0.0
+    },
+    {
+      "source_hex": "#080B0C",
+      "brand": "Generic",
+      "code": "GEN-001",
+      "name": "Black",
+      "hex": "#080B0C",
+      "distance": 0.0
+    },
+    {
+      "source_hex": "#D8952A",
+      "brand": "Generic",
+      "code": "GEN-004",
+      "name": "Golden Tan",
+      "hex": "#D8952A",
+      "distance": 0.0
+    },
+    {
+      "source_hex": "#4B4A45",
+      "brand": "Generic",
+      "code": "GEN-009",
+      "name": "Charcoal",
+      "hex": "#4B4A45",
+      "distance": 0.0
+    },
+    {
+      "source_hex": "#D94A32",
+      "brand": "Generic",
+      "code": "GEN-010",
+      "name": "Red Orange",
+      "hex": "#D94A32",
+      "distance": 0.0
+    },
+    {
+      "source_hex": "#F6DFA8",
+      "brand": "Generic",
+      "code": "GEN-006",
+      "name": "Light Tan",
+      "hex": "#FFD48F",
+      "distance": 7.55
+    },
+    {
+      "source_hex": "#F8F3E7",
+      "brand": "Generic",
+      "code": "GEN-002",
+      "name": "Soft White",
+      "hex": "#F8F3E7",
+      "distance": 0.0
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "overallScore",
+    "readabilityScore",
+    "energyScore",
+    "originalityScore",
+    "compositionScore",
+    "verdict",
+    "strongestDecisions",
+    "weakestProblems",
+    "visualRisks",
+    "controlGroupVerdict",
+    "counterShapeVerdict",
+    "spacingVerdict",
+    "glyphDifferentiationVerdict",
+    "proofStringFailures",
+    "nextEdits",
+    "tastePracticeFocus",
+    "promptPatch",
+    "learningOutcome",
+    "referenceStrategy",
+    "memoryLesson"
+  ],
+  "properties": {
+    "overallScore": {
+      "type": "number"
+    },
+    "readabilityScore": {
+      "type": "number"
+    },
+    "energyScore": {
+      "type": "number"
+    },
+    "originalityScore": {
+      "type": "number"
+    },
+    "compositionScore": {
+      "type": "number"
+    },
+    "verdict": {
+      "type": "string"
+    },
+    "strongestDecisions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "weakestProblems": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "visualRisks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "controlGroupVerdict": {
+      "type": "string"
+    },
+    "counterShapeVerdict": {
+      "type": "string"
+    },
+    "spacingVerdict": {
+      "type": "string"
+    },
+    "glyphDifferentiationVerdict": {
+      "type": "string"
+    },
+    "proofStringFailures": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nextEdits": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tastePracticeFocus": {
+      "type": "string"
+    },
+    "promptPatch": {
+      "type": "string"
+    },
+    "learningOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "priorFocus",
+        "status",
+        "evidence",
+        "nextAction"
+      ],
+      "properties": {
+        "priorFocus": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "resolved",
+            "still_failing",
+            "regressed",
+            "not_applicable"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "nextAction": {
+          "type": "string",
+          "enum": [
+            "retire",
+            "keep",
+            "escalate",
+            "ignore"
+          ]
+        }
+      }
+    },
+    "referenceStrategy": {
+      "type": "string"
+    },
+    "memoryLesson": {
+      "type": "string"
+    }
+  }
+}

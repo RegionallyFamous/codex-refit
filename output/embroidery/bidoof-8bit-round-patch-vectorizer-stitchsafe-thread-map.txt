@@ -1,0 +1,25 @@
+Thread Palette Mapping
+======================
+Palette: Generic Embroidery Starter Palette
+Colors in palette: 16
+
+Thread Order
+------------
+1. #FFF2C7 -> Generic GEN-003 Cream (#FFF2C7), distance 0.0
+2. #080B0C -> Generic GEN-001 Black (#080B0C), distance 0.0
+3. #D8952A -> Generic GEN-004 Golden Tan (#D8952A), distance 0.0
+4. #4B4A45 -> Generic GEN-009 Charcoal (#4B4A45), distance 0.0
+5. #D94A32 -> Generic GEN-010 Red Orange (#D94A32), distance 0.0
+6. #F6DFA8 -> Generic GEN-006 Light Tan (#FFD48F), distance 7.55
+7. #F8F3E7 -> Generic GEN-002 Soft White (#F8F3E7), distance 0.0
+8. #080B0C -> Generic GEN-001 Black (#080B0C), distance 0.0
+
+Unique Source Colors
+--------------------
+- #FFF2C7 -> Generic GEN-003 Cream (#FFF2C7), distance 0.0
+- #080B0C -> Generic GEN-001 Black (#080B0C), distance 0.0
+- #D8952A -> Generic GEN-004 Golden Tan (#D8952A), distance 0.0
+- #4B4A45 -> Generic GEN-009 Charcoal (#4B4A45), distance 0.0
+- #D94A32 -> Generic GEN-010 Red Orange (#D94A32), distance 0.0
+- #F6DFA8 -> Generic GEN-006 Light Tan (#FFD48F), distance 7.55
+- #F8F3E7 -> Generic GEN-002 Soft White (#F8F3E7), distance 0.0

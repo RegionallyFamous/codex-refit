@@ -1,0 +1,40 @@
+PES Validation Report
+=====================
+File: output/embroidery/bidoof-8bit-round-patch-vectorizer-stitchsafe.pes
+Design size: 76.20 x 76.20 mm
+Bounds: (0, 0, 762, 762)
+Threads in PES: 8
+Total commands: 19612
+Stitch commands: 19564
+Color changes: 7
+Trims: 19
+Jumps: 21
+
+Stitch Lengths
+--------------
+Max stitch segment: 3.10 mm
+Average stitch segment: 1.56 mm
+> 7 mm stitch segments: 0
+> 10 mm stitch segments: 0
+Max jump segment: 34.49 mm
+> 12 mm jump segments: 11
+> 12 mm jumps without immediate trim: 0
+
+Density Heuristic
+-----------------
+Grid: 5 mm x 5 mm endpoint count
+Maximum 5 mm cell stitch endpoints: 220
+
+Command Counts
+--------------
+color_change: 7
+end: 1
+jump: 21
+stitch: 19564
+trim: 19
+
+Warnings
+--------
+- No obvious software-level geometry warnings.
+
+Simulation preview: output/embroidery/bidoof-8bit-round-patch-vectorizer-stitchsafe-stitch-sim.png

@@ -1,0 +1,80 @@
+{
+  "generatedAt": "2026-06-09T19:07:00.110975+00:00",
+  "familyName": "Voltage Fang",
+  "styleName": "Regular",
+  "prompt": "electric creature-battle title letters with arcade speed, comet-fang weirdness, chunky sticker energy, sharp readable monster-showdown drama Codex learning constraints: Fused-engine diagnosis: clean counters helped, but generic athletic chamfers are not enough. Add oversized creature-specific events: jaw apertures, fang terminals, broken shoulders, hooked counters, and voltage bridges that remain visible at mobile proof size. Prompt patches: Next pass: judge only the undecorated black proof first. Keep the reverse-slanted monster-title stance, but replace repeated esports chamfer chips with one oversized electric-fang structural event per uppercase and numeral. Make C an open jaw with a clear lower fang, G a jaw with an unmistakable inward voltage hook, O a closed charged ring with one large asymmetric break, 0 a slashed form clearly unlike O, 6 an open top hook with lower bite, 8 two pinched counters, and 9 a top loop with a descending fang tail. Apply mint fill, heavy black sticker outline, and purple shadow only after the raw silhouettes pass. Mobile hero: larger centered two-line VOLTAGE / FANG with no crop and less dead space. Next pass: judge only the undecorated black proof first. Keep the reverse-slanted monster-title stance, but remove repeated small chips as the main texture. Each uppercase and numeral needs one large structural electric-fang event visible on mobile. Prioritize C=open jaw with lower fang, G=jaw plus oversized inward voltage hook, O=closed ring with one major voltage break, 0=clear slash unlike O, 6=open top hook plus lower bite, 8=two visibly pinched counters, 9=top loop with descending fang tail. Apply mint fill, black sticker outline, and purple shadow only after the raw silhouettes pass. Lessons: Do not approve Voltage Fang when the decorated hero carries more concept than the raw alphabet. Approval requires mobile-visible, individualized electric-fang silhouettes, especially in C/G/O and 0/6/8/9, plus deliberate mobile scale and tighter proof spacing. Do not approve Voltage Fang when the decorated hero carries the concept better than the raw alphabet. Approval requires visibly individualized electric-fang silhouettes in the black proof, especially C/G/O and 0/6/8/9. Do not approve Voltage Fang while the decorated hero is stronger than the raw alphabet or while mobile crops the title. Approval requires complete mobile composi...",
+  "seed": 4131653621,
+  "concept": "A high-energy display-font package generated from a prompt, with procedural QBT source plus an optional curated open-font remix lane for production-quality static TTF/WOFF2 output.",
+  "outlineEngine": "fused-outline",
+  "tasteDecisions": [
+    "Weight is intentionally loud at 125.0 units, so the face reads as title/display rather than body text.",
+    "Slant is set to -16.1 degrees for forward motion.",
+    "Spike energy 0.29 and jitter 0.02 create controlled weirdness while preserving alphabet recognition.",
+    "Spacing is conservative before kerning; this generator prioritizes usable proofs over tight logo-only spectacle.",
+    "The workflow avoids arbitrary font scraping and records prompt, seed, source font, license, and deterministic transforms for provenance.",
+    "Every uppercase and numeral has a recorded construction idea; Codex should reject the result if those ideas are not visible in the raw black proof.",
+    "The fused-outline engine uses single silhouette contours and reversed counter contours before decorative color treatment."
+  ],
+  "glyphConstruction": {
+    "0": "slashed zero with a different counter rhythm than O",
+    "1": "offset flag and grounded base notch",
+    "2": "top bite that turns into a fast diagonal ramp",
+    "3": "stacked jaws with a hard center shelf",
+    "4": "open triangular frame with a sharp cross-stab",
+    "5": "clipped top shelf and lower bite",
+    "6": "open top hook with a distinct lower loop bite",
+    "7": "long falling lightning slash with one midair nick",
+    "8": "two counters pinched by an offset center voltage seam",
+    "9": "top loop and descending fang tail",
+    "A": "split peak fang with a dropped voltage crossbar",
+    "B": "two separate bowl bites so the upper and lower lobes do different jobs",
+    "C": "open creature jaw with a lower fang spur",
+    "D": "heavy back stem with one dorsal lightning bite",
+    "E": "staggered electric arms with a broken middle shoulder",
+    "F": "top-heavy arcade flag with a missing lower tooth",
+    "G": "C jaw plus an inward voltage hook",
+    "H": "paired pillars joined by a cracked lightning bridge",
+    "I": "narrow charged spine with oversized caps",
+    "J": "hooked tail that turns into a fang",
+    "K": "broken knee where the diagonals collide",
+    "L": "grounded foot with a forward bite",
+    "M": "wide double-claw center valley",
+    "N": "single bolt diagonal cutting across two blunt stems",
+    "O": "closed charged ring with one major asymmetric voltage break",
+    "P": "upper bowl punch with a quiet lower stem",
+    "Q": "O ring plus a long comet tail",
+    "R": "punched bowl and aggressive kicked leg",
+    "S": "serpentine center with two opposing speed cuts",
+    "T": "oversized top rail and narrow charged stem",
+    "U": "bucket bottom with a bitten right shoulder",
+    "V": "single deep fang point",
+    "W": "double fang rhythm with uneven outer claws",
+    "X": "crossing voltage shards with a central collision chip",
+    "Y": "forked upper arms feeding one blunt stem",
+    "Z": "lightning rail with a snapped lower exit"
+  },
+  "modernSupport": {
+    "staticBuild": [
+      "TTF",
+      "WOFF2"
+    ],
+    "source": [
+      "QBT JSON",
+      "SVG proof"
+    ],
+    "variablePreflight": "Light/Bold compatible QBT masters and interpolation proofs can be generated.",
+    "notIncluded": [
+      "manual kerning",
+      "GSUB alternates",
+      "hinting",
+      "final OpenType variable binary"
+    ]
+  },
+  "proofStrings": [
+    "HHH OOO HOO OHH",
+    "nnn ooo non ono",
+    "Hamburgefontsiv",
+    "AVATAR Toffee Wavy YoYo",
+    "VOLTAGE FANG\nTHE QUICK\nBROWN TOOL\nFANGS\nVOLTAGE\n& ODD\nGLYPHS!\nHAMBURGE\nFONTSIV\n0123456789"
+  ]
+}

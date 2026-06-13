@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
+const publicDir = path.join(rootDir, "public");
 const dataDir = path.resolve(process.env.CODEX_REFIT_DATA_DIR || rootDir);
 const homeDir = os.homedir();
 const appSupport = path.join(homeDir, "Library", "Application Support");
@@ -145,6 +146,10 @@ const contentTypes = {
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
   ".svg": "image/svg+xml",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
 };
 
 function assertAllowed(targetPath) {
@@ -18867,14 +18872,19 @@ function sendJson(res, status, payload) {
 async function serveStatic(req, res, url) {
   const requested = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
   const relative = requested.replace(/^\/+/, "");
-  const filePath = path.resolve(path.join(rootDir, relative));
-  if (filePath !== rootDir && !filePath.startsWith(`${rootDir}${path.sep}`)) {
+  const publicPath = path.resolve(path.join(publicDir, relative));
+  const rootPath = path.resolve(path.join(rootDir, relative));
+  const isPublicPath = publicPath === publicDir || publicPath.startsWith(`${publicDir}${path.sep}`);
+  const isRootPath = rootPath === rootDir || rootPath.startsWith(`${rootDir}${path.sep}`);
+  if (!isPublicPath || !isRootPath) {
     res.writeHead(403);
     res.end("Forbidden");
     return;
   }
 
-  const stats = await statOrNull(filePath);
+  const publicStats = await statOrNull(publicPath);
+  const filePath = publicStats?.isFile() ? publicPath : rootPath;
+  const stats = publicStats?.isFile() ? publicStats : await statOrNull(filePath);
   if (!stats?.isFile()) {
     res.writeHead(404);
     res.end("Not found");

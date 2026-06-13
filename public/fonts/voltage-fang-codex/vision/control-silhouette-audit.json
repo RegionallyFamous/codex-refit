@@ -1,0 +1,470 @@
+{
+  "generatedAt": "2026-06-09T21:31:40.517734+00:00",
+  "projectName": "Voltage Fang",
+  "maskSize": 96,
+  "nearCloneThreshold": 0.74,
+  "status": "warn",
+  "summary": {
+    "glyphsAudited": [
+      "C",
+      "G",
+      "O",
+      "Q",
+      "0",
+      "6",
+      "8",
+      "9",
+      "B"
+    ],
+    "nearCloneCount": 3,
+    "topPairs": [
+      {
+        "group": "O0G6Q9B8",
+        "pair": "B/8",
+        "iou": 0.849,
+        "status": "near-clone"
+      },
+      {
+        "group": "OO00",
+        "pair": "O/0",
+        "iou": 0.767,
+        "status": "near-clone"
+      },
+      {
+        "group": "O0G6Q9B8",
+        "pair": "O/0",
+        "iou": 0.767,
+        "status": "near-clone"
+      },
+      {
+        "group": "CGOQ",
+        "pair": "G/O",
+        "iou": 0.736,
+        "status": "separated"
+      },
+      {
+        "group": "O0G6Q9B8",
+        "pair": "O/G",
+        "iou": 0.736,
+        "status": "separated"
+      },
+      {
+        "group": "CGOQ",
+        "pair": "C/G",
+        "iou": 0.726,
+        "status": "separated"
+      },
+      {
+        "group": "O0G6Q9B8",
+        "pair": "0/G",
+        "iou": 0.693,
+        "status": "separated"
+      },
+      {
+        "group": "0689",
+        "pair": "0/8",
+        "iou": 0.679,
+        "status": "separated"
+      }
+    ]
+  },
+  "glyphs": {
+    "C": {
+      "bounds": [
+        23.0,
+        190.0,
+        761.0,
+        760.0
+      ],
+      "aspect": 1.295,
+      "contours": 1,
+      "positiveArea": 188584.5,
+      "negativeArea": 0.0,
+      "counterRatio": 0.0,
+      "blackRatio": 0.297
+    },
+    "G": {
+      "bounds": [
+        23.0,
+        190.0,
+        755.0,
+        760.0
+      ],
+      "aspect": 1.284,
+      "contours": 1,
+      "positiveArea": 249420.0,
+      "negativeArea": 0.0,
+      "counterRatio": 0.0,
+      "blackRatio": 0.316
+    },
+    "O": {
+      "bounds": [
+        22.0,
+        185.0,
+        709.0,
+        760.0
+      ],
+      "aspect": 1.195,
+      "contours": 2,
+      "positiveArea": 303832.5,
+      "negativeArea": 87420.5,
+      "counterRatio": 0.288,
+      "blackRatio": 0.318
+    },
+    "Q": {
+      "bounds": [
+        22.0,
+        185.0,
+        665.0,
+        835.0
+      ],
+      "aspect": 0.989,
+      "contours": 2,
+      "positiveArea": 300892.5,
+      "negativeArea": 78337.5,
+      "counterRatio": 0.26,
+      "blackRatio": 0.377
+    },
+    "0": {
+      "bounds": [
+        22.0,
+        185.0,
+        700.0,
+        760.0
+      ],
+      "aspect": 1.179,
+      "contours": 3,
+      "positiveArea": 353124.5,
+      "negativeArea": 62600.0,
+      "counterRatio": 0.177,
+      "blackRatio": 0.408
+    },
+    "6": {
+      "bounds": [
+        22.0,
+        190.0,
+        704.0,
+        760.0
+      ],
+      "aspect": 1.196,
+      "contours": 2,
+      "positiveArea": 230917.5,
+      "negativeArea": 25399.5,
+      "counterRatio": 0.11,
+      "blackRatio": 0.277
+    },
+    "8": {
+      "bounds": [
+        20.0,
+        185.0,
+        682.0,
+        760.0
+      ],
+      "aspect": 1.151,
+      "contours": 3,
+      "positiveArea": 276496.5,
+      "negativeArea": 54868.0,
+      "counterRatio": 0.198,
+      "blackRatio": 0.363
+    },
+    "9": {
+      "bounds": [
+        72.0,
+        185.0,
+        676.0,
+        806.0
+      ],
+      "aspect": 0.973,
+      "contours": 2,
+      "positiveArea": 223556.5,
+      "negativeArea": 36254.0,
+      "counterRatio": 0.162,
+      "blackRatio": 0.35
+    },
+    "B": {
+      "bounds": [
+        -19.0,
+        190.0,
+        648.0,
+        760.0
+      ],
+      "aspect": 1.17,
+      "contours": 3,
+      "positiveArea": 282092.5,
+      "negativeArea": 54868.5,
+      "counterRatio": 0.195,
+      "blackRatio": 0.361
+    }
+  },
+  "groups": {
+    "CGOQ": {
+      "glyphs": [
+        "C",
+        "G",
+        "O",
+        "Q"
+      ],
+      "pairs": [
+        {
+          "pair": "G/O",
+          "iou": 0.736,
+          "status": "separated"
+        },
+        {
+          "pair": "C/G",
+          "iou": 0.726,
+          "status": "separated"
+        },
+        {
+          "pair": "O/Q",
+          "iou": 0.671,
+          "status": "separated"
+        },
+        {
+          "pair": "C/O",
+          "iou": 0.626,
+          "status": "separated"
+        },
+        {
+          "pair": "G/Q",
+          "iou": 0.597,
+          "status": "separated"
+        },
+        {
+          "pair": "C/Q",
+          "iou": 0.542,
+          "status": "separated"
+        }
+      ]
+    },
+    "0689": {
+      "glyphs": [
+        "0",
+        "6",
+        "8",
+        "9"
+      ],
+      "pairs": [
+        {
+          "pair": "0/8",
+          "iou": 0.679,
+          "status": "separated"
+        },
+        {
+          "pair": "0/6",
+          "iou": 0.593,
+          "status": "separated"
+        },
+        {
+          "pair": "6/8",
+          "iou": 0.588,
+          "status": "separated"
+        },
+        {
+          "pair": "0/9",
+          "iou": 0.501,
+          "status": "separated"
+        },
+        {
+          "pair": "8/9",
+          "iou": 0.495,
+          "status": "separated"
+        },
+        {
+          "pair": "6/9",
+          "iou": 0.347,
+          "status": "separated"
+        }
+      ]
+    },
+    "OO00": {
+      "glyphs": [
+        "O",
+        "0"
+      ],
+      "pairs": [
+        {
+          "pair": "O/0",
+          "iou": 0.767,
+          "status": "near-clone"
+        }
+      ]
+    },
+    "O0G6Q9B8": {
+      "glyphs": [
+        "O",
+        "0",
+        "G",
+        "6",
+        "Q",
+        "9",
+        "B",
+        "8"
+      ],
+      "pairs": [
+        {
+          "pair": "B/8",
+          "iou": 0.849,
+          "status": "near-clone"
+        },
+        {
+          "pair": "O/0",
+          "iou": 0.767,
+          "status": "near-clone"
+        },
+        {
+          "pair": "O/G",
+          "iou": 0.736,
+          "status": "separated"
+        },
+        {
+          "pair": "0/G",
+          "iou": 0.693,
+          "status": "separated"
+        },
+        {
+          "pair": "0/8",
+          "iou": 0.679,
+          "status": "separated"
+        },
+        {
+          "pair": "O/Q",
+          "iou": 0.671,
+          "status": "separated"
+        },
+        {
+          "pair": "0/B",
+          "iou": 0.667,
+          "status": "separated"
+        },
+        {
+          "pair": "G/6",
+          "iou": 0.664,
+          "status": "separated"
+        },
+        {
+          "pair": "O/6",
+          "iou": 0.654,
+          "status": "separated"
+        },
+        {
+          "pair": "O/8",
+          "iou": 0.633,
+          "status": "separated"
+        },
+        {
+          "pair": "0/Q",
+          "iou": 0.632,
+          "status": "separated"
+        },
+        {
+          "pair": "O/B",
+          "iou": 0.626,
+          "status": "separated"
+        },
+        {
+          "pair": "G/Q",
+          "iou": 0.597,
+          "status": "separated"
+        },
+        {
+          "pair": "0/6",
+          "iou": 0.593,
+          "status": "separated"
+        },
+        {
+          "pair": "G/8",
+          "iou": 0.59,
+          "status": "separated"
+        },
+        {
+          "pair": "6/8",
+          "iou": 0.588,
+          "status": "separated"
+        },
+        {
+          "pair": "G/B",
+          "iou": 0.579,
+          "status": "separated"
+        },
+        {
+          "pair": "6/B",
+          "iou": 0.563,
+          "status": "separated"
+        },
+        {
+          "pair": "Q/8",
+          "iou": 0.54,
+          "status": "separated"
+        },
+        {
+          "pair": "Q/9",
+          "iou": 0.535,
+          "status": "separated"
+        },
+        {
+          "pair": "Q/B",
+          "iou": 0.53,
+          "status": "separated"
+        },
+        {
+          "pair": "6/Q",
+          "iou": 0.521,
+          "status": "separated"
+        },
+        {
+          "pair": "0/9",
+          "iou": 0.501,
+          "status": "separated"
+        },
+        {
+          "pair": "9/B",
+          "iou": 0.5,
+          "status": "separated"
+        },
+        {
+          "pair": "9/8",
+          "iou": 0.495,
+          "status": "separated"
+        },
+        {
+          "pair": "O/9",
+          "iou": 0.424,
+          "status": "separated"
+        },
+        {
+          "pair": "G/9",
+          "iou": 0.405,
+          "status": "separated"
+        },
+        {
+          "pair": "6/9",
+          "iou": 0.347,
+          "status": "separated"
+        }
+      ]
+    }
+  },
+  "nearClones": [
+    {
+      "group": "OO00",
+      "pair": "O/0",
+      "iou": 0.767,
+      "status": "near-clone"
+    },
+    {
+      "group": "O0G6Q9B8",
+      "pair": "B/8",
+      "iou": 0.849,
+      "status": "near-clone"
+    },
+    {
+      "group": "O0G6Q9B8",
+      "pair": "O/0",
+      "iou": 0.767,
+      "status": "near-clone"
+    }
+  ],
+  "sourceProject": "/Users/nick/Documents/Weirdo/public/fonts/voltage-fang-codex/proof/voltage-fang.normalized.qbt.json",
+  "contactSheet": "/Users/nick/Documents/Weirdo/public/fonts/voltage-fang-codex/vision/control-silhouette-audit.png"
+}

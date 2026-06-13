@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Monspark Display Specimen</title>
+    <link rel="stylesheet" href="./monspark-display.css">
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #152033;
+        --black: #071322;
+        --blue: #163da7;
+        --yellow: #ffd72e;
+        --paper: #f7f0df;
+        --panel: #ffffff;
+        --red: #d72825;
+        --green: #189466;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: ui-rounded, "Avenir Next", system-ui, sans-serif;
+      }
+
+      main {
+        width: min(1120px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 48px 0;
+      }
+
+      .title {
+        margin: 0;
+        font-family: "Monspark Display", ui-rounded, system-ui, sans-serif;
+        font-size: 4rem;
+        line-height: 0.9;
+        background: linear-gradient(180deg, #fff24a 0%, #f57a24 40%, #d72825 41%, #aa1319 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: var(--red);
+        -webkit-text-fill-color: transparent;
+        -webkit-text-stroke: 4px var(--black);
+        paint-order: stroke fill;
+        text-shadow: 3px 3px 0 var(--yellow), 7px 7px 0 var(--blue), 10px 10px 0 var(--black);
+      }
+
+      .subhead {
+        max-width: 760px;
+        margin: 28px 0 42px;
+        font-size: 1.05rem;
+        line-height: 1.5;
+      }
+
+      .specimen-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 18px;
+      }
+
+      .sample {
+        min-height: 190px;
+        padding: 22px;
+        border: 3px solid rgba(21, 32, 51, 0.18);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.78);
+        box-shadow: 0 12px 0 rgba(21, 32, 51, 0.08);
+      }
+
+      .label {
+        display: block;
+        margin-bottom: 18px;
+        color: rgba(21, 32, 51, 0.66);
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      .font-line {
+        margin: 0;
+        font-family: "Monspark Display", ui-rounded, system-ui, sans-serif;
+        font-size: 2.4rem;
+        line-height: 1.05;
+        overflow-wrap: anywhere;
+      }
+
+      .outlined {
+        background: linear-gradient(180deg, #fff24a 0%, #f57a24 40%, #d72825 41%, #aa1319 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: var(--red);
+        -webkit-text-fill-color: transparent;
+        -webkit-text-stroke: 3px var(--black);
+        paint-order: stroke fill;
+        text-shadow: 3px 3px 0 var(--yellow), 7px 7px 0 var(--blue);
+      }
+
+      .plain {
+        color: var(--ink);
+      }
+
+      .red {
+        color: var(--red);
+      }
+
+      .green {
+        color: var(--green);
+      }
+
+      code {
+        display: block;
+        white-space: pre-wrap;
+        font-family: "SFMono-Regular", ui-monospace, monospace;
+        font-size: 0.88rem;
+        line-height: 1.55;
+        color: #24324a;
+      }
+
+      @media (min-width: 720px) {
+        .title {
+          font-size: 7rem;
+          -webkit-text-stroke-width: 6px;
+          text-shadow: 4px 4px 0 var(--yellow), 9px 9px 0 var(--blue), 13px 13px 0 var(--black);
+        }
+
+        .subhead {
+          font-size: 1.2rem;
+        }
+
+        .font-line {
+          font-size: 3.8rem;
+        }
+      }
+
+      @media (min-width: 1040px) {
+        .title {
+          font-size: 10rem;
+          -webkit-text-stroke-width: 8px;
+          text-shadow: 5px 5px 0 var(--yellow), 11px 11px 0 var(--blue), 16px 16px 0 var(--black);
+        }
+
+        .font-line {
+          font-size: 4.8rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 class="title">MONSPARK</h1>
+      <p class="subhead">
+        An original angular display font for monster-battle title treatments.
+      </p>
+
+      <section class="specimen-grid" aria-label="Font specimen samples">
+        <article class="sample">
+          <span class="label">Alphabet</span>
+          <p class="font-line plain">ABC DEF GHI JKL MNO PQR STU VWX YZ</p>
+        </article>
+
+        <article class="sample">
+          <span class="label">Lowercase Small Caps</span>
+          <p class="font-line green">battle core surge</p>
+        </article>
+
+        <article class="sample">
+          <span class="label">Numbers</span>
+          <p class="font-line red">012 345 6789</p>
+        </article>
+
+        <article class="sample">
+          <span class="label">Outlined Treatment</span>
+          <p class="font-line outlined">BRAWL! NOW?</p>
+        </article>
+
+        <article class="sample">
+          <span class="label">Web CSS</span>
+          <code>@import url("./monspark-display.css");
+
+.title {
+  font-family: "Monspark Display";
+  color: #d72825;
+  -webkit-text-stroke: 5px #071322;
+  text-shadow: 4px 4px 0 #ffd72e,
+    9px 9px 0 #163da7;
+}</code>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>

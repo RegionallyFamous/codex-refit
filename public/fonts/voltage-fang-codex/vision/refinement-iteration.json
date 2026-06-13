@@ -1,0 +1,69 @@
+{
+  "generatedAt": "2026-06-09T19:08:04.336383+00:00",
+  "iteration": 2,
+  "familyName": "Voltage Fang",
+  "basePrompt": "electric creature-battle title letters with arcade speed, comet-fang weirdness, chunky sticker energy, sharp readable monster-showdown drama",
+  "promptUsed": "electric creature-battle title letters with arcade speed, comet-fang weirdness, chunky sticker energy, sharp readable monster-showdown drama Codex learning constraints: Fused-engine diagnosis: clean counters helped, but generic athletic chamfers are not enough. Add oversized creature-specific events: jaw apertures, fang terminals, broken shoulders, hooked counters, and voltage bridges that remain visible at mobile proof size. Prompt patches: Next pass: judge only the undecorated black proof first. Keep the reverse-slanted monster-title stance, but replace repeated esports chamfer chips with one oversized electric-fang structural event per uppercase and numeral. Make C an open jaw with a clear lower fang, G a jaw with an unmistakable inward voltage hook, O a closed charged ring with one large asymmetric break, 0 a slashed form clearly unlike O, 6 an open top hook with lower bite, 8 two pinched counters, and 9 a top loop with a descending fang tail. Apply mint fill, heavy black sticker outline, and purple shadow only after the raw silhouettes pass. Mobile hero: larger centered two-line VOLTAGE / FANG with no crop and less dead space. Next pass: judge only the undecorated black proof first. Keep the reverse-slanted monster-title stance, but remove repeated small chips as the main texture. Each uppercase and numeral needs one large structural electric-fang event visible on mobile. Prioritize C=open jaw with lower fang, G=jaw plus oversized inward voltage hook, O=closed ring with one major voltage break, 0=clear slash unlike O, 6=open top hook plus lower bite, 8=two visibly pinched counters, 9=top loop with descending fang tail. Apply mint fill, black sticker outline, and purple shadow only after the raw silhouettes pass. Lessons: Do not approve Voltage Fang when the decorated hero carries more concept than the raw alphabet. Approval requires mobile-visible, individualized electric-fang silhouettes, especially in C/G/O and 0/6/8/9, plus deliberate mobile scale and tighter proof spacing. Do not approve Voltage Fang when the decorated hero carries the concept better than the raw alphabet. Approval requires visibly individualized electric-fang silhouettes in the black proof, especially C/G/O and 0/6/8/9. Do not approve Voltage Fang while the decorated hero is stronger than the raw alphabet or while mobile crops the title. Approval requires complete mobile composi...",
+  "promptChars": 2400,
+  "packageDir": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02",
+  "memoryPath": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/_learning/font-codex-memory.jsonl",
+  "staticEngine": "procedural-qbt",
+  "referenceFont": null,
+  "scores": {
+    "overall": 7.1,
+    "readability": 7.8,
+    "energy": 8.3,
+    "originality": 6.8,
+    "composition": 7.2
+  },
+  "verdict": "Passable but not yet approval-grade. The decorated hero has a strong monster-arcade hit, and the mobile crop problem is mostly fixed, but the raw black proof still relies too much on repeated athletic slash/chamfer language. The concept is visible, yet the promised per-glyph fang events are uneven and several key glyphs are not distinctive enough at mobile size.",
+  "nextEdits": [
+    "Proof only the black uppercase and numerals first, without mint, outline, shadow, or gradient.",
+    "Redraw C/G/O/0/6/8/9 as a focused group with one large visible body event each, not extra perimeter chips.",
+    "Make C an unmistakable open jaw with a lower fang silhouette that changes the aperture shape.",
+    "Give G a much larger inward voltage hook that reads before decoration is added.",
+    "Make O a closed charged ring with one bold asymmetric break, and make 0 clearly slashed with a different rhythm.",
+    "Reduce small repeated chamfer chips by another 30-40% and replace them with fewer, larger structural decisions.",
+    "Tighten display spacing for VOLTAGE FANG and CGO AEX while preserving enough room for outlines in the decorated hero."
+  ],
+  "memoryLesson": "Do not approve Voltage Fang just because the hero looks exciting. Approval requires the undecorated black proof to show large, individualized electric-fang construction, especially in C/G/O and 0/6/8/9, with spacing tuned at mobile size.",
+  "publishedPreview": {
+    "publishedAt": "2026-06-09T21:01:16.549048+00:00",
+    "sourcePackage": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02",
+    "destination": "/Users/nick/Documents/Weirdo/public/fonts/voltage-fang-codex",
+    "familyName": "Voltage Fang",
+    "sourceReport": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02/package-report.json",
+    "urlPath": "/public/fonts/voltage-fang-codex/index.html",
+    "copiedFiles": 42,
+    "destructiveCleanup": false,
+    "policy": "best",
+    "scoreKey": "overall",
+    "decision": "restored usable best 7.1"
+  },
+  "batch": {
+    "batchStamp": "20260609-190556",
+    "candidate": 2,
+    "candidateCount": 2,
+    "strategy": "Candidate lane: spacing and mobile. Preserve a deliberate VOLTAGE / FANG lockup, reduce descriptor dominance, avoid horizontal clipping, and keep raw proof readable before effects.",
+    "seed": 4131653621
+  },
+  "publishDecision": {
+    "requested": true,
+    "policy": "best",
+    "scoreKey": "overall",
+    "note": "restored usable best 7.1",
+    "manifest": {
+      "publishedAt": "2026-06-09T21:01:16.549048+00:00",
+      "sourcePackage": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02",
+      "destination": "/Users/nick/Documents/Weirdo/public/fonts/voltage-fang-codex",
+      "familyName": "Voltage Fang",
+      "sourceReport": "/Users/nick/Documents/GitHub/openai-font-foundry-runs/forever/voltage-fang-20260609-190556-c02/package-report.json",
+      "urlPath": "/public/fonts/voltage-fang-codex/index.html",
+      "copiedFiles": 42,
+      "destructiveCleanup": false,
+      "policy": "best",
+      "scoreKey": "overall",
+      "decision": "restored usable best 7.1"
+    }
+  }
+}

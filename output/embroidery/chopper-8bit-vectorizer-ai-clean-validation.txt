@@ -1,0 +1,40 @@
+PES Validation Report
+=====================
+File: /Users/nick/Documents/Weirdo/output/embroidery/chopper-8bit-vectorizer-ai-clean.pes
+Design size: 76.20 x 76.20 mm
+Bounds: (0, 0, 762, 762)
+Threads in PES: 9
+Total commands: 24536
+Stitch commands: 24439
+Color changes: 8
+Trims: 43
+Jumps: 45
+
+Stitch Lengths
+--------------
+Max stitch segment: 3.10 mm
+Average stitch segment: 1.43 mm
+> 7 mm stitch segments: 0
+> 10 mm stitch segments: 0
+Max jump segment: 43.30 mm
+> 12 mm jump segments: 26
+> 12 mm jumps without immediate trim: 1
+
+Density Heuristic
+-----------------
+Grid: 5 mm x 5 mm endpoint count
+Maximum 5 mm cell stitch endpoints: 279
+
+Command Counts
+--------------
+color_change: 8
+end: 1
+jump: 45
+stitch: 24439
+trim: 43
+
+Warnings
+--------
+- 1 jump segments exceed 12 mm without an immediately preceding trim
+
+Simulation preview: /Users/nick/Documents/Weirdo/output/embroidery/chopper-8bit-vectorizer-ai-clean-stitch-sim.png

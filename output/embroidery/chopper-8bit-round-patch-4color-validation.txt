@@ -1,0 +1,40 @@
+PES Validation Report
+=====================
+File: output/embroidery/chopper-8bit-round-patch-4color.pes
+Design size: 76.20 x 76.20 mm
+Bounds: (0, 0, 762, 762)
+Threads in PES: 5
+Total commands: 22282
+Stitch commands: 22221
+Color changes: 4
+Trims: 27
+Jumps: 29
+
+Stitch Lengths
+--------------
+Max stitch segment: 3.10 mm
+Average stitch segment: 1.52 mm
+> 7 mm stitch segments: 0
+> 10 mm stitch segments: 0
+Max jump segment: 38.80 mm
+> 12 mm jump segments: 15
+> 12 mm jumps without immediate trim: 0
+
+Density Heuristic
+-----------------
+Grid: 5 mm x 5 mm endpoint count
+Maximum 5 mm cell stitch endpoints: 237
+
+Command Counts
+--------------
+color_change: 4
+end: 1
+jump: 29
+stitch: 22221
+trim: 27
+
+Warnings
+--------
+- No obvious software-level geometry warnings.
+
+Simulation preview: output/embroidery/chopper-8bit-round-patch-4color-stitch-sim.png

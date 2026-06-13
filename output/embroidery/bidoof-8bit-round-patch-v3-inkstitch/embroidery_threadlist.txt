@@ -1,0 +1,29 @@
+Design Details
+==============================
+
+Title: embroidery
+Size (mm): 74.67 x 74.67
+Stitches: 19127
+Colors: 6
+
+Thread Order
+===========================
+
+1 None #None - None (#080b0c)
+2 None #None - None (#5a3a2a)
+3 None #None - None (#f6dfaa)
+4 None #None - None (#b86f21)
+5 None #None - None (#f6dfaa)
+6 None #None - None (#f8f3e7)
+7 None #None - None (#d94a32)
+8 None #None - None (#080b0c)
+
+Thread Used
+===========================
+
+None #None - None (#5a3a2a)
+None #None - None (#f8f3e7)
+None #None - None (#080b0c)
+None #None - None (#d94a32)
+None #None - None (#f6dfaa)
+None #None - None (#b86f21)

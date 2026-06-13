@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 1000 1000" width="76.2mm" height="76.2mm">
+<g fill="#5a3a2a">
+<polygon id="tail-fill" points="745,425 830,455 865,535 830,625 745,660 708,600 720,485"/>
+</g>
+<g fill="#b86f21">
+<polygon id="body-fill" points="310,274 366,238 421,274 454,321 532,320 604,354 682,420 728,526 730,632 688,735 605,789 507,780 450,736 392,786 306,756 256,688 239,601 256,542 205,514 247,469 239,386 282,339"/>
+<polygon id="left-ear-fill" points="300,225 372,225 405,270 398,338 338,370 282,342 260,285"/>
+<polygon id="right-ear-fill" points="610,224 682,224 722,282 700,340 640,370 585,334 575,270"/>
+<polygon id="left-cheek-tuft-fill" points="222,472 188,500 222,530 188,558 232,594 268,548 258,500"/>
+<polygon id="right-cheek-tuft-fill" points="646,440 708,462 674,500 728,530 675,570 635,522 660,490"/>
+<rect id="left-leg" x="305" y="750" width="65" height="105"/>
+<rect id="right-leg" x="615" y="748" width="65" height="105"/>
+<rect id="left-paw" x="235" y="585" width="58" height="78"/>
+<rect id="right-paw" x="685" y="585" width="58" height="78"/>
+<polygon id="head-tuft-fill" points="450,310 486,250 512,315"/>
+</g>
+<g fill="#f6dfaa">
+<polygon id="tail-stripe" points="760,505 835,535 818,575 743,548"/>
+<polygon id="left-ear-inner" points="315,265 365,265 382,300 362,330 320,322 300,290"/>
+<polygon id="right-ear-inner" points="628,264 676,264 696,300 674,330 632,322 612,292"/>
+<polygon id="cream-muzzle" points="330,395 495,395 540,450 540,540 500,602 365,610 315,560 315,455"/>
+<polygon id="belly-fill" points="462,675 628,675 678,742 650,830 520,852 430,800 410,720"/>
+</g>
+<g fill="#f8f3e7">
+<rect id="left-eye-glint" x="354" y="428" width="12" height="20"/>
+<rect id="right-eye-glint" x="502" y="428" width="12" height="20"/>
+<rect id="left-tooth" x="380" y="584" width="40" height="70"/>
+<rect id="right-tooth" x="424" y="584" width="40" height="70"/>
+<rect id="nose-glint" x="395" y="522" width="18" height="18"/>
+</g>
+<g fill="#d94a32">
+<rect id="red-nose" x="370" y="510" width="104" height="48" rx="10" ry="10"/>
+</g>
+<g fill="#4b4a45">
+<rect id="left-foot" x="292" y="842" width="84" height="42"/>
+<rect id="right-foot" x="604" y="842" width="84" height="42"/>
+<rect id="left-foot-over" x="302" y="846" width="64" height="28"/>
+<rect id="right-foot-over" x="614" y="846" width="64" height="28"/>
+</g>
+<g fill="#080b0c">
+<path id="smooth-border" fill-rule="evenodd" d="M 500 10 A 490 490 0 1 0 500 990 A 490 490 0 1 0 500 10 Z M 500 58 A 442 442 0 1 1 500 942 A 442 442 0 1 1 500 58 Z"/>
+<path id="tail-outline" fill-rule="evenodd" d="M 720 385 L 850 425 L 900 530 L 855 665 L 735 710 L 675 620 L 690 465 Z M 745 425 L 830 455 L 865 535 L 830 625 L 745 660 L 708 600 L 720 485 Z"/>
+<path id="body-outline" fill-rule="evenodd" d="M 292 244 L 365 202 L 438 248 L 476 296 L 540 296 L 620 330 L 708 402 L 758 516 L 763 640 L 715 758 L 620 826 L 506 814 L 454 772 L 397 824 L 288 792 L 228 710 L 208 612 L 224 556 L 174 518 L 224 456 L 211 374 L 260 314 Z M 310 274 L 366 238 L 421 274 L 454 321 L 532 320 L 604 354 L 682 420 L 728 526 L 730 632 L 688 735 L 605 789 L 507 780 L 450 736 L 392 786 L 306 756 L 256 688 L 239 601 L 256 542 L 205 514 L 247 469 L 239 386 L 282 339 Z"/>
+<path id="left-ear-outline" fill-rule="evenodd" d="M 286 200 L 382 200 L 430 260 L 420 352 L 340 396 L 260 358 L 235 282 Z M 305 232 L 368 232 L 398 272 L 392 328 L 338 356 L 288 330 L 272 286 Z"/>
+<path id="right-ear-outline" fill-rule="evenodd" d="M 602 198 L 696 198 L 748 276 L 720 356 L 640 394 L 560 345 L 550 260 Z M 618 232 L 676 232 L 710 284 L 692 330 L 640 356 L 590 326 L 586 274 Z"/>
+<path id="muzzle-outline" fill-rule="evenodd" d="M 314 370 L 505 370 L 568 440 L 568 555 L 515 632 L 355 640 L 286 575 L 286 450 Z M 330 395 L 495 395 L 540 450 L 540 540 L 500 602 L 365 610 L 315 560 L 315 455 Z"/>
+<path id="belly-outline" fill-rule="evenodd" d="M 440 650 L 645 650 L 710 735 L 672 858 L 520 888 L 400 818 L 382 706 Z M 465 690 L 620 690 L 660 746 L 632 810 L 522 832 L 435 780 L 420 724 Z"/>
+<rect id="left-eye" x="340" y="418" width="42" height="70" rx="8" ry="8"/>
+<rect id="right-eye" x="488" y="418" width="42" height="70" rx="8" ry="8"/>
+<rect id="nose-outline" x="347" y="498" width="148" height="74" rx="14" ry="14"/>
+<rect id="teeth-outline" x="365" y="572" width="114" height="92"/>
+<rect id="tooth-divider" x="420" y="584" width="8" height="70"/>
+<rect id="left-foot-outline" x="286" y="833" width="96" height="58"/>
+<rect id="right-foot-outline" x="598" y="833" width="96" height="58"/>
+<rect id="left-paw-top" x="222" y="575" width="82" height="34"/>
+<rect id="right-paw-top" x="674" y="575" width="82" height="34"/>
+<path id="head-tuft-outline" fill-rule="evenodd" d="M 438 318 L 486 224 L 526 322 Z M 458 308 L 487 260 L 504 310 Z"/>
+</g>
+</svg>
